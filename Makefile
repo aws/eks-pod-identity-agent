@@ -23,7 +23,8 @@ REGISTRY_ID?=$(shell aws sts get-caller-identity | jq -r '.Account')
 IMAGE_NAME?=eks/eks-pod-identity-agent
 REGION?=us-west-2
 IMAGE?=$(REGISTRY_ID).dkr.ecr.$(REGION).amazonaws.com/$(IMAGE_NAME)
-TAG?=0.1.6
+TAG?=0.1.0
+
 
 .PHONY: docker
 docker:
