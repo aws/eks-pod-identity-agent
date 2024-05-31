@@ -1,0 +1,4 @@
+include:
+  - project: eks-dataplane/gitlab-ci-templates
+    file: multi-arch-image-build.yaml
+    ref: main

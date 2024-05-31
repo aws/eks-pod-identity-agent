@@ -1,0 +1,16 @@
+apiVersion: v2
+name: eks-pod-identity-agent
+type: application
+version: 1.2.0
+appVersion: 0.1.6
+description: A Helm chart for eks-pod-identity-agent
+icon: https://raw.githubusercontent.com/aws/eks-charts/master/docs/logo/aws.png
+
+## TODO: Use github repos here
+home: TBA
+sources:
+  - TBA
+keywords:
+  - eks
+  - pod-identity
+
