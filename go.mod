@@ -8,14 +8,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/eksauth v1.3.4
 	github.com/aws/smithy-go v1.20.2
 	github.com/golang-jwt/jwt/v5 v5.2.0
-	github.com/google/go-cmp v0.5.9
 	github.com/onsi/gomega v1.27.8
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.7.0
 	github.com/stretchr/testify v1.7.0
 	github.com/vishvananda/netlink v1.1.0
 	go.uber.org/mock v0.3.0
-	golang.org/x/sys v0.8.0
+	golang.org/x/sys v0.18.0
 	golang.org/x/time v0.3.0
 )
 
@@ -31,11 +30,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.23.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df // indirect
-	golang.org/x/net v0.10.0 // indirect
-	golang.org/x/text v0.9.0 // indirect
+	golang.org/x/net v0.23.0 // indirect
+	golang.org/x/text v0.14.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
