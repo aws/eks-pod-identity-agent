@@ -8,6 +8,11 @@ This agent is required for EKS pods to get granular IAM permissions with EKS Pod
 - Kubernetes v{?} running on AWS
 - Helm v3
 
+## Update below Env to your cluster and region in values.yaml
+
+* `EKS_CLUSTER_NAME` 
+* `AWS_REGION_NAME`
+
 ## Installing the Chart
 
 First add the EKS repository to Helm:
