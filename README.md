@@ -20,7 +20,18 @@ checking [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod
 
 ## Installation
 
+### Helm Install
+
 checking README.md in `charts` for Helm installation.
+
+### Kubectl Install
+
+Update below Env in hack/dev/ds.yaml:
+
+* `EKS_CLUSTER_NAME`
+* `AWS_REGION_NAME`
+
+Run `kubectl apply -f hack/dev/ds.yaml`
 
 ## Security
 
