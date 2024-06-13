@@ -30,8 +30,6 @@ agent:
 
 clusterName: EKS_CLUSTER_NAME
 
-eksStageName: EKS_STAGE_NAME
-
 env:
   AWS_REGION: AWS_REGION_NAME
 

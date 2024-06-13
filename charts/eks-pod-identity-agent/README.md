@@ -15,23 +15,8 @@ This agent is required for EKS pods to get granular IAM permissions with EKS Pod
 
 ## Installing the Chart
 
-First add the EKS repository to Helm:
-
 ```shell
-helm repo add eks https://aws.github.io/eks-charts
-```
-
-To install the chart with the release name `eks-pod-identity-agent` and default configuration:
-
-```shell
-$ helm install eks-pod-identity-agent --namespace kube-system eks/eks-pod-identity-agent
-```
-
-To install manually, clone the repository to your local machine.
-Then, use the helm install command to install the chart into your Kubernetes cluster:
-
-```shell
-$ helm install eks-pod-identity-agent --namespace kube-system ./charts/eks-pod-identity-agent
+$ helm install eks-pod-identity-agent --namespace kube-system ./charts/eks-pod-identity-agent --values ./charts/eks-pod-identity-agent/values.yaml
 ```
 
 To uninstall:
@@ -63,14 +48,4 @@ The following table lists the configurable parameters for this chart and their d
 | `updateStrategy`          | Optional update strategy                                | `type: RollingUpdate`    |
 
 Specify each parameter using the `--set key=value[,key=value]` argument to `helm install` or provide a YAML file
-containing the values for the above parameters:
-
-```shell
-$ helm install eks-pod-identity-agent --namespace kube-system eks/eks-pod-identity-agent --values values.yaml
-```
-
-Manual install:
-
-```shell
-$ helm install eks-pod-identity-agent --namespace kube-system ./charts/eks-pod-identity-agent --values values.yaml
-```
+containing the values for the above parameters.
