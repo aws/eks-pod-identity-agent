@@ -67,10 +67,6 @@ spec:
             - {{ .Values.clusterName | quote }}
             - "--probe-port"
             - {{ .Values.agent.probePort | quote }}
-            {{- if or (eq "beta" (lower .Values.eksStageName)) (eq "gamma" (lower .Values.eksStageName)) }}
-            - "--endpoint"
-            - {{ include "eks-pod-identity-agent.eks-auth-endpoint" . | quote }}
-            {{- end }}
             {{- range $key, $value := .Values.agent.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}

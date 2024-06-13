@@ -60,14 +60,3 @@ The eks-pod-identity-agent image to use
 {{- printf "%s/eks/eks-pod-identity-agent:%s" .Values.image.containerRegistry .Values.image.tag }}
 {{- end }}
 {{- end }}
-
-{{/*
-The eks-auth endpoint to use
-*/}}
-{{- define "eks-pod-identity-agent.eks-auth-endpoint" -}}
-{{ if or (eq "cn-north-1" (.Values.env.AWS_REGION)) (eq "cn-northwest-1" (.Values.env.AWS_REGION)) }}
-{{- printf "https://%s.%s.auth.eks.a2z.org.cn" (lower .Values.eksStageName) .Values.env.AWS_REGION }}
-{{- else }}
-{{- printf "https://%s.%s.auth.eks.aws.dev" (lower .Values.eksStageName) .Values.env.AWS_REGION }}
-{{- end }}
-{{- end }}
