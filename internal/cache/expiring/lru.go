@@ -16,9 +16,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package lru implements an LRU cache.
-// LRU generified from https://code.amazon.com/packages/GoLRU/trees/mainline
-
 import "container/list"
 
 // lruCache is an LRU cache. It is not safe for concurrent access.
