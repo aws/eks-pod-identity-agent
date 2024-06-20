@@ -16,13 +16,15 @@ This agent is required for EKS pods to get granular IAM permissions with EKS Pod
 ## Installing the Chart
 
 ```shell
-$ helm install eks-pod-identity-agent --namespace kube-system ./charts/eks-pod-identity-agent --values ./charts/eks-pod-identity-agent/values.yaml
+git clone https://github.com/aws/eks-pod-identity-agent.git
+cd eks-pod-identity-agent/
+helm install eks-pod-identity-agent --namespace kube-system ./charts/eks-pod-identity-agent --values ./charts/eks-pod-identity-agent/values.yaml
 ```
 
 To uninstall:
 
 ```shell
-$ helm uninstall eks-pod-identity-agent --namespace kube-system
+helm uninstall eks-pod-identity-agent --namespace kube-system
 ```
 
 ## Configuration
