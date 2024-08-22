@@ -18,6 +18,9 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/server"
+
+	// extensions imports
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/extensions/chainrole"
 )
 
 var (
@@ -137,4 +140,6 @@ func init() {
 
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
 
+	// extended cmd flags
+	chainrole.AddCMDFlags(serverCmd)
 }

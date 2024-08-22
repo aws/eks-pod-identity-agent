@@ -12,6 +12,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/extensions/chainrole"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
@@ -37,6 +38,8 @@ type EksCredentialHandlerOpts struct {
 
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
 	credentialsRetriever := eksauth.NewService(opts.Cfg)
+	credentialsRetriever = chainrole.NewCredentialsRetriever(opts.Cfg, credentialsRetriever)
+
 	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
 		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(credsretriever.CachedCredentialRetrieverOpts{
 			Delegate:              credentialsRetriever,
