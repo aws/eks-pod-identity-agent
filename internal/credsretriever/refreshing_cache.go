@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -51,6 +53,13 @@ type internalClock func() time.Time
 
 // type assertion
 var _ credentials.CredentialRetriever = &cachedCredentialRetriever{}
+
+var (
+	promCacheNonRecoverableError = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_non_recoverable_error",
+		Help: "Removing credentials from cache, got non recoverable error",
+	})
+)
 
 const (
 	// defaultCleanupInterval sets how often we go over the cache to check if
@@ -209,6 +218,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 
 		if eksauth.IsIrrecoverableApiError(err) {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
+			promCacheNonRecoverableError.Inc()
 			r.internalCache.Delete(entry.originatingRequest.ServiceAccountToken)
 			return
 		}
