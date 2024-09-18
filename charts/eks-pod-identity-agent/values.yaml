@@ -57,7 +57,9 @@ nameOverride: "eks-pod-identity-agent"
 
 nodeSelector: {}
 
-podAnnotations: {}
+podAnnotations:
+  prometheus.io/port: '2705'
+  prometheus.io/scrape: 'true'
 
 priorityClassName: system-node-critical
 

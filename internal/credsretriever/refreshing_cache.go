@@ -56,9 +56,14 @@ var _ credentials.CredentialRetriever = &cachedCredentialRetriever{}
 
 var (
 	promCacheNonRecoverableError = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "cache_non_recoverable_error",
+		Name: "pod_identity_cache_non_recoverable_error",
 		Help: "Removing credentials from cache, got non recoverable error",
 	})
+	promCacheHit = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_identity_cache_state",
+		Help: "The state of credential in cache",
+	}, []string{"state"},
+	)
 )
 
 const (
@@ -154,7 +159,6 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (cacheEntry, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
-
 	newCacheEntry, err := r.fetchCredentialsFromDelegate(ctx, request)
 	if err != nil {
 		return cacheEntry{}, nil, fmt.Errorf("error getting credentials to cache: %w", err)
@@ -203,7 +207,6 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		logger.ContextWithField(entry.requestLogCtx, "from", "renewal-thread"), renewalTimeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
-
 	if r.refreshRateLimiter.Allow() {
 		err := r.refreshRateLimiter.Wait(ctx)
 		if err != nil {
@@ -213,6 +216,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
+			promCacheHit.WithLabelValues("hit").Inc()
 			return
 		}
 
@@ -237,6 +241,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			Infof("Credentials still valid for at least %0.2fs, keeping them will try again after ttl expires", oldCredsDuration.Seconds())
 		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, oldCredsDuration)
 	} else {
+		promCacheHit.WithLabelValues("evicted").Inc()
 		log.Infof("Evicting credentials since they are too old")
 	}
 }

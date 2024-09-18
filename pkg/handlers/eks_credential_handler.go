@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -34,6 +37,13 @@ type EksCredentialHandlerOpts struct {
 	MaxCacheSize      int
 	RefreshQPS        int
 }
+
+var (
+	promHttpStatus = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_identity_http_response",
+		Help: "Pod Identity http response code",
+	}, []string{"code"})
+)
 
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
 	credentialsRetriever := eksauth.NewService(opts.Cfg)
@@ -72,18 +82,21 @@ func (h *EksCredentialHandler) HandleRequest(resp http.ResponseWriter, req *http
 	creds, err := h.GetEksCredentials(ctx, eksCredentialsRequest)
 	if err != nil {
 		msg, code := errors.HandleCredentialFetchingError(ctx, err)
+		promHttpStatus.WithLabelValues(strconv.Itoa(code)).Inc()
 		http.Error(resp, msg, code)
 		return
 	}
 
 	jsonOutput, err := json.Marshal(creds)
 	if err != nil {
+		promHttpStatus.WithLabelValues(strconv.Itoa(http.StatusInternalServerError)).Inc()
 		http.Error(resp, "Unable to serialize credentials", http.StatusInternalServerError)
 		return
 	}
 
 	// send the response
 	resp.Header().Add("Content-Type", "application/json")
+	promHttpStatus.WithLabelValues("200").Inc()
 	_, err = resp.Write(jsonOutput)
 	if err != nil {
 		log.Errorf("failed to write response: %v", err)
