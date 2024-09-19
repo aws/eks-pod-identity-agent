@@ -55,11 +55,13 @@ type internalClock func() time.Time
 var _ credentials.CredentialRetriever = &cachedCredentialRetriever{}
 
 var (
-	promCacheNonRecoverableError = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pod_identity_cache_non_recoverable_error",
+	promCacheError = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_identity_cache_errors",
 		Help: "Removing credentials from cache, got non recoverable error",
-	})
-	promCacheHit = promauto.NewCounterVec(prometheus.CounterOpts{
+	}, []string{"type"},
+	)
+
+	promCacheState = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_identity_cache_state",
 		Help: "The state of credential in cache",
 	}, []string{"state"},
@@ -216,13 +218,13 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
-			promCacheHit.WithLabelValues("hit").Inc()
+			promCacheState.WithLabelValues("hit").Inc()
 			return
 		}
 
 		if eksauth.IsIrrecoverableApiError(err) {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
-			promCacheNonRecoverableError.Inc()
+			promCacheError.WithLabelValues("NonRecoverable").Inc()
 			r.internalCache.Delete(entry.originatingRequest.ServiceAccountToken)
 			return
 		}
@@ -241,7 +243,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			Infof("Credentials still valid for at least %0.2fs, keeping them will try again after ttl expires", oldCredsDuration.Seconds())
 		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, oldCredsDuration)
 	} else {
-		promCacheHit.WithLabelValues("evicted").Inc()
+		promCacheState.WithLabelValues("evicted").Inc()
 		log.Infof("Evicting credentials since they are too old")
 	}
 }
