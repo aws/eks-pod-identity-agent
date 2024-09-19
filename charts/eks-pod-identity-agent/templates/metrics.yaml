@@ -1,0 +1,47 @@
+{{- if .Values.agent.metrics.enabled -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eks-pod-identity-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+  {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
+  {{- with .Values.agent.metrics.extraLabels -}}
+  {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    app: eks-pod-identiy-agent
+  ports:
+    - name: metrics
+      port: {{ .Values.agent.metrics.port }}
+      targetPort: {{ .Values.agent.metrics.port }}
+  type: ClusterIP
+
+---
+{{- if .Values.agent.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: eks-pod-identity-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+  {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
+  {{- with .Values.agent.metrics.serviceMonitor.extraLabels -}}
+  {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: eks-pod-identiy-agent
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - targetPort: {{ .Values.agent.metrics.port }}
+      path: {{ .Values.agent.metrics.path }}
+      interval: {{ .Values.agent.metrics.serviceMonitor.interval | default "15s"}}
+
+{{- end }}
+{{- end }}
