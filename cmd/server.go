@@ -98,7 +98,7 @@ func createServers(cfg aws.Config) []*server.Server {
 
 	// add health probes listening on host's network
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
-	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("localhost:%d", metricsPort), bindHosts, serverPort))
+	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("0.0.0.0:%d", metricsPort), bindHosts, serverPort))
 	return servers
 }
 
