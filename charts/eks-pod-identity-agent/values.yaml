@@ -27,17 +27,19 @@ agent:
   livenessEndpoint: /healthz
   probePort: 2703
   readinessEndpoint: /readyz
-  metrics:
+
+
+metrics:
+  enabled: true
+  port: 2705
+  path: /metrics
+  extraLabels:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: 2705
+  serviceMonitor:
+    extraLabels: {}
     enabled: true
-    port: 2705
-    path: /metrics
-    extraLabels:
-      prometheus.io/scrape: "true"
-      prometheus.io/port: 2705
-    serviceMonitor:
-      extraLabels: {}
-      enabled: true
-      interval: "15s"
+    interval: "15s"
 
 clusterName: EKS_CLUSTER_NAME
 

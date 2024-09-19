@@ -1,4 +1,4 @@
-{{- if .Values.agent.metrics.enabled -}}
+{{- if .Values.metrics.enabled -}}
 ---
 apiVersion: v1
 kind: Service
@@ -7,7 +7,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
   {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
-  {{- with .Values.agent.metrics.extraLabels -}}
+  {{- with .Values.metrics.extraLabels -}}
   {{ toYaml . | nindent 4 }}
   {{- end }}
 spec:
@@ -15,12 +15,12 @@ spec:
     app: eks-pod-identiy-agent
   ports:
     - name: metrics
-      port: {{ .Values.agent.metrics.port }}
-      targetPort: {{ .Values.agent.metrics.port }}
+      port: {{ .Values.metrics.port }}
+      targetPort: {{ .Values.metrics.port }}
   type: ClusterIP
 
 ---
-{{- if .Values.agent.metrics.serviceMonitor.enabled }}
+{{- if .Values.metrics.serviceMonitor.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -28,7 +28,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
   {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
-  {{- with .Values.agent.metrics.serviceMonitor.extraLabels -}}
+  {{- with .Values.metrics.serviceMonitor.extraLabels -}}
   {{ toYaml . | nindent 4 }}
   {{- end }}
 spec:
@@ -39,9 +39,9 @@ spec:
     matchNames:
       - {{ .Release.Namespace }}
   endpoints:
-    - targetPort: {{ .Values.agent.metrics.port }}
-      path: {{ .Values.agent.metrics.path }}
-      interval: {{ .Values.agent.metrics.serviceMonitor.interval | default "15s"}}
+    - targetPort: {{ .Values.metrics.port }}
+      path: {{ .Values.metrics.path }}
+      interval: {{ .Values.metrics.serviceMonitor.interval | default "15s"}}
 
 {{- end }}
 {{- end }}
