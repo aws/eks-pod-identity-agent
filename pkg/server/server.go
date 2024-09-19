@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	ratelimiter "go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/rate_limiter"
@@ -60,6 +61,13 @@ func NewProbeServer(addr string, hosts []string, port uint16) *Server {
 func NewEksCredentialServer(addr string, opts handlers.EksCredentialHandlerOpts) *Server {
 	srv := newBaseServer(addr)
 	srv.configurer = handlers.NewEksCredentialHandler(opts)
+	return srv
+}
+
+func NewMetricsServer(addr string, hosts []string, port uint16) *Server {
+	srv := newBaseServer(addr)
+	srv.configurer = handlers.NewProbeHandler(hosts, port)
+	srv.mux.Handle("/metrics", promhttp.Handler())
 	return srv
 }
 

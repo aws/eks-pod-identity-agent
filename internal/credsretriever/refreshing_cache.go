@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -51,6 +53,20 @@ type internalClock func() time.Time
 
 // type assertion
 var _ credentials.CredentialRetriever = &cachedCredentialRetriever{}
+
+var (
+	promCacheError = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_identity_cache_errors",
+		Help: "Removing credentials from cache, got non recoverable error",
+	}, []string{"type"},
+	)
+
+	promCacheState = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_identity_cache_state",
+		Help: "The state of credential in cache",
+	}, []string{"state"},
+	)
+)
 
 const (
 	// defaultCleanupInterval sets how often we go over the cache to check if
@@ -145,7 +161,6 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (cacheEntry, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
-
 	newCacheEntry, err := r.fetchCredentialsFromDelegate(ctx, request)
 	if err != nil {
 		return cacheEntry{}, nil, fmt.Errorf("error getting credentials to cache: %w", err)
@@ -194,7 +209,6 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		logger.ContextWithField(entry.requestLogCtx, "from", "renewal-thread"), renewalTimeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
-
 	if r.refreshRateLimiter.Allow() {
 		err := r.refreshRateLimiter.Wait(ctx)
 		if err != nil {
@@ -204,11 +218,13 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
+			promCacheState.WithLabelValues("hit").Inc()
 			return
 		}
 
 		if eksauth.IsIrrecoverableApiError(err) {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
+			promCacheError.WithLabelValues("NonRecoverable").Inc()
 			r.internalCache.Delete(entry.originatingRequest.ServiceAccountToken)
 			return
 		}
@@ -227,6 +243,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			Infof("Credentials still valid for at least %0.2fs, keeping them will try again after ttl expires", oldCredsDuration.Seconds())
 		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, oldCredsDuration)
 	} else {
+		promCacheState.WithLabelValues("evicted").Inc()
 		log.Infof("Evicting credentials since they are too old")
 	}
 }
