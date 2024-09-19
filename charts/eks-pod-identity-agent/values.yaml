@@ -30,15 +30,15 @@ agent:
 
 
 metrics:
-  enabled: true
+  enabled: false
   port: 2705
   path: /metrics
   extraLabels:
     prometheus.io/scrape: "true"
     prometheus.io/port: 2705
   serviceMonitor:
+    enabled: false
     extraLabels: {}
-    enabled: true
     interval: "15s"
 
 clusterName: EKS_CLUSTER_NAME
