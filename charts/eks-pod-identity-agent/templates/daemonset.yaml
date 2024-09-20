@@ -67,6 +67,10 @@ spec:
             - {{ .Values.clusterName | quote }}
             - "--probe-port"
             - {{ .Values.agent.probePort | quote }}
+            {{- if .Values.metrics.enabled }}
+            - "--metrics-port"
+            - {{ .Values.metrics.port | quote }}
+            {{- end }}
             {{- range $key, $value := .Values.agent.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}
@@ -78,6 +82,11 @@ spec:
             - containerPort: {{ .Values.agent.probePort }}
               protocol: TCP
               name: probes-port
+           {{- if .Values.metrics.enabled }}
+            - containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+              name: metrics
+            {{- end }}
           env:
           {{- range $key, $value := .Values.env }}
           - name: {{ $key }}
