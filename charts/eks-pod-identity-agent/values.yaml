@@ -35,7 +35,7 @@ metrics:
   path: /metrics
   extraLabels:
     prometheus.io/scrape: "true"
-    prometheus.io/port: 2705
+    prometheus.io/port: "2705"
   serviceMonitor:
     enabled: false
     extraLabels: {}
