@@ -40,7 +40,7 @@ helm.sh/chart: {{ include "eks-pod-identity-agent.chart" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app: eks-pod-identiy-agent
+app: eks-pod-identity-agent
 {{- end }}
 
 {{/*
