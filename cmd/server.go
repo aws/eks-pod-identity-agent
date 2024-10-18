@@ -23,6 +23,7 @@ import (
 var (
 	serverPort              uint16
 	probePort               uint16
+	metricsAddress          string
 	metricsPort             uint16
 	bindHosts               []string
 	clusterName             string
@@ -98,7 +99,7 @@ func createServers(cfg aws.Config) []*server.Server {
 
 	// add health probes listening on host's network
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
-	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("0.0.0.0:%d", metricsPort), bindHosts, serverPort))
+	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 	return servers
 }
 
@@ -128,6 +129,7 @@ func init() {
 	// Setup the port where the proxy server will listen to connections
 	serverCmd.Flags().Uint16VarP(&serverPort, "port", "p", 80, "Listening port of the proxy server")
 	serverCmd.Flags().Uint16Var(&probePort, "probe-port", 2703, "Health and readiness listening port")
+	serverCmd.Flags().StringVar(&metricsAddress, "metrics-address", "0.0.0.0", "Metrics listening address")
 	serverCmd.Flags().Uint16Var(&metricsPort, "metrics-port", 2705, "Metrics listening port")
 	serverCmd.Flags().DurationVar(&maxCredentialRenewal, "max-credential-retention-before-renewal", 3*time.Hour,
 		"Maximum amount of time that agent waits before renewing credentials. Set 0 to disable caching.")
