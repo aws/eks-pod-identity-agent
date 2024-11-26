@@ -74,6 +74,8 @@ podAnnotations:
   prometheus.io/port: '2705'
   prometheus.io/scrape: 'true'
 
+podLabels: {}
+
 priorityClassName: system-node-critical
 
 resources: {}
