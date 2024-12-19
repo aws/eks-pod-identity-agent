@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/server"
 )
@@ -31,6 +32,7 @@ var (
 	maxCredentialRenewal    time.Duration
 	maxCacheSize            int
 	refreshQps              int
+	rotateCredentials       bool
 )
 
 var serverCmd = &cobra.Command{
@@ -52,6 +54,10 @@ var serverCmd = &cobra.Command{
 		}
 		if err != nil {
 			log.Fatal("Unable to initialize aws configuration, exiting")
+		}
+		if rotateCredentials {
+			log.Info("Credentials rotation enabled. Creds will be fetched and rotated from shared credentials file")
+			cfg.Credentials = aws.NewCredentialsCache(sharedcredsrotater.NewRotatingSharedCredentialsProvider())
 		}
 
 		startServers(ctx, cfg)
@@ -139,7 +145,7 @@ func init() {
 		"Maximum amount of queries per second to EKS Auth")
 	serverCmd.Flags().StringArrayVarP(&bindHosts, "bind-hosts", "b",
 		[]string{configuration.DefaultIpv4TargetHost, "[" + configuration.DefaultIpv6TargetHost + "]"}, "Hosts to bind server to")
-
+	serverCmd.Flags().BoolVar(&rotateCredentials, "rotate-credentials", false, "Enable credentials rotation from shared credentials file")
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
 
 }

@@ -1,56 +1,63 @@
+{{- $top := . -}}
+{{- range $_, $daemonset := .Values.daemonsets -}}
+{{- if $daemonset.create -}}
+{{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
+{{- $selectorLabels := include "eks-pod-identity-agent.selectorLabels" $valuesDict -}}
+{{- $affinity := default $top.Values.affinity $daemonset.affinity -}}
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "eks-pod-identity-agent.fullname" . }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ include "eks-pod-identity-agent.fullname" $valuesDict }}
+  namespace: {{ $top.Release.Namespace }}
   labels:
-    {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
+    {{- include "eks-pod-identity-agent.labels" $valuesDict | nindent 4}}
 spec:
   updateStrategy:
-    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    {{- toYaml $top.Values.updateStrategy | nindent 4 }}
   selector:
     matchLabels:
-      {{- include "eks-pod-identity-agent.selectorLabels" . | nindent 6 }}
+      {{- $selectorLabels | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "eks-pod-identity-agent.selectorLabels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
+        {{- $selectorLabels | nindent 8 }}
+        {{- with $top.Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- with $top.Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      priorityClassName: {{ .Values.priorityClassName }}
+      priorityClassName: {{ $top.Values.priorityClassName }}
       hostNetwork: true
       terminationGracePeriodSeconds: 30
-      {{- with .Values.tolerations }}
+      {{- with $top.Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with $top.Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.imagePullSecrets }}
+      {{- with $top.Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.init.create }}
+      {{- if $top.Values.init.create }}
       initContainers:
-        - name: {{ .Chart.Name }}-init
-          image: {{ include "eks-pod-identity-agent.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: {{ .Values.init.command }}
-          {{- if .Values.init.additionalArgs }}
+        - name: {{ $top.Chart.Name }}-init
+          image: {{ include "eks-pod-identity-agent.image" $ }}
+          imagePullPolicy: {{ $top.Values.image.pullPolicy }}
+          command: {{ $top.Values.init.command }}
+          {{- if $top.Values.init.additionalArgs }}
           args:
-            {{- range $key, $value := .Values.init.additionalArgs }}
+            {{- range $key, $value := $top.Values.init.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}
             {{- end }}
@@ -59,22 +66,26 @@ spec:
             privileged: true
       {{- end }}
       containers:
-        - name: {{ .Chart.Name }}
-          image: {{ include "eks-pod-identity-agent.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: {{ .Values.agent.command }}
+        - name: {{ $top.Chart.Name }}
+          image: {{ include "eks-pod-identity-agent.image" $ }}
+          imagePullPolicy: {{ $top.Values.image.pullPolicy }}
+          command: {{ $top.Values.agent.command }}
           args:
             - "--port"
             - "80"
             - "--cluster-name"
-            - {{ .Values.clusterName | quote }}
+            - {{ $top.Values.clusterName | quote }}
             - "--probe-port"
-            - {{ .Values.agent.probePort | quote }}
-            {{- if .Values.metrics.enabled }}
+            - {{ $top.Values.agent.probePort | quote }}
+            {{- if $top.Values.metrics.enabled }}
             - "--metrics-port"
-            - {{ .Values.metrics.port | quote }}
+            - {{ $top.Values.metrics.port | quote }}
             {{- end }}
-            {{- range $key, $value := .Values.agent.additionalArgs }}
+            {{- range $key, $value := $top.Values.agent.additionalArgs }}
+            - {{ $key | quote }}
+            - {{ $value | quote }}
+            {{- end }}
+            {{- range $key, $value := $daemonset.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}
             {{- end }}
@@ -82,44 +93,73 @@ spec:
             - containerPort: 80
               protocol: TCP
               name: proxy
-            - containerPort: {{ .Values.agent.probePort }}
+            - containerPort: {{ $top.Values.agent.probePort }}
               protocol: TCP
               name: probes-port
-           {{- if .Values.metrics.enabled }}
-            - containerPort: {{ .Values.metrics.port }}
+           {{- if $top.Values.metrics.enabled }}
+            - containerPort: {{ $top.Values.metrics.port }}
               protocol: TCP
               name: metrics
             {{- end }}
           env:
-          {{- range $key, $value := .Values.env }}
+          {{- range $key, $value := $top.Values.env }}
           - name: {{ $key }}
             value: {{ $value | quote }}
+          {{- end }}
+          {{- if contains "-iso" $top.Values.env.AWS_REGION }}
+          - name: AWS_CA_BUNDLE
+            value: /etc/pki/tls/certs/ca-bundle.crt
+          {{- end }}
+          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumeMounts }}
+          volumeMounts:
+          {{- end }}
+          {{- if contains "-iso" $top.Values.env.AWS_REGION }}
+          - name: ca-bundle
+            mountPath: /etc/pki/tls/certs/ca-bundle.crt
+            readOnly: true
+          {{- end }}
+          {{- if $daemonset.volumeMounts }}
+          {{- toYaml $daemonset.volumeMounts | nindent 10}}
           {{- end }}
           securityContext:
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.agent.livenessEndpoint }}
+            {{- toYaml $top.Values.resources | nindent 12 }}
+          {{- if $top.Values.agent.livenessEndpoint }}
           livenessProbe:
             failureThreshold: 3
             httpGet:
               host: localhost
-              path: {{ .Values.agent.livenessEndpoint }}
+              path: {{ $top.Values.agent.livenessEndpoint }}
               port: probes-port
               scheme: HTTP
             initialDelaySeconds: 30
             timeoutSeconds: 10
           {{- end }}
-          {{- if .Values.agent.readinessEndpoint }}
+          {{- if $top.Values.agent.readinessEndpoint }}
           readinessProbe:
             failureThreshold: 30
             httpGet:
               host: localhost
-              path: {{ .Values.agent.readinessEndpoint }}
+              path: {{ $top.Values.agent.readinessEndpoint }}
               port: probes-port
               scheme: HTTP
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
+      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumes }}
+      volumes:
+      {{- end }}
+        {{- if contains "-iso" $top.Values.env.AWS_REGION }}
+        - name: ca-bundle
+          hostPath:
+            path: /etc/pki/tls/certs/ca-bundle.crt
+            type: File
+        {{- end }}
+        {{- if $daemonset.volumes }}
+        {{- toYaml $daemonset.volumes | nindent 8}}
+        {{- end }}
+{{ end }}
+{{ end }}
