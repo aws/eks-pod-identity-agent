@@ -1,0 +1,24 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: test
+
+on: pull_request
+jobs:
+  test:
+    # this is to prevent the job to run at forked projects
+    if: github.repository == 'aws/eks-pod-identity-agent'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Setup Go Version
+      run: echo "GO_VERSION=$(cat .go-version)" >> $GITHUB_ENV
+    - name: Install Go
+      uses: actions/setup-go@v3
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    - name: Checkout code
+      uses: actions/checkout@v3
+    - name: Test
+      run: go mod tidy && go mod vendor && go test ./...
+    - name: Verify helm template
+      run: make helm-verify 
