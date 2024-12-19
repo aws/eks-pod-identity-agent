@@ -17,6 +17,15 @@ TOOLS_BIN_DIR := $(TOOLS_DIR)/bin
 
 # Binaries
 MOCKGEN := $(TOOLS_BIN_DIR)/mockgen
+HELM := $(TOOLS_BIN_DIR)/helm
+HELM_VERSION := v3.16.1
+
+$(TOOLS_BIN_DIR):
+	mkdir -p $(TOOLS_BIN_DIR)
+
+$(HELM): $(TOOLS_BIN_DIR)
+	@echo "Installing Helm $(HELM_VERSION)"
+	curl -sSL https://get.helm.sh/helm-$(HELM_VERSION)-$(GOOS)-$(GOARCH).tar.gz | tar -xzv -C $(TOOLS_BIN_DIR) --strip-components=1 $(GOOS)-$(GOARCH)/helm
 
 # Generic make
 REGISTRY_ID?=$(shell aws sts get-caller-identity | jq -r '.Account')
@@ -83,3 +92,8 @@ lint:
 		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell go env GOPATH)/bin v1.52.1; \
 	fi
 	golangci-lint run ./...
+
+.PHONY: helm-verify
+helm-verify: $(HELM)
+	$(HELM) lint charts/eks-pod-identity-agent
+	hack/scripts/helmverify.sh $(HELM)
