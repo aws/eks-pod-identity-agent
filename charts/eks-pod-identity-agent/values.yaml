@@ -2,6 +2,42 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+daemonsets:
+  cloud:
+    create: true
+  hybrid:
+    create: false
+    nameSuffix: hybrid
+    additionalArgs:
+      "--rotate-credentials": "true"
+    volumes:
+    - name: aws-credentials
+      hostPath:
+        path: /eks-hybrid/.aws
+        type: Directory
+    volumeMounts:
+    - mountPath: /root/.aws
+      name: aws-credentials
+      readOnly: true
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: "kubernetes.io/os"
+                  operator: In
+                  values:
+                    - linux
+                - key: "kubernetes.io/arch"
+                  operator: In
+                  values:
+                    - amd64
+                    - arm64
+                - key: "eks.amazonaws.com/compute-type"
+                  operator: In
+                  values:
+                    - hybrid
+
 affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
@@ -20,9 +56,12 @@ affinity:
               operator: NotIn
               values:
                 - fargate
+                - hybrid
+                - auto
 
 agent:
   additionalArgs:
+    "-v": "trace"
   command: "['/go-runner', '/eks-pod-identity-agent', 'server']"
   livenessEndpoint: /healthz
   probePort: 2703
@@ -62,6 +101,7 @@ imagePullSecrets: []
 
 init:
   additionalArgs:
+    "-v": "trace"
   command: "['/go-runner', '/eks-pod-identity-agent', 'initialize']"
   # Specifies whether initContainer should be created
   create: true

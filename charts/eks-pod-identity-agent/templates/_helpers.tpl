@@ -2,7 +2,8 @@
 Expand the name of the chart.
 */}}
 {{- define "eks-pod-identity-agent.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- include "addSuffixAndTrim" (dict "name" $name "suffix" .nameSuffix) -}}
 {{- end }}
 
 {{/*
@@ -11,15 +12,31 @@ We truncate at 63 chars because some Kubernetes name fields are limited to this 
 If release name contains chart name it will be used as a full name.
 */}}
 {{- define "eks-pod-identity-agent.fullname" -}}
-{{- if .Values.fullnameOverride }}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
-{{- else }}
 {{- $name := default .Chart.Name .Values.nameOverride }}
-{{- if contains $name .Release.Name }}
-{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- if .Values.fullnameOverride }}
+{{- $name = .Values.fullnameOverride }}
 {{- else }}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- if contains $name .Release.Name }}
+{{- $name = .Release.Name}}
+{{- else }}
+{{- $name = printf "%s-%s" .Release.Name $name }}
 {{- end }}
+{{- end }}
+{{- include "addSuffixAndTrim" (dict "name" $name "suffix" .nameSuffix) -}}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+If release name contains chart name it will be used as a full name.
+*/}}
+{{- define "addSuffixAndTrim" -}}
+{{- if .suffix -}}
+{{- $truncSize := int (sub 62 (len .suffix)) -}}
+{{- $trimmmedName := .name | trunc $truncSize | trimSuffix "-" -}}
+{{- printf "%s-%s" $trimmmedName .suffix -}}
+{{- else -}}
+{{- .name | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 {{- end }}
 

@@ -11,6 +11,7 @@ metadata:
     app.kubernetes.io/instance: release-name
     app.kubernetes.io/version: "0.1.6"
     app.kubernetes.io/managed-by: Helm
+    app: eks-pod-identity-agent
 spec:
   updateStrategy:
     rollingUpdate:
@@ -25,6 +26,9 @@ spec:
       labels:
         app.kubernetes.io/name: eks-pod-identity-agent
         app.kubernetes.io/instance: release-name
+      annotations:
+        prometheus.io/port: "2705"
+        prometheus.io/scrape: "true"
     spec:
       priorityClassName: system-node-critical
       hostNetwork: true
@@ -53,7 +57,7 @@ spec:
                 - auto
       initContainers:
         - name: eks-pod-identity-agent-init
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.0.22
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.1.10
           imagePullPolicy: Always
           command: ['/go-runner', '/eks-pod-identity-agent', 'initialize']
           args:
@@ -63,7 +67,7 @@ spec:
             privileged: true
       containers:
         - name: eks-pod-identity-agent
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.0.22
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.1.10
           imagePullPolicy: Always
           command: ['/go-runner', '/eks-pod-identity-agent', 'server']
           args:
