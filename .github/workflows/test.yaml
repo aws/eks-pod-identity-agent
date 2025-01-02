@@ -21,4 +21,9 @@ jobs:
     - name: Test
       run: go mod tidy && go mod vendor && go test ./...
     - name: Verify helm template
-      run: make helm-verify 
+      run: make helm-verify
+    - name: Tag release
+      run: |
+        /usr/bin/git config --global user.email actions@github.com
+        /usr/bin/git config --global user.name 'GitHub Actions Release Tagger'
+        hack/tag-release.sh
