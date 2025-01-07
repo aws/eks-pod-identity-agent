@@ -133,10 +133,12 @@ func (c *cache[K, V]) SetWithRefreshExpire(k K, v V, refresh, expire time.Durati
 	c.mu.Lock()
 
 	evictedEntry := c.lru.Add(k, true)
-	var evictedV V
-	var shouldCallOnEvict bool
+	var (
+		evictedValue V
+		evicted      bool
+	)
 	if evictedEntry != nil {
-		evictedV, shouldCallOnEvict = c.delete(evictedEntry.key)
+		evictedValue, evicted = c.delete(evictedEntry.key)
 	}
 	c.items[k] = Item[V]{
 		Object:     v,
@@ -145,8 +147,8 @@ func (c *cache[K, V]) SetWithRefreshExpire(k K, v V, refresh, expire time.Durati
 	}
 	c.mu.Unlock()
 
-	if shouldCallOnEvict {
-		c.onEvicted(evictedEntry.key, evictedV)
+	if evicted && c.onEvicted != nil {
+		c.onEvicted(evictedEntry.key, evictedValue)
 	}
 }
 
@@ -199,9 +201,9 @@ func (c *cache[K, V]) AddWithRefreshExpire(k K, v V, refresh, expire time.Durati
 		return fmt.Errorf("freshcache.Add: item %v already exists", k)
 	}
 
-	evictedValue, valueEvicted := c.set(k, v, refresh, expire)
+	evictedValue, evicted := c.set(k, v, refresh, expire)
 	c.mu.Unlock()
-	if valueEvicted {
+	if evicted && c.onEvicted != nil {
 		c.onEvicted(k, evictedValue)
 	}
 	return nil
@@ -232,9 +234,9 @@ func (c *cache[K, V]) ReplaceWithRefreshExpire(k K, v V, refresh, expire time.Du
 		return fmt.Errorf("freshcache.Replace: item %v doesn't exist", k)
 	}
 
-	evictedValue, valueEvicted := c.set(k, v, refresh, expire)
+	evictedValue, evicted := c.set(k, v, refresh, expire)
 	c.mu.Unlock()
-	if valueEvicted {
+	if evicted && c.onEvicted != nil {
 		c.onEvicted(k, evictedValue)
 	}
 	return nil
@@ -377,7 +379,7 @@ func (c *cache[K, V]) Delete(k K) {
 	c.mu.Lock()
 	v, evicted := c.delete(k)
 	c.mu.Unlock()
-	if evicted {
+	if evicted && c.onEvicted != nil {
 		c.onEvicted(k, v)
 	}
 }
@@ -424,7 +426,7 @@ func (c *cache[K, V]) Pop(k K) (V, bool) {
 
 	v, evicted := c.delete(k)
 	c.mu.Unlock()
-	if evicted {
+	if evicted && c.onEvicted != nil {
 		c.onEvicted(k, v)
 	}
 
@@ -449,8 +451,10 @@ func (c *cache[K, V]) RefreshOrEvictExpired() {
 	}
 	c.mu.Unlock()
 
-	for _, v := range itemsRequiringRefresh {
-		c.onRefresh(v.key, v.value)
+	if c.onRefresh != nil {
+		for _, v := range itemsRequiringRefresh {
+			c.onRefresh(v.key, v.value)
+		}
 	}
 
 	c.mu.Lock()
@@ -465,8 +469,10 @@ func (c *cache[K, V]) RefreshOrEvictExpired() {
 
 	}
 	c.mu.Unlock()
-	for _, v := range evictedItems {
-		c.onEvicted(v.key, v.value)
+	if c.onEvicted != nil {
+		for _, v := range evictedItems {
+			c.onEvicted(v.key, v.value)
+		}
 	}
 }
 
