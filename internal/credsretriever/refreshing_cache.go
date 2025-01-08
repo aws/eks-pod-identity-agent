@@ -85,7 +85,12 @@ const (
 	defaultThrottlingKey             = "default-throttling-key"
 	defaultThrottlingMsg             = "account throttling"
 	defaultThrottledRequestCacheSize = 10
-	defaultActiveRequestRetries      = 1
+	// default timeout for AWS credential provider is 1 sec:
+	// https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-credential-providers/
+	// therefore defaultActiveRequestRetries * defaultActiveRequestWaitTime should be configured as
+	// a bit smaller than 1 sec
+	defaultActiveRequestRetries  = 4
+	defaultActiveRequestWaitTime = 200 * time.Millisecond
 	// defaultCleanupInterval sets how often we go over the cache to check if
 	// there are expired credentials requiring renewal
 	defaultCleanupInterval  = 1 * time.Minute
@@ -173,8 +178,10 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		}
 
 		if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
-			// Wait 1s for active request to finish caching into internalCache
-			time.Sleep(1 * time.Second)
+			// Wait for active request to finish caching into internalCache, if not the last retry
+			if i < defaultActiveRequestRetries {
+				time.Sleep(defaultActiveRequestWaitTime)
+			}
 		} else {
 			// No active request, exit the loop to fetch from delegate
 			break
