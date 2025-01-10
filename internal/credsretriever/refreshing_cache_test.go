@@ -461,7 +461,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
 						time.Sleep(200 * time.Millisecond) // Simulate API call latency
 						return nil, nil, fmt.Errorf("my special error")
-					}).Times(numRequests)
+					}).Times(1)
 			},
 			expectedErrMsg: "my special error",
 		},

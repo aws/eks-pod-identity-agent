@@ -23,10 +23,12 @@ type cachedCredentialRetriever struct {
 	// are of type cacheEntry.
 	internalCache *expiring.Cache[string, cacheEntry]
 	// internalActiveRequestCache tracks the active ongoing requests. Key in the cache is the service
-	// token, values are simply boolean as a place holder. When a service token is in the
+	// token, values are errors returned from the active requests. When a service token is in the
 	// internalActiveRequestCache, but not internalCache, it means an active request is ongoing,
-	// other requests to the same service token should wait for this active request
-	internalActiveRequestCache *expiring.Cache[string, bool]
+	// other requests to the same service token should wait for this active request.
+	// When an error is returned from the internalActiveRequestCache, the other requests should return
+	// error from internalActiveRequestCache instead of reaching out to EKS Auth service
+	internalActiveRequestCache *expiring.Cache[string, error]
 	// internalThrottledRequestCache tracks the ongoing throttled requests. Key in the cache is the
 	// caller, values are simply boolean as a place holder. Since the account based throttling rules,
 	// when throttling happens, it is applied to all the requests coming to the pod-identity-agent,
@@ -91,6 +93,7 @@ const (
 	// a bit smaller than 1 sec
 	defaultActiveRequestRetries  = 4
 	defaultActiveRequestWaitTime = 200 * time.Millisecond
+	defaultActiveRequestInterval = 1 * time.Second
 	// defaultCleanupInterval sets how often we go over the cache to check if
 	// there are expired credentials requiring renewal
 	defaultCleanupInterval  = 1 * time.Minute
@@ -133,7 +136,7 @@ func NewCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) credential
 
 func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCredentialRetriever {
 	internalCache := expiring.NewLru[string, cacheEntry](opts.MaxCacheSize, opts.CredentialsRenewalTtl, opts.CleanupInterval)
-	internalActiveRequestCache := expiring.NewLru[string, bool](opts.MaxCacheSize, 0, 0)
+	internalActiveRequestCache := expiring.NewLru[string, error](opts.MaxCacheSize, 0, 0)
 	internalThrottledRequestCache := expiring.NewLru[string, bool](defaultThrottledRequestCacheSize, 0, 1*time.Second)
 	retriever := &cachedCredentialRetriever{
 		delegate:                      opts.Delegate,
@@ -177,7 +180,12 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 			break
 		}
 
-		if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
+		if errActiveRequest, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
+			// if there is an error from the active request, return the error
+			if errActiveRequest != nil {
+				log.Errorf("Failed the request with error from the same active request: %v\n", errActiveRequest)
+				return nil, nil, errActiveRequest
+			}
 			// Wait for active request to finish caching into internalCache, if not the last retry
 			if i < defaultActiveRequestRetries {
 				time.Sleep(defaultActiveRequestWaitTime)
@@ -188,12 +196,18 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		}
 	}
 
-	r.internalActiveRequestCache.Add(request.ServiceAccountToken, true)
-	defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
+	r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
 
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
+	defer func() {
+		if err == nil {
+			r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
+		} else {
+			r.internalActiveRequestCache.ReplaceWithExpire(request.ServiceAccountToken, err, defaultActiveRequestInterval)
+		}
+	}()
 	if err != nil {
 		return nil, nil, err
 	}
