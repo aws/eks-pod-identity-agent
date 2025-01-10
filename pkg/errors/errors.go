@@ -58,6 +58,26 @@ func NewAccessDeniedError(reason string) *AccessDeniedError {
 	}
 }
 
+type ThrottledError struct {
+	Code    int
+	Message string
+}
+
+func (e *ThrottledError) Error() string {
+	return fmt.Sprintf("Too Many Requests. %s", e.Message)
+}
+
+func (e *ThrottledError) HttpStatus() int {
+	return e.Code
+}
+
+func NewThrottledError(reason string) *ThrottledError {
+	return &ThrottledError{
+		Message: reason,
+		Code:    http.StatusTooManyRequests,
+	}
+}
+
 func HandleCredentialFetchingError(ctx context.Context, err error) (string, int) {
 	log := logger.FromContext(ctx)
 	defer func() {
