@@ -183,7 +183,7 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		if errActiveRequest, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
 			// if there is an error from the active request, return the error
 			if errActiveRequest != nil {
-				log.Errorf("Failed the request with error from the same active request: %v\n", errActiveRequest)
+				log.Errorf("Failed the request with error from the same active request: %v", errActiveRequest)
 				return nil, nil, errActiveRequest
 			}
 			// Wait for active request to finish caching into internalCache, if not the last retry
@@ -201,16 +201,11 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
 
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
-	defer func() {
-		if err == nil {
-			r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
-		} else {
-			r.internalActiveRequestCache.ReplaceWithExpire(request.ServiceAccountToken, err, defaultActiveRequestInterval)
-		}
-	}()
 	if err != nil {
+		r.internalActiveRequestCache.ReplaceWithExpire(request.ServiceAccountToken, err, defaultActiveRequestInterval)
 		return nil, nil, err
 	}
+	r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 	return iamCredentials.credentials, metadata, nil
 }
 
@@ -248,7 +243,7 @@ func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Con
 	request *credentials.EksCredentialsRequest) (cacheEntry, error) {
 	log := logger.FromContext(ctx)
 	if _, ok := r.internalThrottledRequestCache.Get(defaultThrottlingKey); ok {
-		log.Errorf("Account being throttled for 1 sec\n")
+		log.Errorf("Account being throttled for 1 sec")
 		return cacheEntry{}, errors.NewThrottledError(defaultThrottlingMsg)
 	}
 	iamCredentials, metadata, err := r.delegate.GetIamCredentials(ctx, request)
@@ -256,8 +251,8 @@ func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Con
 		_, statusCode := errors.HandleCredentialFetchingError(ctx, err)
 		if statusCode == http.StatusTooManyRequests {
 			r.internalThrottledRequestCache.SetWithExpire(defaultThrottlingKey, true, 1*time.Second)
+			log.Errorf("Throttle account for 1 sec")
 		}
-		log.Errorf("Throttle account for 1 sec\n")
 		return cacheEntry{}, err
 	}
 	requestLogCtx := logger.ContextWithField(logger.CloneToNewIfPresent(ctx, context.Background()),
