@@ -91,7 +91,7 @@ image:
   containerRegistry: "602401143452.dkr.ecr.us-west-2.amazonaws.com"
   pullPolicy: Always
   region: us-west-2
-  tag: 0.1.10
+  tag: v0.1.20
 
   # Set to use custom image
   # override: "repo/org/image:tag"
