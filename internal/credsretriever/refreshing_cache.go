@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,7 +12,6 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"golang.org/x/time/rate"
 )
 
@@ -29,12 +27,6 @@ type cachedCredentialRetriever struct {
 	// When an error is returned from the internalActiveRequestCache, the other requests should return
 	// error from internalActiveRequestCache instead of reaching out to EKS Auth service
 	internalActiveRequestCache *expiring.Cache[string, error]
-	// internalThrottledRequestCache tracks the ongoing throttled requests. Key in the cache is the
-	// caller, values are simply boolean as a place holder. Since the account based throttling rules,
-	// when throttling happens, it is applied to all the requests coming to the pod-identity-agent,
-	// thus the key can be a hardcoded value "default-throttling-key".
-	// The internalThrottledRequestCache leverages the key eviction with TTL
-	internalThrottledRequestCache *expiring.Cache[string, bool]
 	// delegate is who we are actually getting the credentials from
 	delegate credentials.CredentialRetriever
 	// credentialsRenewalTtl the maximum amount of time that we can hold
@@ -84,9 +76,6 @@ var (
 )
 
 const (
-	defaultThrottlingKey             = "default-throttling-key"
-	defaultThrottlingMsg             = "account throttling"
-	defaultThrottledRequestCacheSize = 10
 	// default timeout for AWS credential provider is 1 sec:
 	// https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-credential-providers/
 	// therefore defaultActiveRequestRetries * defaultActiveRequestWaitTime should be configured as
@@ -137,18 +126,16 @@ func NewCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) credential
 func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCredentialRetriever {
 	internalCache := expiring.NewLru[string, cacheEntry](opts.MaxCacheSize, opts.CredentialsRenewalTtl, opts.CleanupInterval)
 	internalActiveRequestCache := expiring.NewLru[string, error](opts.MaxCacheSize, 0, 0)
-	internalThrottledRequestCache := expiring.NewLru[string, bool](defaultThrottledRequestCacheSize, 0, 1*time.Second)
 	retriever := &cachedCredentialRetriever{
-		delegate:                      opts.Delegate,
-		internalCache:                 internalCache,
-		internalActiveRequestCache:    internalActiveRequestCache,
-		internalThrottledRequestCache: internalThrottledRequestCache,
-		credentialsRenewalTtl:         opts.CredentialsRenewalTtl,
-		minCredentialTtl:              defaultMinCredentialTtl,
-		retryInterval:                 defaultRetryInterval,
-		maxRetryJitter:                defaultMaxRetryJitter,
-		now:                           time.Now,
-		refreshRateLimiter:            rate.NewLimiter(rate.Limit(opts.RefreshQPS), opts.RefreshQPS),
+		delegate:                   opts.Delegate,
+		internalCache:              internalCache,
+		internalActiveRequestCache: internalActiveRequestCache,
+		credentialsRenewalTtl:      opts.CredentialsRenewalTtl,
+		minCredentialTtl:           defaultMinCredentialTtl,
+		retryInterval:              defaultRetryInterval,
+		maxRetryJitter:             defaultMaxRetryJitter,
+		now:                        time.Now,
+		refreshRateLimiter:         rate.NewLimiter(rate.Limit(opts.RefreshQPS), opts.RefreshQPS),
 	}
 	internalCache.OnRefresh(retriever.onCredentialRenewal)
 	internalCache.OnEvicted(retriever.onCredentialEviction)
@@ -241,18 +228,8 @@ func (r *cachedCredentialRetriever) credentialsInEntryWithinValidTtl(newCacheEnt
 
 func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (cacheEntry, error) {
-	log := logger.FromContext(ctx)
-	if _, ok := r.internalThrottledRequestCache.Get(defaultThrottlingKey); ok {
-		log.Errorf("Account being throttled for 1 sec")
-		return cacheEntry{}, errors.NewThrottledError(defaultThrottlingMsg)
-	}
 	iamCredentials, metadata, err := r.delegate.GetIamCredentials(ctx, request)
 	if err != nil {
-		_, statusCode := errors.HandleCredentialFetchingError(ctx, err)
-		if statusCode == http.StatusTooManyRequests {
-			r.internalThrottledRequestCache.SetWithExpire(defaultThrottlingKey, true, 1*time.Second)
-			log.Errorf("Throttle account for 1 sec")
-		}
 		return cacheEntry{}, err
 	}
 	requestLogCtx := logger.ContextWithField(logger.CloneToNewIfPresent(ctx, context.Background()),
