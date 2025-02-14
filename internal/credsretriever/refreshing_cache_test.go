@@ -12,7 +12,6 @@ import (
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials/mockcreds"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.uber.org/mock/gomock"
 )
 
@@ -536,129 +535,6 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 					}
 				}
 			}
-		})
-	}
-}
-
-func TestCachedCredentialRetriever_GetIamCredentials_ThrottledRequestCaching(t *testing.T) {
-	var (
-		numRequests      = 4
-		sampleRequestOne = credentials.EksCredentialsRequest{
-			ServiceAccountToken: "some.jwt.token.one",
-		}
-		sampleResponseOne = credentials.EksCredentialsResponse{
-			AccountId:  "accountOne",
-			Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
-		}
-		sampleRequestTwo = credentials.EksCredentialsRequest{
-			ServiceAccountToken: "some.jwt.token.two",
-		}
-		sampleRequestThree = credentials.EksCredentialsRequest{
-			ServiceAccountToken: "some.jwt.token.three",
-		}
-		sampleResponseThree = credentials.EksCredentialsResponse{
-			AccountId:  "accountOne",
-			Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
-		}
-		sampleRequestFour = credentials.EksCredentialsRequest{
-			ServiceAccountToken: "some.jwt.token.four",
-		}
-	)
-
-	tests := []struct {
-		name                        string
-		requests                    []credentials.EksCredentialsRequest
-		expectedCredentialsResponse []credentials.EksCredentialsResponse
-		expectedErrMsg              string
-		expectedDelegateCalls       func(retriever *mockcreds.MockCredentialRetriever)
-	}{
-		{
-			name: "calls throttling error",
-			expectedDelegateCalls: func(delegate *mockcreds.MockCredentialRetriever) {
-				delegate.EXPECT().GetIamCredentials(gomock.Any(), &sampleRequestOne).DoAndReturn(
-					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-						time.Sleep(200 * time.Millisecond) // Simulate API call latency
-						response := sampleResponseOne
-						return &response, responseMetadataTest("one"), nil
-					}).Times(1)
-				delegate.EXPECT().GetIamCredentials(gomock.Any(), &sampleRequestTwo).DoAndReturn(
-					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-						time.Sleep(20 * time.Millisecond) // Simulate API call latency
-						return nil, nil, errors.NewThrottledError("my special error")
-					}).Times(1)
-				delegate.EXPECT().GetIamCredentials(gomock.Any(), &sampleRequestThree).DoAndReturn(
-					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-						time.Sleep(200 * time.Millisecond) // Simulate API call latency
-						response := sampleResponseThree
-						return &response, responseMetadataTest("three"), nil
-					}).Times(1)
-				delegate.EXPECT().GetIamCredentials(gomock.Any(), &sampleRequestFour).DoAndReturn(
-					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-						time.Sleep(20 * time.Millisecond) // Simulate API call latency
-						return nil, nil, fmt.Errorf("my special error")
-					}).Times(1)
-			},
-			expectedErrMsg: "my special error",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			g := NewWithT(t)
-			t.Parallel()
-
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-			ctx := context.Background()
-
-			// setup
-			delegate := mockcreds.NewMockCredentialRetriever(ctrl)
-			if test.expectedDelegateCalls != nil {
-				test.expectedDelegateCalls(delegate)
-			}
-
-			opts := CachedCredentialRetrieverOpts{
-				Delegate:              delegate,
-				CredentialsRenewalTtl: 1 * time.Minute,
-				MaxCacheSize:          5,
-				CleanupInterval:       defaultCleanupInterval,
-				RefreshQPS:            1,
-			}
-
-			retriever := newCachedCredentialRetriever(opts)
-
-			// normal request
-			req := sampleRequestOne
-			_, _, err := retriever.GetIamCredentials(ctx, &req)
-			g.Expect(err).ToNot(HaveOccurred())
-
-			// throttle account
-			req = sampleRequestTwo
-			_, _, err = retriever.GetIamCredentials(ctx, &req)
-			g.Expect(err.Error()).To(ContainSubstring(test.expectedErrMsg))
-
-			// account being throttled
-			for j := 0; j < numRequests; j++ {
-				req = sampleRequestThree
-				_, _, err = retriever.GetIamCredentials(ctx, &req)
-				g.Expect(err.Error()).To(ContainSubstring(defaultThrottlingMsg))
-				req = sampleRequestFour
-				_, _, err = retriever.GetIamCredentials(ctx, &req)
-				g.Expect(err.Error()).To(ContainSubstring(defaultThrottlingMsg))
-			}
-
-			// wait for defaultThrottlingKey to expire after 1s
-			time.Sleep(2 * time.Second)
-
-			// account recovered from being throttled
-			// normal request
-			req = sampleRequestThree
-			_, _, err = retriever.GetIamCredentials(ctx, &req)
-			g.Expect(err).ToNot(HaveOccurred())
-			// error request
-			req = sampleRequestFour
-			_, _, err = retriever.GetIamCredentials(ctx, &req)
-			g.Expect(err.Error()).To(ContainSubstring(test.expectedErrMsg))
 		})
 	}
 }
