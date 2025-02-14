@@ -57,7 +57,7 @@ spec:
                 - auto
       initContainers:
         - name: eks-pod-identity-agent-init
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.1.10
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
           imagePullPolicy: Always
           command: ['/go-runner', '/eks-pod-identity-agent', 'initialize']
           args:
@@ -67,7 +67,7 @@ spec:
             privileged: true
       containers:
         - name: eks-pod-identity-agent
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.1.10
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
           imagePullPolicy: Always
           command: ['/go-runner', '/eks-pod-identity-agent', 'server']
           args:
@@ -170,7 +170,7 @@ spec:
                 - hybrid
       initContainers:
         - name: eks-pod-identity-agent-init
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.1.10
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
           imagePullPolicy: Always
           command: ['/go-runner', '/eks-pod-identity-agent', 'initialize']
           args:
@@ -180,7 +180,7 @@ spec:
             privileged: true
       containers:
         - name: eks-pod-identity-agent
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:0.1.10
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
           imagePullPolicy: Always
           command: ['/go-runner', '/eks-pod-identity-agent', 'server']
           args:
