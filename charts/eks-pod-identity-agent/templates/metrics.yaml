@@ -34,7 +34,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: eks-pod-identiy-agent
+      app: eks-pod-identity-agent
   namespaceSelector:
     matchNames:
       - {{ .Release.Namespace }}
