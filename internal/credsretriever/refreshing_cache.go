@@ -76,11 +76,7 @@ var (
 )
 
 const (
-	// default timeout for AWS credential provider is 1 sec:
-	// https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-credential-providers/
-	// therefore defaultActiveRequestRetries * defaultActiveRequestWaitTime should be configured as
-	// a bit smaller than 1 sec
-	defaultActiveRequestRetries  = 4
+	defaultActiveRequestRetries  = 10
 	defaultActiveRequestWaitTime = 200 * time.Millisecond
 	defaultActiveRequestInterval = 1 * time.Second
 	// defaultCleanupInterval sets how often we go over the cache to check if
@@ -173,6 +169,9 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 				log.Errorf("Failed the request with error from the same active request: %v", errActiveRequest)
 				return nil, nil, errActiveRequest
 			}
+			if i > 0 {
+				log.Infof("Waiting for active request with %v tries", i)
+			}
 			// Wait for active request to finish caching into internalCache, if not the last retry
 			if i < defaultActiveRequestRetries {
 				time.Sleep(defaultActiveRequestWaitTime)
@@ -181,6 +180,10 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 			// No active request, exit the loop to fetch from delegate
 			break
 		}
+	}
+
+	if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
+		log.Warnf("Failed to complete active request in %v tries", defaultActiveRequestRetries)
 	}
 
 	r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil)
