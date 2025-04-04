@@ -28,6 +28,7 @@ tmp_dir=$(mktemp -d)
 template_path=${tmp_dir}/template.yaml
 expected_default_template_path=hack/testdata/expected_eks_pod_identity_agent_default_helm_template.yaml
 expected_hybrid_template_path=hack/testdata/expected_eks_pod_identity_agent_hybrid_helm_template.yaml
+expected_hybrid_bottlerocket_template_path=hack/testdata/expected_eks_pod_identity_agent_hybrid_bottlerocket_helm_template.yaml
 
 echo "Validating default helm template for eks-pod-identity-agent"
 helm_template ${template_path}
@@ -38,5 +39,11 @@ helm_template ${template_path} "--set daemonsets.hybrid.create=true
     --set nameOverride=eks-pod-identity-agent-custom-test-truncate-123213213121321121-this-part-should-be-truncated
     --set fullnameOverride=eks-pod-identity-agent-custom-test-truncate-123213213121321121-this-part-should-be-truncated"
 compare_templates ${template_path} ${expected_hybrid_template_path}
+
+echo "Validating Bottlerocket hybrid helm template for eks-pod-identity-agent"
+helm_template ${template_path} "--set daemonsets.hybrid-bottlerocket.create=true
+    --set nameOverride=eks-pod-identity-agent-custom-test-truncate-123213213121321121-this-part-should-be-truncated
+    --set fullnameOverride=eks-pod-identity-agent-custom-test-truncate-123213213121321121-this-part-should-be-truncated"
+compare_templates ${template_path} ${expected_hybrid_bottlerocket_template_path}
 
 rm -rf ${tmp_dir}
