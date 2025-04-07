@@ -125,6 +125,9 @@ spec:
             capabilities:
               add:
                 - CAP_NET_BIND_SERVICE
+            {{- with $daemonset.additionalSecurityContext }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml $top.Values.resources | nindent 12 }}
           {{- if $top.Values.agent.livenessEndpoint }}

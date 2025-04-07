@@ -37,6 +37,49 @@ daemonsets:
                   operator: In
                   values:
                     - hybrid
+                - key: os.bottlerocket.aws/variant
+                  operator: DoesNotExist
+                - key: os.bottlerocket.aws/version
+                  operator: DoesNotExist
+  hybrid-bottlerocket:
+    create: false
+    nameSuffix: hybrid-bottlerocket
+    additionalArgs:
+      "--rotate-credentials": "true"
+    additionalSecurityContext:
+      seLinuxOptions:
+        type: spc_t
+    volumes:
+    - name: aws-credentials
+      hostPath:
+        path: /var/eks-hybrid/.aws
+        type: Directory
+    volumeMounts:
+    - mountPath: /root/.aws
+      name: aws-credentials
+      readOnly: true
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: "kubernetes.io/os"
+                  operator: In
+                  values:
+                    - linux
+                - key: "kubernetes.io/arch"
+                  operator: In
+                  values:
+                    - amd64
+                    - arm64
+                - key: "eks.amazonaws.com/compute-type"
+                  operator: In
+                  values:
+                    - hybrid
+                - key: os.bottlerocket.aws/variant
+                  operator: Exists
+                - key: os.bottlerocket.aws/version
+                  operator: Exists
 
 affinity:
   nodeAffinity:
