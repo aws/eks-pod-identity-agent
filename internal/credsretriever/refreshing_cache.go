@@ -76,8 +76,8 @@ var (
 )
 
 const (
-	defaultActiveRequestRetries  = 10
-	defaultActiveRequestWaitTime = 200 * time.Millisecond
+	defaultActiveRequestRetries  = 16
+	defaultActiveRequestWaitTime = 250 * time.Millisecond
 	defaultActiveRequestInterval = 1 * time.Second
 	// defaultCleanupInterval sets how often we go over the cache to check if
 	// there are expired credentials requiring renewal
