@@ -1,6 +1,6 @@
 module go.amzn.com/eks/eks-pod-identity-agent
 
-go 1.23.5
+go 1.23.6
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.26.1
