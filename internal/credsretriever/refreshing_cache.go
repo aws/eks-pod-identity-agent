@@ -76,9 +76,8 @@ var (
 )
 
 const (
-	defaultActiveRequestRetries  = 16
-	defaultActiveRequestWaitTime = 250 * time.Millisecond
-	defaultActiveRequestInterval = 1 * time.Second
+	minActiveRequestWaitTime = 100 * time.Millisecond
+	maxActiveRequestWaitTime = 400 * time.Millisecond
 	// defaultCleanupInterval sets how often we go over the cache to check if
 	// there are expired credentials requiring renewal
 	defaultCleanupInterval  = 1 * time.Minute
@@ -150,7 +149,8 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		return nil, nil, fmt.Errorf("service account is empty, cannot fetch credentials without a valid one")
 	}
 
-	for i := 0; i <= defaultActiveRequestRetries; i++ {
+	n := 0
+	for {
 		// Check if the request is in the cache, if it is, return it
 		if val, ok := r.internalCache.Get(request.ServiceAccountToken); ok {
 			if _, withinTtl := r.credentialsInEntryWithinValidTtl(val); withinTtl {
@@ -169,13 +169,17 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 				log.Errorf("Failed the request with error from the same active request: %v", errActiveRequest)
 				return nil, nil, errActiveRequest
 			}
-			if i > 0 {
-				log.Infof("Waiting for active request with %v tries", i)
-			}
+
 			// Wait for active request to finish caching into internalCache, if not the last retry
-			if i < defaultActiveRequestRetries {
-				time.Sleep(defaultActiveRequestWaitTime)
+			// 2^n exponential backoff
+			waitTime := minActiveRequestWaitTime * (1 << uint(n)) // 2^n backoff
+			if waitTime > maxActiveRequestWaitTime {
+				break
 			}
+
+			log.Infof("Retrying %v waiting for internalActiveRequestCache in %v\n", n, waitTime)
+			time.Sleep(waitTime)
+			n++
 		} else {
 			// No active request, exit the loop to fetch from delegate
 			break
@@ -183,19 +187,18 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	}
 
 	if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
-		log.Warnf("Failed to complete active request in %v tries", defaultActiveRequestRetries)
+		log.Warnf("Failed to complete active request in %v", maxActiveRequestWaitTime*2)
 	}
-
-	r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
 
+	r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil)
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
+	r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
+
 	if err != nil {
-		r.internalActiveRequestCache.ReplaceWithExpire(request.ServiceAccountToken, err, defaultActiveRequestInterval)
 		return nil, nil, err
 	}
-	r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 	return iamCredentials.credentials, metadata, nil
 }
 

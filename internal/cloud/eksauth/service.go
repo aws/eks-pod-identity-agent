@@ -3,6 +3,7 @@ package eksauth
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,6 +26,14 @@ type service struct {
 }
 
 func NewService(cfg aws.Config) Iface {
+	// Set up custom HTTP client with 2s timeout
+	// default credential provider timeout
+	// https://github.com/boto/botocore/blob/develop/botocore/utils.py#L3032
+	customHTTPClient := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+	// Inject custom HTTP client into AWS config
+	cfg.HTTPClient = customHTTPClient
 	eksAuthService := eksauth.NewFromConfig(cfg)
 	return &service{
 		eksAuthService: eksAuthService,
