@@ -202,24 +202,6 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	return iamCredentials.credentials, metadata, nil
 }
 
-// credentialsRenewalJitteredTtl returns a jittered TTL value between (ttl - 1h) and ttl
-// or between 0 and ttl if ttl < 1h
-func (r *cachedCredentialRetriever) credentialsRenewalJitteredTtl() time.Duration {
-	var (
-		ttl       = r.credentialsRenewalTtl
-		jitterMax time.Duration
-	)
-
-	if ttl >= time.Hour {
-		jitterMax = time.Hour
-		ttl -= time.Hour
-	} else {
-		jitterMax = ttl / 2
-		ttl = ttl / 2
-	}
-	return ttl + time.Duration(rand.Int63n(int64(jitterMax)))
-}
-
 func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (cacheEntry, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
@@ -234,7 +216,7 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 		return cacheEntry{}, nil, fmt.Errorf("fetched credentials are expired or will expire within the next %0.2f seconds", credsDuration.Seconds())
 	}
 
-	refreshTtl := minDuration(credsDuration, r.credentialsRenewalJitteredTtl())
+	refreshTtl := minDuration(credsDuration, r.credentialsRenewalTtl)
 	log.WithField("refreshTtl", refreshTtl).Infof("Storing creds in cache")
 
 	// Store credentials in cache if they are valid. It might be that
@@ -242,40 +224,6 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 	// thread, but it won't matter, we'll just upsert as the cache is thread safe
 	r.internalCache.SetWithRefreshExpire(request.ServiceAccountToken, newCacheEntry, refreshTtl, credsDuration)
 	return newCacheEntry, nil, nil
-}
-
-func (r *cachedCredentialRetriever) callDelegateAndCacheWithRetry(ctx context.Context,
-	request *credentials.EksCredentialsRequest, timeout time.Duration) (cacheEntry, credentials.ResponseMetadata, error) {
-	log := logger.FromContext(ctx)
-
-	n := 0
-	minWaitTime, maxWaitTime := minActiveRequestWaitTime, timeout/2
-	var (
-		iamCredentials cacheEntry
-		metadata       credentials.ResponseMetadata
-		err            error
-	)
-
-	for {
-		// Call callDelegateAndCache
-		iamCredentials, metadata, err = r.callDelegateAndCache(ctx, request)
-		if err == nil {
-			return iamCredentials, metadata, nil
-		}
-
-		// Wait if not the last retry
-		// 2^n exponential backoff
-		waitTime := minWaitTime * (1 << uint(n)) // 2^n backoff
-		if waitTime > maxWaitTime {
-			break
-		}
-
-		log.Infof("Retrying %v waiting for callDelegateAndCache in %v\n", n, waitTime)
-		time.Sleep(waitTime)
-		n++
-	}
-
-	return cacheEntry{}, nil, fmt.Errorf("error getting credentials and cache with retries: %w", err)
 }
 
 func (r *cachedCredentialRetriever) credentialsInEntryWithinValidTtl(newCacheEntry cacheEntry) (time.Duration, bool) {
@@ -312,7 +260,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			log.Errorf("Problem waiting, will schedule refresh to next sweep")
 			return
 		}
-		_, _, err = r.callDelegateAndCacheWithRetry(ctx, entry.originatingRequest, renewalTimeout)
+		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
 			promCacheState.WithLabelValues("hit").Inc()
