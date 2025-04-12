@@ -24,8 +24,6 @@ type cachedCredentialRetriever struct {
 	// token, values are errors returned from the active requests. When a service token is in the
 	// internalActiveRequestCache, but not internalCache, it means an active request is ongoing,
 	// other requests to the same service token should wait for this active request.
-	// When an error is returned from the internalActiveRequestCache, the other requests should return
-	// error from internalActiveRequestCache instead of reaching out to EKS Auth service
 	internalActiveRequestCache *expiring.Cache[string, error]
 	// delegate is who we are actually getting the credentials from
 	delegate credentials.CredentialRetriever
@@ -76,9 +74,8 @@ var (
 )
 
 const (
-	defaultActiveRequestRetries  = 16
-	defaultActiveRequestWaitTime = 250 * time.Millisecond
-	defaultActiveRequestInterval = 1 * time.Second
+	defaultActiveRequestRetries  = 9
+	defaultActiveRequestWaitTime = 200 * time.Millisecond
 	// defaultCleanupInterval sets how often we go over the cache to check if
 	// there are expired credentials requiring renewal
 	defaultCleanupInterval  = 1 * time.Minute
@@ -163,12 +160,10 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 			break
 		}
 
-		if errActiveRequest, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
-			// if there is an error from the active request, return the error
-			if errActiveRequest != nil {
-				log.Errorf("Failed the request with error from the same active request: %v", errActiveRequest)
-				return nil, nil, errActiveRequest
-			}
+		if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); !ok {
+			// No active request, exit the loop to fetch from delegate
+			break
+		} else {
 			if i > 0 {
 				log.Infof("Waiting for active request with %v tries", i)
 			}
@@ -176,9 +171,6 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 			if i < defaultActiveRequestRetries {
 				time.Sleep(defaultActiveRequestWaitTime)
 			}
-		} else {
-			// No active request, exit the loop to fetch from delegate
-			break
 		}
 	}
 
@@ -187,15 +179,14 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	}
 
 	r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil)
+	defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
 
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
 	if err != nil {
-		r.internalActiveRequestCache.ReplaceWithExpire(request.ServiceAccountToken, err, defaultActiveRequestInterval)
 		return nil, nil, err
 	}
-	r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 	return iamCredentials.credentials, metadata, nil
 }
 
