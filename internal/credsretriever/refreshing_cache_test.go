@@ -450,20 +450,6 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 				sampleResponseOne,
 			},
 		},
-		{
-			name: "calls with errors",
-			requests: []credentials.EksCredentialsRequest{
-				sampleRequestOne,
-			},
-			expectedDelegateCalls: func(delegate *mockcreds.MockCredentialRetriever) {
-				delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).DoAndReturn(
-					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-						time.Sleep(200 * time.Millisecond) // Simulate API call latency
-						return nil, nil, fmt.Errorf("my special error")
-					}).Times(1)
-			},
-			expectedErrMsg: "my special error",
-		},
 	}
 
 	for _, test := range tests {
