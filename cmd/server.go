@@ -42,7 +42,7 @@ var serverCmd = &cobra.Command{
 
 	Request that are sent to the credential path (/v1/credentials) will be proxied to EKS to fetch temporary
 	AWS credentials. The AWS SDKs used from within EKS workloads can be configured to invoke this endpoint
-    for granular IAM permissions.
+	for granular IAM permissions.
 
 	Example use: './eks-pod-identity-agent server'`, serverPort),
 	Run: func(cmd *cobra.Command, args []string) {
