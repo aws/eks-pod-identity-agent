@@ -15,7 +15,7 @@ jobs:
 
     permissions:
       contents: write
-
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -24,3 +24,55 @@ jobs:
           /usr/bin/git config --global user.email actions@github.com
           /usr/bin/git config --global user.name 'GitHub Actions Release Tagger'
           hack/tag-release.sh
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::314666526026:role/github-actions-amazon-eks-pod-identity-agent
+          aws-region: us-east-1
+      - name: Login to Amazon ECR Public
+        id: login-ecr-public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+      - name: Setup Go Version
+        run: echo "GO_VERSION=$(cat .go-version)" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: crazy-max/ghaction-docker-buildx@v3
+        with:
+          buildx-version: latest
+          qemu-version: latest  
+      - name: Build container and push to Dockerhub registry
+        run: |
+          BRANCH=$(echo $GITHUB_REF | cut -d'/' -f3)
+          SHORT_SHA=$(echo $GITHUB_SHA | cut -c -7)
+          REPO=public.ecr.aws/eks/eks-pod-identity-agent
+          VERSION=$(cat version.txt);
+          if [ "$BRANCH" = "main" ]; then
+            TAG=$SHORT_SHA
+          else
+            TAG=$BRANCH
+          fi
+
+          docker buildx build \
+                -t $REPO:$TAG \
+                --build-arg golang_image=public.ecr.aws/eks-distro-build-tooling/golang:${{ env.GO_VERSION }}-gcc \
+                --platform=linux/amd64,linux/arm64 \
+                --progress plain \
+                --push .
+          if [ "$BRANCH" = "main" ]; then
+            docker buildx build \
+                  -t $REPO:latest \
+                  --build-arg golang_image=public.ecr.aws/eks-distro-build-tooling/golang:${{ env.GO_VERSION }}-gcc \
+                  --platform=linux/amd64,linux/arm64 \
+                  --progress plain \
+                  --push .
+          fi
+          if [ -n "$VERSION" ]; then
+            docker buildx build \
+                  -t $REPO:$VERSION \
+                  --build-arg golang_image=public.ecr.aws/eks-distro-build-tooling/golang:${{ env.GO_VERSION }}-gcc \
+                  --platform=linux/amd64,linux/arm64 \
+                  --progress plain \
+                  --push .
+          fi
