@@ -30,6 +30,7 @@ spec:
         prometheus.io/port: "2705"
         prometheus.io/scrape: "true"
     spec:
+      automountServiceAccountToken: false
       priorityClassName: system-node-critical
       hostNetwork: true
       terminationGracePeriodSeconds: 30
@@ -145,6 +146,7 @@ spec:
         prometheus.io/port: "2705"
         prometheus.io/scrape: "true"
     spec:
+      automountServiceAccountToken: false
       priorityClassName: system-node-critical
       hostNetwork: true
       terminationGracePeriodSeconds: 30
