@@ -24,6 +24,7 @@ spec:
         app.kubernetes.io/name: eks-pod-identity-agent
         app.kubernetes.io/instance: release-name
     spec:
+      automountServiceAccountToken: false
       priorityClassName: system-node-critical
       hostNetwork: true
       terminationGracePeriodSeconds: 30
