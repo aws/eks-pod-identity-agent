@@ -1,4 +1,4 @@
-package sharedcredsrotater
+package credproviders
 
 import (
 	"context"
