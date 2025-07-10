@@ -3,6 +3,8 @@ package eksauth
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,6 +27,16 @@ type service struct {
 }
 
 func NewService(cfg aws.Config) Iface {
+	// Configure HTTP client with custom timeouts
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: 500 * time.Millisecond, // Socket timeout
+			}).DialContext,
+		},
+		Timeout: 600 * time.Millisecond, // HTTP request timeout
+	}
+	cfg.HTTPClient = httpClient
 	eksAuthService := eksauth.NewFromConfig(cfg)
 	return &service{
 		eksAuthService: eksAuthService,
