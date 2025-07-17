@@ -276,7 +276,6 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			Infof("Credentials still valid for at least %0.2fs, keeping them will try again after ttl expires", oldCredsDuration.Seconds())
 		r.internalCache.SetWithRefreshExpire(key, entry, newRefreshTtl, oldCredsDuration)
 	} else {
-		promCacheState.WithLabelValues("evicted").Inc()
 		log.Infof("Evicting credentials since they are too old")
 	}
 }
@@ -284,6 +283,7 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 func (r *cachedCredentialRetriever) onCredentialEviction(key string, entry cacheEntry) {
 	log := logger.FromContext(entry.requestLogCtx)
 	log.Infof("Credentials evicted")
+	promCacheState.WithLabelValues("evicted").Inc()
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {
