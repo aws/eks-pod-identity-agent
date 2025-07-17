@@ -63,7 +63,7 @@ var (
 	promCacheError = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_identity_cache_errors",
 		Help: "Removing credentials from cache, got non recoverable error",
-	}, []string{"type"},
+	}, []string{"type", "code"},
 	)
 
 	promCacheState = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -255,9 +255,9 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			return
 		}
 
-		if eksauth.IsIrrecoverableApiError(err) {
+		if code, ok := eksauth.IsIrrecoverableApiError(err); ok {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
-			promCacheError.WithLabelValues("NonRecoverable").Inc()
+			promCacheError.WithLabelValues("NonRecoverable", code).Inc()
 			r.internalCache.Delete(entry.originatingRequest.ServiceAccountToken)
 			return
 		}

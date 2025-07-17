@@ -7,7 +7,7 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-func IsIrrecoverableApiError(err error) bool {
+func IsIrrecoverableApiError(err error) (string, bool) {
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		switch ae.(type) {
@@ -15,10 +15,10 @@ func IsIrrecoverableApiError(err error) bool {
 			*types.ExpiredTokenException,
 			*types.InvalidTokenException,
 			*types.AccessDeniedException:
-			return true
+			return ae.ErrorCode(), true
 		default:
-			return false
+			return ae.ErrorCode(), false
 		}
 	}
-	return false
+	return "", false
 }
