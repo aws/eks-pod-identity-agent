@@ -182,6 +182,7 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
+	promCacheState.WithLabelValues("miss").Inc()
 
 	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
 	if err != nil {
