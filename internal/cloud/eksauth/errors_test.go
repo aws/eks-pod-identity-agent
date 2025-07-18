@@ -10,9 +10,10 @@ import (
 
 func TestIsIrrecoverableApiError(t *testing.T) {
 	tests := []struct {
-		name   string
-		errors []error
-		result bool
+		name          string
+		errors        []error
+		expectedCodes []string
+		expectedOk    bool
 	}{
 		{
 			name: "single exception, can be identified as irrecoverable",
@@ -22,21 +23,33 @@ func TestIsIrrecoverableApiError(t *testing.T) {
 				&types.InvalidTokenException{},
 				&types.ResourceNotFoundException{},
 			},
-			result: true,
+			expectedCodes: []string{
+				"AccessDeniedException",
+				"ExpiredTokenException",
+				"InvalidTokenException",
+				"ResourceNotFoundException",
+			},
+			expectedOk: true,
 		},
 		{
 			name: "single exception, can be identified as recoverable",
 			errors: []error{
 				&types.InternalServerException{},
 			},
-			result: false,
+			expectedCodes: []string{
+				"InternalServerException",
+			},
+			expectedOk: false,
 		},
 		{
 			name: "single exception, can be identified as irrecoverable if wrapped",
 			errors: []error{
 				fmt.Errorf("error, layer 1: %w", &types.AccessDeniedException{}),
 			},
-			result: true,
+			expectedCodes: []string{
+				"AccessDeniedException",
+			},
+			expectedOk: true,
 		},
 	}
 
@@ -44,8 +57,10 @@ func TestIsIrrecoverableApiError(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			for _, err := range test.errors {
-				g.Expect(IsIrrecoverableApiError(err)).To(Equal(test.result))
+			for i, err := range test.errors {
+				code, ok := IsIrrecoverableApiError(err)
+				g.Expect(ok).To(Equal(test.expectedOk))
+				g.Expect(code).To(Equal(test.expectedCodes[i]))
 			}
 		})
 	}
