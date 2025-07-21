@@ -7,6 +7,8 @@ import (
 	"github.com/aws/smithy-go"
 )
 
+const errCodeUnknown = "Unknown"
+
 func IsIrrecoverableApiError(err error) (string, bool) {
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
@@ -20,5 +22,5 @@ func IsIrrecoverableApiError(err error) (string, bool) {
 			return ae.ErrorCode(), false
 		}
 	}
-	return "", false
+	return errCodeUnknown, false
 }

@@ -1,6 +1,7 @@
 package eksauth
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -50,6 +51,16 @@ func TestIsIrrecoverableApiError(t *testing.T) {
 				"AccessDeniedException",
 			},
 			expectedOk: true,
+		},
+		{
+			name: "unknown error",
+			errors: []error{
+				errors.New("custom error"),
+			},
+			expectedCodes: []string{
+				"Unknown",
+			},
+			expectedOk: false,
 		},
 	}
 
