@@ -18,7 +18,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Prints agent version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("EKS Pod Identity Agent version %s\n",configuration.GetVersion())
+		fmt.Printf("EKS Pod Identity Agent version %s\n",configuration.AgentVersion)
 	},
 }
 
