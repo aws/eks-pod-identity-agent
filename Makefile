@@ -1,6 +1,8 @@
 ROOT_DIR_RELATIVE := .
 include $(ROOT_DIR_RELATIVE)/common.mk
 
+VERSION_FILE=version.txt
+
 # GIT_VERSION includes the latest git tag and is unique and not semver
 GIT_VERSION := $(shell git describe --tags --always)
 # GIT_VERSION_SHORT is only the latest git tag, not unique, semver
@@ -48,6 +50,7 @@ push: docker
 .PHONY: build
 build:
 	@echo "Building eks-pod-identity-agent for $(shell go env GOOS)/$(GOARCH)"
+	cp $(VERSION_FILE) configuration
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build \
 		-ldflags "-X 'k8s.io/component-base/version.gitVersion=$(GIT_VERSION_SHORT)' \
 		-X 'k8s.io/component-base/version.gitCommit=$(GIT_COMMIT_ID)' \
