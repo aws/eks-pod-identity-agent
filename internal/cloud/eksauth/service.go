@@ -34,7 +34,7 @@ func NewService(cfg aws.Config) Iface {
 				Timeout: 500 * time.Millisecond, // Socket timeout
 			}).DialContext,
 		},
-		Timeout: 600 * time.Millisecond, // HTTP request timeout
+		Timeout: 1000 * time.Millisecond, // HTTP request timeout
 	}
 	cfg.HTTPClient = httpClient
 	eksAuthService := eksauth.NewFromConfig(cfg)
