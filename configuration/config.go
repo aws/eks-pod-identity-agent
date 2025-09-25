@@ -8,3 +8,5 @@ const (
 
 // RequestRate indicates the number of request allowed per second
 const RequestRate = 1000
+
+var AgentVersion string

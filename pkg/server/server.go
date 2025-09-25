@@ -77,6 +77,7 @@ func (p *Server) ListenUntilContextCancelled(ctx context.Context) {
 
 	// Run the server in a goroutine
 	go func() {
+		log.Infof("Pod Identity Agent version %v", configuration.AgentVersion)
 		log.Info("Starting server...")
 		if err := p.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Unable to start server: %v", err)
