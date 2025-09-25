@@ -10,7 +10,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 )
 
-var AgentVersion string = "v0.1.32"
+var AgentVersion string
 
 // versionCmd represents the version command
 var versionCmd = &cobra.Command{
