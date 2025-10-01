@@ -1,6 +1,9 @@
 ROOT_DIR_RELATIVE := .
 include $(ROOT_DIR_RELATIVE)/common.mk
 
+VERSION_FILE=version.txt
+VERSION=$(shell cat $(VERSION_FILE))
+
 # GIT_VERSION includes the latest git tag and is unique and not semver
 GIT_VERSION := $(shell git describe --tags --always)
 # GIT_VERSION_SHORT is only the latest git tag, not unique, semver
@@ -51,7 +54,8 @@ build:
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build \
 		-ldflags "-X 'k8s.io/component-base/version.gitVersion=$(GIT_VERSION_SHORT)' \
 		-X 'k8s.io/component-base/version.gitCommit=$(GIT_COMMIT_ID)' \
-		-X 'k8s.io/component-base/version/verflag.programName=eks-pod-identity-agent' " \
+		-X 'k8s.io/component-base/version/verflag.programName=eks-pod-identity-agent' \
+		-X 'go.amzn.com/eks/eks-pod-identity-agent/configuration.AgentVersion=$(VERSION)' " \
 		-o $(BINARY) .
 
 # Run the agent locally
