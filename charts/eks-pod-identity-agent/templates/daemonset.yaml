@@ -91,9 +91,11 @@ spec:
             - {{ $value | quote }}
             {{- end }}
           ports:
+            {{- if $top.Values.agent.advertiseProxyPort }}
             - containerPort: 80
               protocol: TCP
               name: proxy
+            {{- end }}
             - containerPort: {{ $top.Values.agent.probePort }}
               protocol: TCP
               name: probes-port
