@@ -105,6 +105,7 @@ affinity:
 agent:
   additionalArgs:
     "-v": "trace"
+  advertiseProxyPort: true
   command: "['/go-runner', '/eks-pod-identity-agent', 'server']"
   livenessEndpoint: /healthz
   probePort: 2703
