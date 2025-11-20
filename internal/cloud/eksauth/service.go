@@ -30,6 +30,7 @@ func NewService(cfg aws.Config) Iface {
 	// Configure HTTP client with custom timeouts
 	httpClient := &http.Client{
 		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
 				Timeout: 500 * time.Millisecond, // Socket timeout
 			}).DialContext,
