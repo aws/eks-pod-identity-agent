@@ -6,18 +6,20 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"golang.org/x/time/rate"
 )
 
 type cachedCredentialRetriever struct {
 	// internalCache is where credentials are stored, it runs a janitor that evicts and refreshes
-	// entries once they expire. Key in the cache is the service token, values
+	// entries once they expire. Key in the cache is the pod UID, values
 	// are of type cacheEntry.
 	internalCache *expiring.Cache[string, cacheEntry]
 	// internalActiveRequestCache tracks the active ongoing requests. Key in the cache is the service
@@ -147,16 +149,22 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		return nil, nil, fmt.Errorf("service account is empty, cannot fetch credentials without a valid one")
 	}
 
+	podUID, err := getPodUIDfromServiceAccountToken(request.ServiceAccountToken)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get pod uid from service account token: %w", err)
+	}
+
 	for i := 0; i <= defaultActiveRequestRetries; i++ {
 		// Check if the request is in the cache, if it is, return it
-		if val, ok := r.internalCache.Get(request.ServiceAccountToken); ok {
+		val, ok := r.internalCache.Get(podUID)
+		if ok && val.originatingRequest.ServiceAccountToken == request.ServiceAccountToken {
 			if _, withinTtl := r.credentialsInEntryWithinValidTtl(val); withinTtl {
 				log.WithField("cache-hit", 1).Tracef("Using cached credentials")
 				return val.credentials, nil, nil
 			}
 
 			log.Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
-			r.internalCache.Delete(request.ServiceAccountToken)
+			r.internalCache.Delete(podUID)
 			break
 		}
 
@@ -195,6 +203,11 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (cacheEntry, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
 
+	podUID, err := getPodUIDfromServiceAccountToken(request.ServiceAccountToken)
+	if err != nil {
+		return cacheEntry{}, nil, fmt.Errorf("failed to get pod uid from service account token: %w", err)
+	}
+
 	newCacheEntry, err := r.fetchCredentialsFromDelegate(ctx, request)
 	if err != nil {
 		return cacheEntry{}, nil, fmt.Errorf("error getting credentials to cache: %w", err)
@@ -211,7 +224,7 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 	// Store credentials in cache if they are valid. It might be that
 	// the credentials might have been either removed or inserted by another
 	// thread, but it won't matter, we'll just upsert as the cache is thread safe
-	r.internalCache.SetWithRefreshExpire(request.ServiceAccountToken, newCacheEntry, refreshTtl, credsDuration)
+	r.internalCache.SetWithRefreshExpire(podUID, newCacheEntry, refreshTtl, credsDuration)
 	return newCacheEntry, nil, nil
 }
 
@@ -260,7 +273,12 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		if isIrrecoverableError {
 			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
 			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
-			r.internalCache.Delete(entry.originatingRequest.ServiceAccountToken)
+			podUID, err := getPodUIDfromServiceAccountToken(entry.originatingRequest.ServiceAccountToken)
+			if err != nil {
+				log.Errorf("Could not parse podUID from service account token, will schedule refresh to next sweep")
+				return
+			}
+			r.internalCache.Delete(podUID)
 			return
 		}
 		promCacheError.WithLabelValues("Recoverable", errCode).Inc()
@@ -296,3 +314,34 @@ func minDuration(a time.Duration, b time.Duration) time.Duration {
 		return a
 	}
 }
+
+func getPodUIDfromServiceAccountToken(token string) (string, error) {
+	jwtParser := jwt.NewParser()
+	parsedToken, _, err := jwtParser.ParseUnverified(token, jwt.MapClaims{})
+	if err != nil {
+		return "", errors.NewRequestValidationError(fmt.Sprintf("Service account token cannot be parsed: %v", err))
+	}
+
+	claims, ok := parsedToken.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", errors.NewRequestValidationError("Service account token claims cannot be parsed")
+	}
+
+	k8sInfo, ok := claims["kubernetes.io"].(map[string]interface{})
+	if !ok {
+		return "", errors.NewRequestValidationError("Service account token missing kubernetes.io claims")
+	}
+
+	podInfo, ok := k8sInfo["pod"].(map[string]interface{})
+	if !ok {
+		return "", errors.NewRequestValidationError("Service account token missing pod claims")
+	}
+
+	podUID, ok := podInfo["uid"].(string)
+	if !ok {
+		return "", errors.NewRequestValidationError("Service account token missing pod uid")
+	}
+
+	return podUID, nil
+}
+
