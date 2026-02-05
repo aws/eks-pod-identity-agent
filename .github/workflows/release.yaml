@@ -10,7 +10,7 @@ on:
 
 jobs:
   release:
-    if: ${{ github.repository == 'aws/eks-pod-identity-agent' }}
+    if: ${{ github.repository == 'notSoWiseOldMan/eks-pod-identity-agent' }}
     runs-on: ubuntu-latest
 
     permissions:
