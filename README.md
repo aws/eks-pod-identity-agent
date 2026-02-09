@@ -35,6 +35,32 @@ Update below Env in hack/dev/ds.yaml:
 
 Run `kubectl apply -f hack/dev/ds.yaml`
 
+## Dependency Management
+
+This repository uses automated dependency management to keep dependencies secure and up-to-date.
+
+### Automated Security Updates
+
+- **Dependabot** runs daily scans to detect CVEs and security vulnerabilities in Go dependencies
+- When a security issue is detected, Dependabot automatically creates a PR with the fix
+- Go version updates are automatically synchronized across:
+  - `go.mod` - Go module version
+  - `.go-version` - Tooling version reference
+  - `Dockerfile` - Builder image version
+
+### How It Works
+
+1. Dependabot scans dependencies daily against GitHub's Security Advisory Database (includes CVEs from NVD and other sources)
+2. When an update is needed, Dependabot creates a PR updating `go.mod`
+3. A GitHub Actions workflow automatically detects the change and updates `.go-version` and `Dockerfile` to match
+4. All three files are kept in sync within the same PR
+
+This ensures consistent Go versions across the project and rapid response to security vulnerabilities.
+
+### Testing
+
+See [TESTING.md](TESTING.md) for details on how the automated sync workflow was tested and validated.
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
