@@ -16,7 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credproviders"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/server"
 )
@@ -49,6 +49,7 @@ var serverCmd = &cobra.Command{
 		ctx := context.Background()
 		log := logger.FromContext(ctx)
 		cfg, err := config.LoadDefaultConfig(ctx)
+		cfg.Credentials = aws.NewCredentialsCache(credproviders.CustomDefaultCredentialsProvider(cfg))
 		if overrideEksAuthEndpoint != "" {
 			overrideEndpointInCfg(log, &cfg, overrideEksAuthEndpoint)
 		}
@@ -57,7 +58,7 @@ var serverCmd = &cobra.Command{
 		}
 		if rotateCredentials {
 			log.Info("Credentials rotation enabled. Creds will be fetched and rotated from shared credentials file")
-			cfg.Credentials = aws.NewCredentialsCache(sharedcredsrotater.NewRotatingSharedCredentialsProvider())
+			cfg.Credentials = aws.NewCredentialsCache(credproviders.NewRotatingSharedCredentialsProvider())
 		}
 
 		startServers(ctx, cfg)
