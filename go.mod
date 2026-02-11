@@ -10,9 +10,9 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/onsi/gomega v1.27.8
 	github.com/prometheus/client_golang v1.20.3
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.7.0
-	github.com/stretchr/testify v1.9.0
+	github.com/stretchr/testify v1.10.0
 	github.com/vishvananda/netlink v1.1.0
 	go.uber.org/mock v0.3.0
 	golang.org/x/sys v0.31.0
