@@ -25,7 +25,7 @@ jobs:
           /usr/bin/git config --global user.name 'GitHub Actions Release Tagger'
           hack/tag-release.sh
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a #v4.3.1
         with:
           role-to-assume: arn:aws:iam::314666526026:role/github-actions-amazon-eks-pod-identity-agent
           aws-region: us-east-1
