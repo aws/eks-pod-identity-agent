@@ -3,12 +3,13 @@ package validation
 import (
 	"context"
 	"fmt"
+	"net"
+
 	"github.com/golang-jwt/jwt/v5"
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
-	"net"
 )
 
 // A RequestValidator validates the requests that are expected by the agent
@@ -42,7 +43,7 @@ func (cv DefaultCredentialValidator) ValidateEksCredentialRequest(ctx context.Co
 		return err
 	}
 
-	err = cv.validateToken(credsRequest)
+	err = cv.validateTokenBasic(credsRequest)
 	if err != nil {
 		return err
 	}
@@ -51,9 +52,8 @@ func (cv DefaultCredentialValidator) ValidateEksCredentialRequest(ctx context.Co
 	return nil
 }
 
-// validateToken checks if the JWT token is parseable
-func (cv DefaultCredentialValidator) validateToken(credsRequest *credentials.EksCredentialsRequest) error {
-	// just verify the token is parseable, we will detect if it's valid or not on the service
+// validateTokenBasic checks if the JWT token is parseable and has valid registered claims.
+func (cv DefaultCredentialValidator) validateTokenBasic(credsRequest *credentials.EksCredentialsRequest) error {
 	if credsRequest.ServiceAccountToken == "" {
 		return errors.NewRequestValidationError("Service account token cannot be empty")
 	}
