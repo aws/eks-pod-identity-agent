@@ -17,7 +17,7 @@ python3 -c "import yaml; yaml.safe_load(open('.github/workflows/sync-go-version.
 ```bash
 grep '^go ' go.mod | awk '{print $2}'
 ```
-**Result**: Successfully extracted `1.25.6`
+**Result**: Successfully extracted `1.26.1`
 
 ### 3. .go-version File Update
 **Test**: Simulated writing extracted version to .go-version
@@ -25,14 +25,14 @@ grep '^go ' go.mod | awk '{print $2}'
 GO_VERSION=$(grep '^go ' go.mod | awk '{print $2}')
 echo "$GO_VERSION" > /tmp/test-go-version
 ```
-**Result**: ✓ File correctly written with version `1.25.6`
+**Result**: ✓ File correctly written with version `1.26.1`
 
 ### 4. Dockerfile Update
 **Test**: Verified sed command correctly updates Dockerfile
 ```bash
 sed -i "s/golang:[0-9.]\+/golang:1.26.0/" Dockerfile
 ```
-**Result**: ✓ Successfully updated from `golang:1.25.6` to `golang:1.26.0`
+**Result**: ✓ Successfully updated from `golang:1.26.1` to `golang:1.26.0`
 
 ### 5. End-to-End Workflow Simulation
 **Test**: Simulated complete workflow with version change
