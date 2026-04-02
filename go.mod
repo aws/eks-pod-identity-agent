@@ -16,7 +16,7 @@ require (
 	github.com/vishvananda/netlink v1.1.0
 	go.uber.org/mock v0.3.0
 	golang.org/x/sys v0.31.0
-	golang.org/x/time v0.3.0
+	golang.org/x/time v0.14.0
 )
 
 require (
