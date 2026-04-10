@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -12,10 +13,16 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"golang.org/x/time/rate"
 )
+
+// tokenValidator performs local JWT validation when available.
+type tokenValidator interface {
+	ValidateToken(ctx context.Context, req *credentials.EksCredentialsRequest) error
+}
 
 type cachedCredentialRetriever struct {
 	// internalCache is where credentials are stored, it runs a janitor that evicts and refreshes
@@ -29,6 +36,9 @@ type cachedCredentialRetriever struct {
 	internalActiveRequestCache *expiring.Cache[string, error]
 	// delegate is who we are actually getting the credentials from
 	delegate credentials.CredentialRetriever
+	// tokenValidator performs local JWT validation when available
+	tokenValidator      atomic.Value // stores tokenValidator interface
+	tvInitInFlight atomic.Bool
 	// credentialsRenewalTtl the maximum amount of time that we can hold
 	// credentials in the cache
 	credentialsRenewalTtl time.Duration
@@ -73,6 +83,12 @@ var (
 		Help: "The state of credential in cache",
 	}, []string{"state"},
 	)
+
+	promLocalValidation = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_identity_local_validation",
+		Help: "Outcome of local token validation: success, failure, or skipped",
+	}, []string{"result"},
+	)
 )
 
 const (
@@ -89,6 +105,7 @@ const (
 
 type CachedCredentialRetrieverOpts struct {
 	Delegate              credentials.CredentialRetriever
+	TokenValidator        tokenValidator
 	CredentialsRenewalTtl time.Duration
 	MaxCacheSize          int
 	RefreshQPS            int
@@ -132,6 +149,9 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 		now:                        time.Now,
 		refreshRateLimiter:         rate.NewLimiter(rate.Limit(opts.RefreshQPS), opts.RefreshQPS),
 	}
+	if opts.TokenValidator != nil {
+		retriever.tokenValidator.Store(opts.TokenValidator)
+	}
 	internalCache.OnRefresh(retriever.onCredentialRenewal)
 	internalCache.OnEvicted(retriever.onCredentialEviction)
 	return retriever
@@ -155,30 +175,12 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	}
 
 	for i := 0; i <= defaultActiveRequestRetries; i++ {
-		// Check if the request is in the cache, if it is, return it
-		val, ok := r.internalCache.Get(podUID)
-		if ok && val.originatingRequest.ServiceAccountToken == request.ServiceAccountToken {
-			if _, withinTtl := r.credentialsInEntryWithinValidTtl(val); withinTtl {
-				log.WithField("cache-hit", 1).Tracef("Using cached credentials")
-				return val.credentials, nil, nil
-			}
-
-			log.Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
-			r.internalCache.Delete(podUID)
-			break
+		if resp, done := r.tryServingFromCache(ctx, podUID, request); done {
+			return resp, nil, nil
 		}
 
-		if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); !ok {
-			// No active request, exit the loop to fetch from delegate
+		if !r.waitForActiveRequest(ctx, request.ServiceAccountToken, i) {
 			break
-		} else {
-			if i > 0 {
-				log.Infof("Waiting for active request with %v tries", i)
-			}
-			// Wait for active request to finish caching into internalCache, if not the last retry
-			if i < defaultActiveRequestRetries {
-				time.Sleep(defaultActiveRequestWaitTime)
-			}
 		}
 	}
 
@@ -197,6 +199,91 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		return nil, nil, err
 	}
 	return iamCredentials.credentials, metadata, nil
+}
+
+// tryServingFromCache checks the internal cache for valid credentials matching the request.
+// Returns the credentials and true if a cache hit was found, or nil and false otherwise.
+// If the cached entry has expired TTL, it deletes the entry and returns nil, false.
+func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
+	podUID string, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, bool) {
+	log := logger.FromContext(ctx)
+
+	val, ok := r.internalCache.Get(podUID)
+	if !ok {
+		return nil, false
+	}
+
+	if _, withinTtl := r.credentialsInEntryWithinValidTtl(val); !withinTtl {
+		log.Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
+		r.internalCache.Delete(podUID)
+		return nil, false
+	}
+
+	// If the cached credentials' token matches the incoming requests' token, return the credentials
+	if val.originatingRequest.ServiceAccountToken == request.ServiceAccountToken {
+		log.WithField("cache-hit", 1).Tracef("Using cached credentials")
+		return val.credentials, true
+	}
+
+	// Otherwise, attempt to validate the token locally
+	tv, ok := r.tokenValidator.Load().(tokenValidator)
+	if !ok {
+		r.tryInitTokenValidator(ctx)
+		promLocalValidation.WithLabelValues("skipped").Inc()
+		return nil, false
+	}
+
+	// Validate the token 
+	if err := tv.ValidateToken(ctx, request); err != nil {
+		log.Infof("Local token validation failed: %v, falling back to delegate", err)
+		promLocalValidation.WithLabelValues("failure").Inc()
+		return nil, false
+	}
+
+	r.internalCache.Modify(podUID, func(e cacheEntry) cacheEntry {
+		e.originatingRequest = request
+		return e
+	})
+	log.WithField("cache-hit", 1).Tracef("Local validation succeeded, using cached credentials")
+	promLocalValidation.WithLabelValues("success").Inc()
+	return val.credentials, true
+}
+
+// tryInitTokenValidator kicks off a background token validator initialization
+// if no other goroutine is already doing so. Uses an atomic CAS so that
+// callers never block — they just skip if init is already in progress.
+func (r *cachedCredentialRetriever) tryInitTokenValidator(ctx context.Context) {
+	if !r.tvInitInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer r.tvInitInFlight.Store(false)
+		log := logger.FromContext(ctx)
+		newTv, err := validation.NewTokenValidator(ctx)
+		if err != nil {
+			log.Infof("Token validator init failed: %v", err)
+			return
+		}
+		r.tokenValidator.Store(newTv)
+	}()
+}
+
+// waitForActiveRequest checks if there's an in-flight request for the same token.
+// Returns true if the caller should continue waiting (i.e. keep looping), false to break out.
+func (r *cachedCredentialRetriever) waitForActiveRequest(ctx context.Context,
+	token string, attempt int) bool {
+	log := logger.FromContext(ctx)
+
+	if _, ok := r.internalActiveRequestCache.Get(token); !ok {
+		return false
+	}
+	if attempt > 0 {
+		log.Infof("Waiting for active request with %v tries", attempt)
+	}
+	if attempt < defaultActiveRequestRetries {
+		time.Sleep(defaultActiveRequestWaitTime)
+	}
+	return true
 }
 
 func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
@@ -344,4 +431,3 @@ func getPodUIDfromServiceAccountToken(token string) (string, error) {
 
 	return podUID, nil
 }
-

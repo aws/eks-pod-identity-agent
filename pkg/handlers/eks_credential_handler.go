@@ -47,13 +47,24 @@ var (
 
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
 	credentialsRetriever := eksauth.NewService(opts.Cfg)
+
+	tv, err := validation.NewTokenValidator(context.Background())
+	if err != nil {
+		log := logger.FromContext(context.Background())
+		log.Infof("failed to initialize token validator: %v", err)
+	}
+
 	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
-		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(credsretriever.CachedCredentialRetrieverOpts{
+		retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
 			Delegate:              credentialsRetriever,
 			CredentialsRenewalTtl: opts.CredentialRenewal,
 			MaxCacheSize:          opts.MaxCacheSize,
 			RefreshQPS:            opts.RefreshQPS,
-		})
+		}
+		if tv != nil {
+			retrieverOpts.TokenValidator = tv
+		}
+		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
 	}
 
 	return &EksCredentialHandler{
