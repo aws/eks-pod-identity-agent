@@ -687,6 +687,7 @@ func TestCachedCredentialRetriever_AuthServiceFailure_NoCredentialsReturned(t *t
 	}
 	retriever := newCachedCredentialRetriever(opts)
 
+	// Pre-populate the cache with an entry for a pod UID using an initial JWT
 	podUID := "test-pod-uid-auth-failure"
 	initialTime := time.Now()
 	initialJWT := test.CreateToken(test.TokenConfig{
@@ -708,7 +709,7 @@ func TestCachedCredentialRetriever_AuthServiceFailure_NoCredentialsReturned(t *t
 	}
 	retriever.internalCache.Add(podUID, cachedEntry)
 
-	// Send a request coming from the same pod but with a different JWT
+	// Create a different JWT with the same pod UID (different iat/nbf/exp)
 	newTime := initialTime.Add(time.Minute)
 	newJWT := test.CreateToken(test.TokenConfig{
 		Expiry: newTime.Add(time.Hour),
@@ -717,15 +718,17 @@ func TestCachedCredentialRetriever_AuthServiceFailure_NoCredentialsReturned(t *t
 		PodUID: podUID,
 	})
 	g.Expect(newJWT).ToNot(Equal(initialJWT))
+
+	// Make a request with the new JWT
 	newRequest := &credentials.EksCredentialsRequest{
 		ServiceAccountToken: newJWT,
 	}
 
-	// Simulate a failure from the Auth Service
+	// The delegate (auth service) returns an error (InternalServerException)
 	delegate.EXPECT().GetIamCredentials(gomock.Any(), newRequest).
 		Return(nil, nil, &types.InternalServerException{}).Times(1)
 
-	// Exepct no credentials to have been returned, since the JWT cannot be validated
+	// Assert that no credentials are returned — the cached creds from the original JWT are not served
 	creds, _, err := retriever.GetIamCredentials(ctx, newRequest)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(creds).To(BeNil())
