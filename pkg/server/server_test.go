@@ -30,7 +30,7 @@ func TestEksCredentialServer(t *testing.T) {
 	)
 
 	var (
-		someValidServiceAccountToken = test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now())
+		someValidServiceAccountToken = test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()})
 		getMockCredentials           = func() *credentials.EksCredentialsResponse {
 			expTime, _ := time.Parse(time.RFC3339Nano, "2023-07-13T20:49:35.999999999Z")
 			return &credentials.EksCredentialsResponse{

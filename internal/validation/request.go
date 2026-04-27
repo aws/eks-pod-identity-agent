@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
-	_ "github.com/golang-jwt/jwt/v5"
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"

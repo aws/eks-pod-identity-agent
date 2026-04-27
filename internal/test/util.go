@@ -1,21 +1,35 @@
 package test
 
 import (
-	"github.com/golang-jwt/jwt/v5"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
-func CreateTokenForTest(expiry time.Time, iat time.Time, nbf time.Time) string {
-	someJwtSigningKey := []byte("signingKey")
+type TokenConfig struct {
+	Expiry time.Time
+	Iat    time.Time
+	Nbf    time.Time
+	PodUID string
+}
 
-	token, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		ExpiresAt: jwt.NewNumericDate(expiry),
-		IssuedAt:  jwt.NewNumericDate(iat),
-		NotBefore: jwt.NewNumericDate(nbf),
-		Issuer:    "some-issuer",
-		Subject:   "some-subject",
-		Audience:  []string{"some-audience"},
-	}).SignedString(someJwtSigningKey)
+func CreateToken(config TokenConfig) string {
+	signingKey := []byte("signingKey")
 
+	claims := jwt.MapClaims{
+		"exp": jwt.NewNumericDate(config.Expiry).Unix(),
+		"iat": jwt.NewNumericDate(config.Iat).Unix(),
+		"nbf": jwt.NewNumericDate(config.Nbf).Unix(),
+	}
+
+	if config.PodUID != "" {
+		claims["kubernetes.io"] = map[string]interface{}{
+			"pod": map[string]interface{}{
+				"uid": config.PodUID,
+			},
+		}
+	}
+
+	token, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(signingKey)
 	return token
 }

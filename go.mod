@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.31.12
 	github.com/aws/aws-sdk-go-v2/service/eksauth v1.11.7
 	github.com/aws/smithy-go v1.23.0
-	github.com/golang-jwt/jwt/v5 v5.2.2
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/onsi/gomega v1.27.8
 	github.com/prometheus/client_golang v1.20.3
 	github.com/sirupsen/logrus v1.9.3

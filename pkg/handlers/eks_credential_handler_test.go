@@ -46,7 +46,7 @@ func TestEksCredentialHandler_GetIamCredentialsHandler(t *testing.T) {
 	var (
 		validTargetHost              = configuration.DefaultIpv4TargetHost
 		someFutureTime               = time.Now().Add(1 * time.Hour)
-		someValidServiceAccountToken = test.CreateTokenForTest(someFutureTime, time.Now(), time.Now())
+		someValidServiceAccountToken = test.CreateToken(test.TokenConfig{Expiry: someFutureTime, Iat: time.Now(), Nbf: time.Now()})
 		validEksCredentialResponse   = &credentials.EksCredentialsResponse{
 			AccessKeyId:     "access-key-id",
 			SecretAccessKey: "secret-access-key",

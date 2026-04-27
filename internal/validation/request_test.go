@@ -32,33 +32,33 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 		{
 			name: "passes on valid request",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now()),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   someValidSrcAddr,
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: someValidSrcAddr,
 			},
 		},
 		{
 			name: "passes on valid request IPv6 no braces",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now()),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   someValidSrc6Addr,
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: someValidSrc6Addr,
 			},
 		},
 		{
 			name: "passes on valid request IPv6 with braces",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now()),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   someValidSrc6WithBraces,
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: someValidSrc6WithBraces,
 			},
 		},
 		{
 			name: "passes on valid request IPv6 with port",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now()),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   someValidSrc6WithPort,
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: someValidSrc6WithPort,
 			},
 		},
 		{
@@ -73,27 +73,27 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 		{
 			name: "no src add passed",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now()),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   "124.3.1.2",
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: "124.3.1.2",
 			},
 			error: fmt.Sprintf("Access Denied. Called agent through invalid address, please use either %s address not 124.3.1.2", defaultValidTargetHosts),
 		},
 		{
 			name: "expired token",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now(), time.Now(), time.Now()),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   someValidSrcAddr,
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now(), Iat: time.Now(), Nbf: time.Now()}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: someValidSrcAddr,
 			},
 			error: "Service account token failed basic claim validations: token is expired",
 		},
 		{
 			name: "token nbf in future",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateTokenForTest(time.Now().Add(1*time.Hour), time.Now(), time.Now().Add(1*time.Hour)),
-				ClusterName:         someValidClusterName,
-				RequestTargetHost:   someValidSrcAddr,
+				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now().Add(1 * time.Hour)}),
+				ClusterName:       someValidClusterName,
+				RequestTargetHost: someValidSrcAddr,
 			},
 			error: "Service account token failed basic claim validations: token is not valid yet",
 		},
