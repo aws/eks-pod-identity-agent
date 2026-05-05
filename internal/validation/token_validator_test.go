@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -417,9 +418,9 @@ func TestValidateToken_K8sVersionGating(t *testing.T) {
 	jwksResponse := JWKSet{Keys: []JWK{rsaJWK(test.DefaultKid, &signingKey.PublicKey)}}
 
 	tests := []struct {
-		name    string
-		version map[string]string
-		wantErr bool
+		name     string
+		version  map[string]string
+		wantErr  bool
 		closeSrv bool
 	}{
 		{
@@ -471,4 +472,206 @@ func TestValidateToken_K8sVersionGating(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failingJWKSProvider always returns an error from fetchPublicKeys,
+// simulating an unreachable apiserver.
+type failingJWKSProvider struct{}
+
+func (f *failingJWKSProvider) fetchPublicKeys(_ context.Context) (*JWKSet, error) {
+	return nil, fmt.Errorf("apiserver unreachable")
+}
+
+// TestRefreshKeys_DiskPersistence covers all interactions between refreshKeys and the
+// disk cache: persist on success, fallback on failure, graceful handling of write errors.
+func TestRefreshKeys_DiskPersistence(t *testing.T) {
+	tests := []struct {
+		name           string
+		providerFails  bool   // whether the jwksProvider returns an error
+		preSeedDisk    bool   // whether to write a cache file before calling refreshKeys
+		cachePath      string // override cache path ("" = no path, "nested" = subdir, "unwritable" = /proc/fake)
+		wantErr        bool
+		wantKeysInMem  bool
+		wantKeysOnDisk bool
+	}{
+		{
+			name:           "apiserver up, persists to disk",
+			providerFails:  false,
+			preSeedDisk:    false,
+			cachePath:      "normal",
+			wantKeysInMem:  true,
+			wantKeysOnDisk: true,
+		},
+		{
+			name:           "apiserver up, auto-creates nested directory",
+			providerFails:  false,
+			preSeedDisk:    false,
+			cachePath:      "nested",
+			wantKeysInMem:  true,
+			wantKeysOnDisk: true,
+		},
+		{
+			name:           "apiserver up, disk write fails, keys still loaded",
+			providerFails:  false,
+			preSeedDisk:    false,
+			cachePath:      "unwritable",
+			wantKeysInMem:  true,
+			wantKeysOnDisk: false,
+		},
+		{
+			name:           "apiserver down, falls back to disk cache",
+			providerFails:  true,
+			preSeedDisk:    true,
+			cachePath:      "normal",
+			wantKeysInMem:  true,
+			wantKeysOnDisk: true, // already on disk from pre-seed
+		},
+		{
+			name:          "apiserver down, no disk cache, returns error",
+			providerFails: true,
+			preSeedDisk:   false,
+			cachePath:     "normal",
+			wantErr:       true,
+			wantKeysInMem: false,
+		},
+		{
+			name:          "apiserver down, no cache path configured, returns error",
+			providerFails: true,
+			preSeedDisk:   false,
+			cachePath:     "",
+			wantErr:       true,
+			wantKeysInMem: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			key := test.GenerateTestKey(t)
+			jwks := &JWKSet{Keys: []JWK{rsaJWK("kid-1", &key.PublicKey)}}
+
+			// Resolve the cache path
+			var path string
+			switch tt.cachePath {
+			case "normal":
+				path = filepath.Join(t.TempDir(), "jwks-cache.json")
+			case "nested":
+				path = filepath.Join(t.TempDir(), "sub", "dir", "jwks-cache.json")
+			case "unwritable":
+				path = "/proc/fake/jwks-cache.json"
+			case "":
+				path = ""
+			}
+
+			// Pre-seed disk if needed
+			if tt.preSeedDisk && path != "" {
+				g.Expect(writeJWKCache(path, jwks)).To(Succeed())
+			}
+
+			// Set up provider
+			var source jwksProvider
+			if tt.providerFails {
+				source = &failingJWKSProvider{}
+			} else {
+				source = &channelJWKSProvider{called: make(chan struct{}, 1), jwks: jwks}
+			}
+
+			tv := &TokenValidator{jwksSource: source, jwkCachePath: path}
+			tv.keys.Store(make(keyCache))
+
+			err := tv.refreshKeys(context.Background())
+
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			// Check in-memory keys
+			cache := tv.keys.Load().(keyCache)
+			if tt.wantKeysInMem {
+				g.Expect(cache).To(HaveKey("kid-1"))
+			} else {
+				g.Expect(cache).To(BeEmpty())
+			}
+
+			// Check disk keys
+			if tt.wantKeysOnDisk && path != "" {
+				got, err := readJWKCache(path)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(got.Keys).To(HaveLen(1))
+			}
+		})
+	}
+}
+
+// TestRefreshKeys_AlreadyInFlight verifies that concurrent refresh attempts
+// are rejected with an error rather than blocking or double-fetching.
+func TestRefreshKeys_AlreadyInFlight(t *testing.T) {
+	g := NewWithT(t)
+	tv := &TokenValidator{}
+	tv.keys.Store(make(keyCache))
+	tv.refreshInFlight.Store(true)
+
+	err := tv.refreshKeys(context.Background())
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("already in progress"))
+}
+
+// TestIntegration_AgentRestart_ApiserverDown_ValidatesFromDiskCache simulates a full
+// agent lifecycle: fetch keys → persist to disk → restart with apiserver down →
+// validate a token using only the disk-cached keys.
+func TestIntegration_AgentRestart_ApiserverDown_ValidatesFromDiskCache(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	kid := "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+	signingKey := test.GenerateTestKey(t)
+	jwks := &JWKSet{Keys: []JWK{rsaJWK(kid, &signingKey.PublicKey)}}
+	cachePath := filepath.Join(t.TempDir(), "jwks-cache.json")
+
+	// --- First boot: apiserver is up, keys fetched and persisted ---
+	provider := &channelJWKSProvider{called: make(chan struct{}, 1), jwks: jwks}
+	tv1 := &TokenValidator{jwksSource: provider, jwkCachePath: cachePath}
+	tv1.keys.Store(make(keyCache))
+
+	err := tv1.refreshKeys(ctx)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(tv1.keys.Load().(keyCache)).To(HaveKey(kid))
+
+	// --- Simulate restart: new validator, apiserver is down ---
+	tv2 := &TokenValidator{jwksSource: &failingJWKSProvider{}, jwkCachePath: cachePath}
+	tv2.keys.Store(make(keyCache))
+
+	err = tv2.refreshKeys(ctx)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// --- Validate a token signed with the original key ---
+	now := time.Now()
+	token := test.CreateSignedToken(t, signingKey, test.TokenConfig{
+		Expiry: now.Add(time.Hour),
+		Iat:    now,
+		Nbf:    now,
+		Overrides: map[string]interface{}{
+			"sub": "system:serviceaccount:default:my-sa",
+			"kubernetes.io": map[string]interface{}{
+				"namespace": "default",
+				"pod": map[string]interface{}{
+					"name": "my-pod",
+					"uid":  "pod-uid",
+				},
+				"serviceaccount": map[string]interface{}{
+					"name": "my-sa",
+					"uid":  "sa-uid",
+				},
+			},
+		},
+		HeaderOverrides: map[string]interface{}{"kid": kid},
+	})
+
+	// Full ValidateToken: claims + signature verification using disk-cached keys
+	err = tv2.ValidateToken(ctx, &credentials.EksCredentialsRequest{
+		ServiceAccountToken: token,
+	})
+	g.Expect(err).ToNot(HaveOccurred())
 }

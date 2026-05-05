@@ -25,6 +25,7 @@ type TokenValidator struct {
 	keys            atomic.Value // stores keyCache, which maps key IDs (kid) to public keys
 	jwksSource      jwksProvider
 	refreshInFlight atomic.Bool
+	jwkCachePath    string // disk path for persisting JWKS between restarts
 }
 
 func NewTokenValidator(ctx context.Context) (*TokenValidator, error) {
@@ -32,8 +33,9 @@ func NewTokenValidator(ctx context.Context) (*TokenValidator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize apiserver client: %w", err)
 	}
-	tv := &TokenValidator{jwksSource: ac}
+	tv := &TokenValidator{jwksSource: ac, jwkCachePath: defaultJWKCachePath}
 	tv.keys.Store(make(keyCache))
+
 	go func() {
 		// pre-populate the cache, but do not return an error on failure
 		// cache misses should trigger a refresh on the next request
@@ -70,7 +72,7 @@ func (tv *TokenValidator) ValidateToken(ctx context.Context, req *credentials.Ek
 	if req.ServiceAccountToken == "" {
 		return errors.NewRequestValidationError("Service account token cannot be empty")
 	}
-	
+
 	parsedToken, _, err := jwt.NewParser().ParseUnverified(req.ServiceAccountToken, jwt.MapClaims{})
 	if err != nil {
 		return errors.NewRequestValidationError(fmt.Sprintf("Service account token cannot be parsed: %v", err))
@@ -87,7 +89,10 @@ func (tv *TokenValidator) ValidateToken(ctx context.Context, req *credentials.Ek
 	return nil
 }
 
-// refreshKeys fetches JWKS from the API server and refreshes the internal cache.
+// refreshKeys attempts to fetch JWKS from the apiserver and load them into the
+// in-memory cache. On success, keys are also persisted to disk. If the apiserver
+// is unreachable, it falls back to the last-known-good keys from the disk cache,
+// ensuring the agent can continue validating tokens across restarts and outages.
 func (tv *TokenValidator) refreshKeys(ctx context.Context) error {
 	if !tv.refreshInFlight.CompareAndSwap(false, true) {
 		return fmt.Errorf("key refresh already in progress")
@@ -98,10 +103,40 @@ func (tv *TokenValidator) refreshKeys(ctx context.Context) error {
 	log.Infof("Public key cache refresh triggered")
 	jwks, err := tv.jwksSource.fetchPublicKeys(ctx)
 	if err != nil {
-		return err
+		return tv.loadKeysFromDisk(ctx, err)
 	}
+
+	tv.persistKeys(ctx, jwks)
 	tv.loadJWKSet(ctx, jwks)
 	return nil
+}
+
+// loadKeysFromDisk attempts to load keys from the disk cache when the apiserver
+// is unreachable. Returns the original fetch error if the disk fallback also fails.
+func (tv *TokenValidator) loadKeysFromDisk(ctx context.Context, fetchErr error) error {
+	log := logger.FromContext(ctx)
+	if tv.jwkCachePath == "" {
+		return fetchErr
+	}
+	cached, err := readJWKCache(tv.jwkCachePath)
+	if err != nil {
+		log.Warnf("failed to load JWK cache from disk: %v", err)
+		return fetchErr
+	}
+	log.Warnf("apiserver fetch failed, loaded keys from disk cache: %v", fetchErr)
+	tv.loadJWKSet(ctx, cached)
+	return nil
+}
+
+// persistKeys writes the JWKSet to disk for future fallback use.
+func (tv *TokenValidator) persistKeys(ctx context.Context, jwks *JWKSet) {
+	if tv.jwkCachePath == "" {
+		return
+	}
+	if err := writeJWKCache(tv.jwkCachePath, jwks); err != nil {
+		log := logger.FromContext(ctx)
+		log.Warnf("failed to write JWK cache to disk: %v", err)
+	}
 }
 
 // loadJWKSet parses a JWKSet and atomically replaces the key cache.
