@@ -120,3 +120,24 @@ func TestValidateKubernetesClaims(t *testing.T) {
 		})
 	}
 }
+
+func TestRequireNestedString_NilAndEmptyParams(t *testing.T) {
+	tests := []struct {
+		name string
+		m    map[string]interface{}
+		key  string
+	}{
+		{"nil map", nil, "key"},
+		{"nil map and empty key", nil, ""},
+		{"non-nil map with empty key", map[string]interface{}{"a": "b"}, ""},
+		{"map value is nil", map[string]interface{}{"key": nil}, "key"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireNestedString(tc.m, tc.key, "test.path")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
