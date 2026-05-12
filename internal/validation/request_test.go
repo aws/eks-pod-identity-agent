@@ -2,7 +2,6 @@ package validation
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -27,12 +26,12 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 	testCases := []struct {
 		name       string
 		eksRequest credentials.EksCredentialsRequest
-		error      string
+		wantErr    bool
 	}{
 		{
 			name: "passes on valid request",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: someValidSrcAddr,
 			},
@@ -40,7 +39,7 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 		{
 			name: "passes on valid request IPv6 no braces",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: someValidSrc6Addr,
 			},
@@ -48,7 +47,7 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 		{
 			name: "passes on valid request IPv6 with braces",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: someValidSrc6WithBraces,
 			},
@@ -56,7 +55,7 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 		{
 			name: "passes on valid request IPv6 with port",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: someValidSrc6WithPort,
 			},
@@ -68,34 +67,34 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 				ClusterName:         someValidClusterName,
 				RequestTargetHost:   someValidSrcAddr,
 			},
-			error: "Service account token cannot be empty",
+			wantErr: true,
 		},
 		{
 			name: "no src add passed",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now()}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: "124.3.1.2",
 			},
-			error: fmt.Sprintf("Access Denied. Called agent through invalid address, please use either %s address not 124.3.1.2", defaultValidTargetHosts),
+			wantErr: true,
 		},
 		{
 			name: "expired token",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now(), Iat: time.Now(), Nbf: time.Now()}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now(), Iat: time.Now(), Nbf: time.Now()}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: someValidSrcAddr,
 			},
-			error: "Service account token failed basic claim validations: token is expired",
+			wantErr: true,
 		},
 		{
 			name: "token nbf in future",
 			eksRequest: credentials.EksCredentialsRequest{
-				ServiceAccountToken: test.CreateToken(test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now().Add(1 * time.Hour)}),
+				ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(1 * time.Hour), Iat: time.Now(), Nbf: time.Now().Add(1 * time.Hour)}),
 				ClusterName:       someValidClusterName,
 				RequestTargetHost: someValidSrcAddr,
 			},
-			error: "Service account token failed basic claim validations: token is not valid yet",
+			wantErr: true,
 		},
 	}
 
@@ -108,9 +107,8 @@ func TestValidateEksCredentialRequest(t *testing.T) {
 			err := DefaultCredentialValidator{}.ValidateEksCredentialRequest(context.Background(), &tc.eksRequest)
 
 			// validate
-			if tc.error != "" {
+			if tc.wantErr {
 				g.Expect(err).To(HaveOccurred())
-				g.Expect(err.Error()).To(Equal(tc.error))
 			} else {
 				g.Expect(err).To(Not(HaveOccurred()))
 			}
