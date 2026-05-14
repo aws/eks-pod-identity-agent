@@ -90,6 +90,9 @@ spec:
           env:
           - name: AWS_REGION
             value: "AWS_REGION_NAME"
+          volumeMounts:
+          - mountPath: /var/lib/eks-pod-identity-agent
+            name: jwk-cache
           securityContext:
             capabilities:
               add:
@@ -114,6 +117,9 @@ spec:
               scheme: HTTP
             initialDelaySeconds: 1
             timeoutSeconds: 10
+      volumes:
+        - emptyDir: {}
+          name: jwk-cache
 ---
 # Source: eks-pod-identity-agent/templates/daemonset.yaml
 apiVersion: apps/v1

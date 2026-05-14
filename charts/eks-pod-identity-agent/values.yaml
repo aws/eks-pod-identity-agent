@@ -5,6 +5,12 @@
 daemonsets:
   cloud:
     create: true
+    volumes:
+    - name: jwk-cache
+      emptyDir: {}
+    volumeMounts:
+    - mountPath: /var/lib/eks-pod-identity-agent
+      name: jwk-cache
   hybrid:
     create: false
     nameSuffix: hybrid
