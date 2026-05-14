@@ -31,11 +31,12 @@ type EksCredentialHandler struct {
 }
 
 type EksCredentialHandlerOpts struct {
-	Cfg               aws.Config
-	ClusterName       string
-	CredentialRenewal time.Duration
-	MaxCacheSize      int
-	RefreshQPS        int
+	Cfg                aws.Config
+	ClusterName        string
+	CredentialRenewal  time.Duration
+	MaxCacheSize       int
+	RefreshQPS         int
+	EndpointOverridden bool
 }
 
 var (
@@ -52,6 +53,9 @@ func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandle
 	if err != nil {
 		log := logger.FromContext(context.Background())
 		log.Infof("failed to initialize token validator: %v", err)
+	}
+	if tv != nil {
+		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
 	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {

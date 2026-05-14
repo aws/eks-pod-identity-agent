@@ -42,16 +42,17 @@ func parseToken(t *testing.T, tokenString string) *jwt.Token {
 
 func TestValidateClaims(t *testing.T) {
 	tests := []struct {
-		name    string
-		token   string
-		wantErr bool
+		name               string
+		token              string
+		endpointOverridden bool
+		wantErr            bool
 	}{
-		{"all valid", test.CreateToken(t, goodConfig()), false},
+		{"all valid", test.CreateToken(t, goodConfig()), true, false},
 		{"bad kid only", test.CreateToken(t, func() test.TokenConfig {
 			c := goodConfig()
 			c.HeaderOverrides = map[string]interface{}{"kid": "INVALID"}
 			return c
-		}()), true},
+		}()), true, true},
 		{"bad k8s claims only", test.CreateToken(t, func() test.TokenConfig {
 			c := goodConfig()
 			c.Overrides["kubernetes.io"] = map[string]interface{}{
@@ -59,12 +60,23 @@ func TestValidateClaims(t *testing.T) {
 				// missing serviceaccount and pod
 			}
 			return c
-		}()), true},
+		}()), true, true},
+		{"wrong audience rejected", test.CreateToken(t, func() test.TokenConfig {
+			c := goodConfig()
+			c.Overrides["aud"] = "wrong-audience"
+			return c
+		}()), false, true},
+		{"wrong audience accepted when endpoint overridden", test.CreateToken(t, func() test.TokenConfig {
+			c := goodConfig()
+			c.Overrides["aud"] = "wrong-audience"
+			return c
+		}()), true, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			parsed := parseToken(t, tc.token)
-			err := ValidateClaims(context.Background(), parsed)
+			tv := &TokenValidator{EndpointOverridden: tc.endpointOverridden}
+			err := tv.ValidateClaims(context.Background(), parsed)
 			if tc.wantErr && err == nil {
 				t.Fatal("expected error, got nil")
 			} else if !tc.wantErr && err != nil {
@@ -141,3 +153,30 @@ func TestRequireNestedString_NilAndEmptyParams(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAudience(t *testing.T) {
+	tests := []struct {
+		name    string
+		claims  jwt.MapClaims
+		wantErr bool
+	}{
+		{"correct audience string", jwt.MapClaims{"aud": expectedAudience}, false},
+		{"correct audience in array", jwt.MapClaims{"aud": []interface{}{expectedAudience}}, false},
+		{"correct audience among multiple", jwt.MapClaims{"aud": []interface{}{"other", expectedAudience}}, false},
+		{"wrong audience", jwt.MapClaims{"aud": "wrong"}, true},
+		{"wrong audience array", jwt.MapClaims{"aud": []interface{}{"wrong"}}, true},
+		{"missing audience", jwt.MapClaims{}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAudience(tc.claims)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			} else if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+
