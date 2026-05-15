@@ -22,10 +22,11 @@ type keyCache map[string]*cachedKey
 // TokenValidator provides deep JWT validation (claims + signature) using
 // a persistent public key cache fetched from the kube-apiserver.
 type TokenValidator struct {
-	keys            atomic.Value // stores keyCache, which maps key IDs (kid) to public keys
-	jwksSource      jwksProvider
-	refreshInFlight atomic.Bool
-	jwkCachePath    string // disk path for persisting JWKS between restarts
+	keys               atomic.Value // stores keyCache, which maps key IDs (kid) to public keys
+	jwksSource         jwksProvider
+	refreshInFlight    atomic.Bool
+	jwkCachePath       string // disk path for persisting JWKS between restarts
+	EndpointOverridden bool   // skip audience validation when endpoint is overridden
 }
 
 func NewTokenValidator(ctx context.Context) (*TokenValidator, error) {
@@ -78,7 +79,7 @@ func (tv *TokenValidator) ValidateToken(ctx context.Context, req *credentials.Ek
 		return errors.NewRequestValidationError(fmt.Sprintf("Service account token cannot be parsed: %v", err))
 	}
 
-	if err := ValidateClaims(ctx, parsedToken); err != nil {
+	if err := tv.ValidateClaims(ctx, parsedToken); err != nil {
 		return errors.NewRequestValidationError(fmt.Sprintf("Service account token failed claim validations: %v", err))
 	}
 	if err := tv.validateSignature(ctx, req.ServiceAccountToken, parsedToken); err != nil {

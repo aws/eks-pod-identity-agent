@@ -133,6 +133,7 @@ func TestValidateToken(t *testing.T) {
 		Iat:    now,
 		Nbf:    now,
 		Overrides: map[string]interface{}{
+			"aud":           expectedAudience,
 			"sub":           "system:serviceaccount:default:my-sa",
 			"kubernetes.io": fullK8sClaim(),
 		},
@@ -145,10 +146,11 @@ func TestValidateToken(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		token    string
-		cacheKey *rsa.PublicKey // public key cached for signature verification
-		wantErr  bool
+		name               string
+		token              string
+		cacheKey           *rsa.PublicKey // public key cached for signature verification
+		endpointOverridden bool
+		wantErr            bool
 	}{
 		{
 			name:     "valid claims and valid signature",
@@ -174,12 +176,43 @@ func TestValidateToken(t *testing.T) {
 			cacheKey: &wrongKey.PublicKey,
 			wantErr:  true,
 		},
+		{
+			name: "wrong audience rejected",
+			token: test.CreateSignedToken(t, signingKey, test.TokenConfig{
+				Expiry: now.Add(time.Hour),
+				Iat:    now,
+				Nbf:    now,
+				Overrides: map[string]interface{}{
+					"aud":           "wrong.audience.com",
+					"sub":           "system:serviceaccount:default:my-sa",
+					"kubernetes.io": fullK8sClaim(),
+				},
+			}),
+			cacheKey: &signingKey.PublicKey,
+			wantErr:  true,
+		},
+		{
+			name: "wrong audience accepted when endpoint overridden",
+			token: test.CreateSignedToken(t, signingKey, test.TokenConfig{
+				Expiry: now.Add(time.Hour),
+				Iat:    now,
+				Nbf:    now,
+				Overrides: map[string]interface{}{
+					"aud":           "custom.audience.com",
+					"sub":           "system:serviceaccount:default:my-sa",
+					"kubernetes.io": fullK8sClaim(),
+				},
+			}),
+			cacheKey:           &signingKey.PublicKey,
+			endpointOverridden: true,
+			wantErr:            false,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			tv := &TokenValidator{}
+			tv := &TokenValidator{EndpointOverridden: tc.endpointOverridden}
 			tv.keys.Store(keyCache{test.DefaultKid: {key: tc.cacheKey, alg: "RS256"}})
 
 			err := tv.ValidateToken(context.Background(), &credentials.EksCredentialsRequest{
@@ -303,6 +336,7 @@ func TestValidateToken_KeyRefreshOnCacheMiss(t *testing.T) {
 	kid := func(i int) string { return fmt.Sprintf("%040x", i) }
 
 	validClaims := map[string]interface{}{
+		"aud":           expectedAudience,
 		"sub":           "system:serviceaccount:default:my-sa",
 		"kubernetes.io": fullK8sClaim(),
 	}
@@ -410,6 +444,7 @@ func TestValidateToken_K8sVersionGating(t *testing.T) {
 		Iat:    now,
 		Nbf:    now,
 		Overrides: map[string]interface{}{
+			"aud":           expectedAudience,
 			"sub":           "system:serviceaccount:default:my-sa",
 			"kubernetes.io": fullK8sClaim(),
 		},
@@ -653,6 +688,7 @@ func TestIntegration_AgentRestart_ApiserverDown_ValidatesFromDiskCache(t *testin
 		Iat:    now,
 		Nbf:    now,
 		Overrides: map[string]interface{}{
+			"aud": expectedAudience,
 			"sub": "system:serviceaccount:default:my-sa",
 			"kubernetes.io": map[string]interface{}{
 				"namespace": "default",
