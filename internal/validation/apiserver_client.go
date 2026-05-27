@@ -3,6 +3,7 @@ package validation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -20,6 +21,9 @@ const (
 
 // minK8sVersion is the minimum Kubernetes version required for JWKS support.
 var minK8sVersion = utilversion.MajorMinor(1, 34)
+
+// ErrUnsupportedK8sVersion indicates the cluster is too old to serve reliable JWKS.
+var ErrUnsupportedK8sVersion = errors.New("kubernetes version does not support fetching public keys")
 
 // apiserverClient manages communication with the Kubernetes API server using client-go.
 type apiserverClient struct {
@@ -72,6 +76,53 @@ func (ac *apiserverClient) fetchPublicKeys(ctx context.Context) (*JWKSet, error)
 	return &jwkSet, nil
 }
 
+// fetchPublicKeysWithFallback tries the apiserver first, persists keys on success,
+// and falls back to the disk cache on network errors. If the version check fails,
+// no fallback is attempted.
+func (ac *apiserverClient) fetchPublicKeysWithFallback(ctx context.Context, cachePath string) (*JWKSet, error) {
+	log := logger.FromContext(ctx)
+
+	jwks, err := ac.fetchPublicKeys(ctx)
+	if err != nil {
+		// Version check failure means keys from any source are unreliable — don't fallback.
+		if errors.Is(err, ErrUnsupportedK8sVersion) {
+			return nil, err
+		}
+
+		// Network/transient failure — try disk cache.
+		cached, diskErr := loadJWKCacheFromDisk(cachePath)
+		if diskErr != nil {
+			log.Warnf("failed to load JWK cache from disk: %v", diskErr)
+			return nil, err
+		}
+		log.Warnf("apiserver fetch failed, loaded keys from disk cache: %v", err)
+		return cached, nil
+	}
+
+	persistJWKCacheToDisk(ctx, cachePath, jwks)
+	return jwks, nil
+}
+
+// loadJWKCacheFromDisk reads keys from the disk cache. Returns an error if no
+// cache path is configured or the file cannot be read.
+func loadJWKCacheFromDisk(cachePath string) (*JWKSet, error) {
+	if cachePath == "" {
+		return nil, fmt.Errorf("no cache path configured")
+	}
+	return readJWKCache(cachePath)
+}
+
+// persistJWKCacheToDisk writes the JWKSet to disk if a cache path is configured.
+func persistJWKCacheToDisk(ctx context.Context, cachePath string, jwks *JWKSet) {
+	if cachePath == "" {
+		return
+	}
+	if err := writeJWKCache(cachePath, jwks); err != nil {
+		log := logger.FromContext(ctx)
+		log.Warnf("failed to write JWK cache to disk: %v", err)
+	}
+}
+
 // checkK8sVersion verifies the API server is running Kubernetes >= 1.34.
 func (ac *apiserverClient) checkK8sVersion(ctx context.Context) error {
 	log := logger.FromContext(ctx)
@@ -94,7 +145,7 @@ func (ac *apiserverClient) checkK8sVersion(ctx context.Context) error {
 		return fmt.Errorf("unable to parse Kubernetes version: %w", err)
 	}
 	if !v.AtLeast(minK8sVersion) {
-		return fmt.Errorf("Kubernetes version does not support fetching public keys from the apiserver, apiserver is on version %d.%d", v.Major(), v.Minor())
+		return fmt.Errorf("%w: apiserver is on version %d.%d", ErrUnsupportedK8sVersion, v.Major(), v.Minor())
 	}
 
 	return nil

@@ -2,19 +2,20 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
+	pkgerrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
 // jwksProvider abstracts fetching a JWK set, allowing the API client to be
 // swapped for testing.
 type jwksProvider interface {
-	fetchPublicKeys(ctx context.Context) (*JWKSet, error)
+	fetchPublicKeysWithFallback(ctx context.Context, cachePath string) (*JWKSet, error)
 }
 
 type keyCache map[string]*cachedKey
@@ -71,29 +72,27 @@ func (tv *TokenValidator) ValidateToken(ctx context.Context, req *credentials.Ek
 	log := logger.FromContext(ctx)
 
 	if req.ServiceAccountToken == "" {
-		return errors.NewRequestValidationError("Service account token cannot be empty")
+		return pkgerrors.NewRequestValidationError("Service account token cannot be empty")
 	}
 
 	parsedToken, _, err := jwt.NewParser().ParseUnverified(req.ServiceAccountToken, jwt.MapClaims{})
 	if err != nil {
-		return errors.NewRequestValidationError(fmt.Sprintf("Service account token cannot be parsed: %v", err))
+		return pkgerrors.NewRequestValidationError(fmt.Sprintf("Service account token cannot be parsed: %v", err))
 	}
 
 	if err := tv.ValidateClaims(ctx, parsedToken); err != nil {
-		return errors.NewRequestValidationError(fmt.Sprintf("Service account token failed claim validations: %v", err))
+		return pkgerrors.NewRequestValidationError(fmt.Sprintf("Service account token failed claim validations: %v", err))
 	}
 	if err := tv.validateSignature(ctx, req.ServiceAccountToken, parsedToken); err != nil {
-		return errors.NewRequestValidationError(fmt.Sprintf("JWT signature validation failed: %v", err))
+		return pkgerrors.NewRequestValidationError(fmt.Sprintf("JWT signature validation failed: %v", err))
 	}
 
 	log.Debug("Token validation passed")
 	return nil
 }
 
-// refreshKeys attempts to fetch JWKS from the apiserver and load them into the
-// in-memory cache. On success, keys are also persisted to disk. If the apiserver
-// is unreachable, it falls back to the last-known-good keys from the disk cache,
-// ensuring the agent can continue validating tokens across restarts and outages.
+// refreshKeys attempts to fetch JWKS from the apiserver (with disk fallback for
+// transient errors) and loads them into the in-memory cache.
 func (tv *TokenValidator) refreshKeys(ctx context.Context) error {
 	if !tv.refreshInFlight.CompareAndSwap(false, true) {
 		return fmt.Errorf("key refresh already in progress")
@@ -102,42 +101,16 @@ func (tv *TokenValidator) refreshKeys(ctx context.Context) error {
 
 	log := logger.FromContext(ctx)
 	log.Infof("Public key cache refresh triggered")
-	jwks, err := tv.jwksSource.fetchPublicKeys(ctx)
+	jwks, err := tv.jwksSource.fetchPublicKeysWithFallback(ctx, tv.jwkCachePath)
 	if err != nil {
-		return tv.loadKeysFromDisk(ctx, err)
+		if errors.Is(err, ErrUnsupportedK8sVersion) {
+			tv.keys.Store(make(keyCache))
+		}
+		return err
 	}
 
-	tv.persistKeys(ctx, jwks)
 	tv.loadJWKSet(ctx, jwks)
 	return nil
-}
-
-// loadKeysFromDisk attempts to load keys from the disk cache when the apiserver
-// is unreachable. Returns the original fetch error if the disk fallback also fails.
-func (tv *TokenValidator) loadKeysFromDisk(ctx context.Context, fetchErr error) error {
-	log := logger.FromContext(ctx)
-	if tv.jwkCachePath == "" {
-		return fetchErr
-	}
-	cached, err := readJWKCache(tv.jwkCachePath)
-	if err != nil {
-		log.Warnf("failed to load JWK cache from disk: %v", err)
-		return fetchErr
-	}
-	log.Warnf("apiserver fetch failed, loaded keys from disk cache: %v", fetchErr)
-	tv.loadJWKSet(ctx, cached)
-	return nil
-}
-
-// persistKeys writes the JWKSet to disk for future fallback use.
-func (tv *TokenValidator) persistKeys(ctx context.Context, jwks *JWKSet) {
-	if tv.jwkCachePath == "" {
-		return
-	}
-	if err := writeJWKCache(tv.jwkCachePath, jwks); err != nil {
-		log := logger.FromContext(ctx)
-		log.Warnf("failed to write JWK cache to disk: %v", err)
-	}
 }
 
 // loadJWKSet parses a JWKSet and atomically replaces the key cache.
