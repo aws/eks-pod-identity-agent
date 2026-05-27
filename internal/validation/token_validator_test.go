@@ -33,6 +33,17 @@ func (c *channelJWKSProvider) fetchPublicKeys(_ context.Context) (*JWKSet, error
 	return c.jwks, nil
 }
 
+func (c *channelJWKSProvider) fetchPublicKeysWithFallback(ctx context.Context, cachePath string) (*JWKSet, error) {
+	jwks, err := c.fetchPublicKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if cachePath != "" {
+		writeJWKCache(cachePath, jwks)
+	}
+	return jwks, nil
+}
+
 // rsaJWK builds a JWK entry from an RSA public key, used to populate mock JWKS responses.
 func rsaJWK(kid string, pub *rsa.PublicKey) JWK {
 	return JWK{
@@ -517,6 +528,25 @@ func (f *failingJWKSProvider) fetchPublicKeys(_ context.Context) (*JWKSet, error
 	return nil, fmt.Errorf("apiserver unreachable")
 }
 
+func (f *failingJWKSProvider) fetchPublicKeysWithFallback(ctx context.Context, cachePath string) (*JWKSet, error) {
+	_, err := f.fetchPublicKeys(ctx)
+	if cachePath == "" {
+		return nil, err
+	}
+	cached, diskErr := readJWKCache(cachePath)
+	if diskErr != nil {
+		return nil, err
+	}
+	return cached, nil
+}
+
+// versionFailingJWKSProvider simulates a version check failure — no disk fallback.
+type versionFailingJWKSProvider struct{}
+
+func (v *versionFailingJWKSProvider) fetchPublicKeysWithFallback(_ context.Context, _ string) (*JWKSet, error) {
+	return nil, fmt.Errorf("%w: apiserver is on version 1.33", ErrUnsupportedK8sVersion)
+}
+
 // TestRefreshKeys_DiskPersistence covers all interactions between refreshKeys and the
 // disk cache: persist on success, fallback on failure, graceful handling of write errors.
 func TestRefreshKeys_DiskPersistence(t *testing.T) {
@@ -638,6 +668,31 @@ func TestRefreshKeys_DiskPersistence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRefreshKeys_VersionCheckFailure_SkipsDiskFallback verifies that when the
+// version check fails, refreshKeys does NOT load keys from disk and clears
+// any existing keys from memory.
+func TestRefreshKeys_VersionCheckFailure_SkipsDiskFallback(t *testing.T) {
+	g := NewWithT(t)
+	key := test.GenerateTestKey(t)
+	jwks := &JWKSet{Keys: []JWK{rsaJWK("kid-1", &key.PublicKey)}}
+	cachePath := filepath.Join(t.TempDir(), "jwks-cache.json")
+
+	// Pre-seed disk with keys
+	g.Expect(writeJWKCache(cachePath, jwks)).To(Succeed())
+
+	tv := &TokenValidator{jwksSource: &versionFailingJWKSProvider{}, jwkCachePath: cachePath}
+	// Pre-populate in-memory cache with a key
+	tv.keys.Store(keyCache{"existing-kid": {key: &key.PublicKey, alg: "RS256"}})
+
+	err := tv.refreshKeys(context.Background())
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("does not support fetching public keys"))
+
+	// Existing keys must be cleared from memory
+	cache := tv.keys.Load().(keyCache)
+	g.Expect(cache).To(BeEmpty())
 }
 
 // TestRefreshKeys_AlreadyInFlight verifies that concurrent refresh attempts

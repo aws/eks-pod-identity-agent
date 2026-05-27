@@ -187,3 +187,77 @@ func TestCheckK8sVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchPublicKeysWithFallback(t *testing.T) {
+	tests := []struct {
+		name        string
+		handler     http.HandlerFunc
+		preSeedDisk bool
+		wantKeys    int
+		wantErr     bool
+	}{
+		{
+			name: "apiserver up, returns keys and persists to disk",
+			handler: versionedHandler(func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(JWKSet{Keys: []JWK{{Kid: "k1"}}})
+			}),
+			wantKeys: 1,
+		},
+		{
+			name: "apiserver down, falls back to disk",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				// version endpoint succeeds but JWKS fails
+				if r.URL.Path == "/version" {
+					json.NewEncoder(w).Encode(version.Info{Major: "1", Minor: "34"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			preSeedDisk: true,
+			wantKeys:    1,
+		},
+		{
+			name: "version too old, does NOT fall back to disk",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(version.Info{Major: "1", Minor: "33"})
+			},
+			preSeedDisk: true,
+			wantErr:     true,
+		},
+		{
+			name: "apiserver down, no disk cache, returns error",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/version" {
+					json.NewEncoder(w).Encode(version.Info{Major: "1", Minor: "34"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			preSeedDisk: false,
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			ac := newTestApiserverClient(srv)
+			cachePath := t.TempDir() + "/jwks-cache.json"
+
+			if tc.preSeedDisk {
+				g.Expect(writeJWKCache(cachePath, &JWKSet{Keys: []JWK{{Kid: "disk-key"}}})).To(Succeed())
+			}
+
+			jwks, err := ac.fetchPublicKeysWithFallback(context.Background(), cachePath)
+			if tc.wantErr {
+				g.Expect(err).To(HaveOccurred())
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(jwks.Keys).To(HaveLen(tc.wantKeys))
+			}
+		})
+	}
+}
