@@ -228,7 +228,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	// Otherwise, attempt to validate the token locally
 	tv, ok := r.tokenValidator.Load().(tokenValidator)
 	if !ok {
-		r.tryInitTokenValidator(ctx)
+		r.tryInitTokenValidator(context.Background())
 		promLocalValidation.WithLabelValues("skipped").Inc()
 		return nil, false
 	}

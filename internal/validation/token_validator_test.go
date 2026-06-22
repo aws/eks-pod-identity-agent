@@ -173,32 +173,60 @@ func TestValidateToken(t *testing.T) {
 		name               string
 		token              string
 		cacheKey           *rsa.PublicKey // public key cached for signature verification
+		jwksSource         jwksProvider
 		endpointOverridden bool
 		wantErr            bool
 	}{
 		{
-			name:     "valid claims and valid signature",
-			token:    test.CreateSignedToken(t, signingKey, validClaimsConfig),
-			cacheKey: &signingKey.PublicKey,
-			wantErr:  false,
+			name:    "empty token returns error",
+			token:   "",
+			wantErr: true,
 		},
 		{
-			name:     "valid claims but invalid signature",
-			token:    test.CreateSignedToken(t, signingKey, validClaimsConfig),
-			cacheKey: &wrongKey.PublicKey, // wrong public key -> sig fails
-			wantErr:  true,
+			name:       "nil jwksSource returns error",
+			token:      test.CreateSignedToken(t, signingKey, validClaimsConfig),
+			jwksSource: nil,
+			wantErr:    true,
 		},
 		{
-			name:     "invalid claims but valid signature",
-			token:    test.CreateSignedToken(t, signingKey, invalidClaimsConfig),
-			cacheKey: &signingKey.PublicKey,
-			wantErr:  true,
+			name:       "unparseable token returns error",
+			token:      "not.a.jwt",
+			jwksSource: &noopJWKSProvider{},
+			wantErr:    true,
 		},
 		{
-			name:     "invalid claims and invalid signature",
-			token:    test.CreateSignedToken(t, signingKey, invalidClaimsConfig),
-			cacheKey: &wrongKey.PublicKey,
-			wantErr:  true,
+			name:       "k8s version check failure returns error",
+			token:      test.CreateSignedToken(t, signingKey, validClaimsConfig),
+			jwksSource: &versionFailingJWKSProvider{},
+			wantErr:    true,
+		},
+		{
+			name:       "valid claims and valid signature",
+			token:      test.CreateSignedToken(t, signingKey, validClaimsConfig),
+			cacheKey:   &signingKey.PublicKey,
+			jwksSource: &noopJWKSProvider{},
+			wantErr:    false,
+		},
+		{
+			name:       "valid claims but invalid signature",
+			token:      test.CreateSignedToken(t, signingKey, validClaimsConfig),
+			cacheKey:   &wrongKey.PublicKey, // wrong public key -> sig fails
+			jwksSource: &noopJWKSProvider{},
+			wantErr:    true,
+		},
+		{
+			name:       "invalid claims but valid signature",
+			token:      test.CreateSignedToken(t, signingKey, invalidClaimsConfig),
+			cacheKey:   &signingKey.PublicKey,
+			jwksSource: &noopJWKSProvider{},
+			wantErr:    true,
+		},
+		{
+			name:       "invalid claims and invalid signature",
+			token:      test.CreateSignedToken(t, signingKey, invalidClaimsConfig),
+			cacheKey:   &wrongKey.PublicKey,
+			jwksSource: &noopJWKSProvider{},
+			wantErr:    true,
 		},
 		{
 			name: "wrong audience rejected",
@@ -212,8 +240,9 @@ func TestValidateToken(t *testing.T) {
 					"kubernetes.io": fullK8sClaim(),
 				},
 			}),
-			cacheKey: &signingKey.PublicKey,
-			wantErr:  true,
+			cacheKey:   &signingKey.PublicKey,
+			jwksSource: &noopJWKSProvider{},
+			wantErr:    true,
 		},
 		{
 			name: "wrong audience accepted when endpoint overridden",
@@ -228,6 +257,7 @@ func TestValidateToken(t *testing.T) {
 				},
 			}),
 			cacheKey:           &signingKey.PublicKey,
+			jwksSource:         &noopJWKSProvider{},
 			endpointOverridden: true,
 			wantErr:            false,
 		},
@@ -236,8 +266,10 @@ func TestValidateToken(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-			tv := &TokenValidator{EndpointOverridden: tc.endpointOverridden, jwksSource: &noopJWKSProvider{}}
-			tv.keys.Store(keyCache{test.DefaultKid: {key: tc.cacheKey, alg: "RS256"}})
+			tv := &TokenValidator{EndpointOverridden: tc.endpointOverridden, jwksSource: tc.jwksSource}
+			if tc.cacheKey != nil {
+				tv.keys.Store(keyCache{test.DefaultKid: {key: tc.cacheKey, alg: "RS256"}})
+			}
 
 			err := tv.ValidateToken(context.Background(), &credentials.EksCredentialsRequest{
 				ServiceAccountToken: tc.token,
@@ -892,5 +924,71 @@ func TestValidateToken_KidNotInJWKSAfterRefresh(t *testing.T) {
 		// expected
 	default:
 		t.Fatal("expected JWKS refresh to be triggered")
+	}
+}
+
+func TestLoadJWKSet(t *testing.T) {
+	validKey := test.GenerateTestKey(t)
+	validJWK := rsaJWK("kid1", &validKey.PublicKey)
+
+	tests := []struct {
+		name         string
+		jwks         *JWKSet
+		expectedKeys int
+	}{
+		{
+			name:         "valid key is loaded",
+			jwks:         &JWKSet{Keys: []JWK{validJWK}},
+			expectedKeys: 1,
+		},
+		{
+			name:         "empty JWKSet results in empty cache",
+			jwks:         &JWKSet{Keys: []JWK{}},
+			expectedKeys: 0,
+		},
+		{
+			name: "unparseable key is skipped",
+			jwks: &JWKSet{Keys: []JWK{
+				{Kty: "UNSUPPORTED", Kid: "bad-key"},
+			}},
+			expectedKeys: 0,
+		},
+		{
+			name: "unparseable key skipped but valid key still loaded",
+			jwks: &JWKSet{Keys: []JWK{
+				{Kty: "UNSUPPORTED", Kid: "bad-key"},
+				validJWK,
+			}},
+			expectedKeys: 1,
+		},
+		{
+			name: "duplicate kid keeps first key only",
+			jwks: &JWKSet{Keys: []JWK{
+				validJWK,
+				validJWK,
+			}},
+			expectedKeys: 1,
+		},
+		{
+			name: "all keys fail to parse results in empty cache",
+			jwks: &JWKSet{Keys: []JWK{
+				{Kty: "RSA", Kid: "bad1", N: "!!!invalid-base64", E: "AQAB"},
+				{Kty: "EC", Kid: "bad2", Crv: "UNKNOWN", X: "x", Y: "y"},
+			}},
+			expectedKeys: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			tv := &TokenValidator{}
+			tv.keys.Store(make(keyCache))
+
+			tv.loadJWKSet(context.Background(), tc.jwks)
+
+			keys := tv.keys.Load().(keyCache)
+			g.Expect(keys).To(HaveLen(tc.expectedKeys))
+		})
 	}
 }

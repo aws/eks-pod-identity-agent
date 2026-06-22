@@ -40,7 +40,7 @@ func writeJWKCache(path string, jwks *JWKSet) error {
 		return fmt.Errorf("failed to write temp file: %w", err)
 	}
 
-	// Close before rename so data is fully flushed to disk.
+	// Close before rename so data is flushed to the kernel page cache and the fd is released.
 	f.Close()
 
 	// Atomic rename — readers see old or new file, never partial data.
