@@ -78,3 +78,19 @@ The eks-pod-identity-agent image to use
 {{- printf "%s/eks/eks-pod-identity-agent:%s" .Values.image.containerRegistry .Values.image.tag }}
 {{- end }}
 {{- end }}
+
+{{/*
+Resolve the ServiceAccount name to set on the pod.
+  create=true,  name=""       -> chart-managed name (fullname template, no nameSuffix)
+  create=true,  name=<custom> -> custom name
+  create=false, name=<custom> -> reference a pre-existing SA by that name
+  create=false, name=""       -> empty string (caller omits serviceAccountName,
+                                 preserving the chart's pre-PR rendered output)
+*/}}
+{{- define "eks-pod-identity-agent.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+  {{- default (include "eks-pod-identity-agent.fullname" (dict "Values" .Values "Release" .Release "Chart" .Chart)) .Values.serviceAccount.name }}
+{{- else -}}
+  {{- .Values.serviceAccount.name }}
+{{- end -}}
+{{- end }}

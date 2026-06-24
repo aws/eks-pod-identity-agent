@@ -180,6 +180,22 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+serviceAccount:
+  # Whether a ServiceAccount manifest should be created and assigned to the pod.
+  # Default false preserves the chart's current rendered output: no SA is created
+  # and no serviceAccountName is set on the pod, so admission resolves it to the
+  # namespace's "default" ServiceAccount.
+  create: false
+  # Annotations to add to the ServiceAccount when create is true (e.g. for
+  # IRSA / EKS Pod Identity associations on the agent itself, if desired).
+  annotations: {}
+  # The ServiceAccount name to use.
+  #   create=true,  name=""       -> chart-managed name (fullname template)
+  #   create=true,  name=<custom> -> create with the given name
+  #   create=false, name=<custom> -> reference a pre-existing SA in the namespace
+  #   create=false, name=""       -> omit serviceAccountName (default behaviour)
+  name: ""
+
 tolerations:
   - operator: Exists
 
