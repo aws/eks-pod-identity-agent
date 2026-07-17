@@ -65,6 +65,10 @@ spec:
           {{- end }}
           securityContext:
             privileged: true
+          {{- with $top.Values.init.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       {{- end }}
       containers:
         - name: {{ $top.Chart.Name }}
