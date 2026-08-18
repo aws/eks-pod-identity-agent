@@ -1,6 +1,6 @@
 
 
-ARG BUILDER=public.ecr.aws/eks-distro-build-tooling/golang:1.26.1
+ARG BUILDER=public.ecr.aws/eks-distro-build-tooling/golang:1.26.6
 
 FROM --platform=$BUILDPLATFORM ${BUILDER} as builder
 WORKDIR /workspace
