@@ -49,7 +49,7 @@ var (
 )
 
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
-	credentialsRetriever := eksauth.NewService(opts.Cfg)
+	credentialsRetriever := eksauth.NewService(context.Background(), opts.Cfg)
 
 	// The IMDS credential source is opt-in. When disabled, the agent behaves
 	// exactly as it did before this feature: a single eksauth delegate, no IMDS
