@@ -71,6 +71,16 @@ func TestValidateClaims(t *testing.T) {
 			c.Overrides["aud"] = "wrong-audience"
 			return c
 		}()), true, false},
+		{"multiple audiences rejected", test.CreateToken(t, func() test.TokenConfig {
+			c := goodConfig()
+			c.Overrides["aud"] = []interface{}{expectedAudience, "https://other.example"}
+			return c
+		}()), false, true},
+		{"multiple audiences accepted when endpoint overridden", test.CreateToken(t, func() test.TokenConfig {
+			c := goodConfig()
+			c.Overrides["aud"] = []interface{}{expectedAudience, "https://other.example"}
+			return c
+		}()), true, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,10 +171,13 @@ func TestValidateAudience(t *testing.T) {
 		wantErr bool
 	}{
 		{"correct audience string", jwt.MapClaims{"aud": expectedAudience}, false},
-		{"correct audience in array", jwt.MapClaims{"aud": []interface{}{expectedAudience}}, false},
-		{"correct audience among multiple", jwt.MapClaims{"aud": []interface{}{"other", expectedAudience}}, false},
+		{"correct audience in single-element array", jwt.MapClaims{"aud": []interface{}{expectedAudience}}, false},
+		{"expected audience among multiple rejected", jwt.MapClaims{"aud": []interface{}{"other", expectedAudience}}, true},
+		{"expected audience first among multiple rejected", jwt.MapClaims{"aud": []interface{}{expectedAudience, "other"}}, true},
+		{"multiple wrong audiences rejected", jwt.MapClaims{"aud": []interface{}{"other", "another"}}, true},
 		{"wrong audience", jwt.MapClaims{"aud": "wrong"}, true},
 		{"wrong audience array", jwt.MapClaims{"aud": []interface{}{"wrong"}}, true},
+		{"empty audience array", jwt.MapClaims{"aud": []interface{}{}}, true},
 		{"missing audience", jwt.MapClaims{}, true},
 	}
 	for _, tc := range tests {

@@ -117,23 +117,35 @@ func requireNestedString(m map[string]interface{}, key, claimPath string) error 
 // check prevents a token intended for another consumer from being presented to
 // the agent to obtain IAM credentials (a confused deputy attack).
 func validateAudience(claims jwt.MapClaims) error {
-	audRaw, ok := claims["aud"]
-	if !ok {
-		return fmt.Errorf("missing claim: aud")
+	audiences := toStringSlice(claims["aud"])
+
+	// Require exactly one audience, equal to the EKS Pod Identity audience. A
+	// token that also names another audience is scoped to another consumer as
+	// well, and honoring it here would let that consumer exchange a shared
+	// token for these credentials — a confused deputy. Limiting to a single
+	// audience prevents that.
+	if len(audiences) != 1 || audiences[0] != expectedAudience {
+		return fmt.Errorf("invalid audience: expected %s", expectedAudience)
 	}
-	// The JWT spec allows aud to be either a single string or an array of strings
-	// https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3
-	switch aud := audRaw.(type) {
+	return nil
+}
+
+// toStringSlice normalizes a JWT aud claim, which per RFC 7519 may be either a
+// single string or an array of strings, into a []string.
+// https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3
+func toStringSlice(raw interface{}) []string {
+	switch v := raw.(type) {
 	case string:
-		if aud == expectedAudience {
-			return nil
-		}
+		return []string{v}
 	case []interface{}:
-		for _, a := range aud {
-			if s, ok := a.(string); ok && s == expectedAudience {
-				return nil
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
 			}
 		}
+		return out
+	default:
+		return nil
 	}
-	return fmt.Errorf("invalid audience: expected %s", expectedAudience)
 }
