@@ -18,11 +18,30 @@ type CredentialRetriever interface {
 	GetIamCredentials(ctx context.Context, request *EksCredentialsRequest) (*EksCredentialsResponse, ResponseMetadata, error)
 }
 
+// CredentialSource identifies where credentials were obtained from.
+type CredentialSource string
+
+const (
+	SourceAuthService CredentialSource = "auth-service"
+	SourceIMDS        CredentialSource = "imds"
+)
+
 // ResponseMetadata contains information about the credentials
 // in the response
 type ResponseMetadata interface {
 	AssociationId() string
+	Source() CredentialSource
 }
+
+// CredentialMetadata is a concrete ResponseMetadata for use by
+// delegates that need to set both association ID and source.
+type CredentialMetadata struct {
+	Association string
+	CredSource  CredentialSource
+}
+
+func (m CredentialMetadata) AssociationId() string   { return m.Association }
+func (m CredentialMetadata) Source() CredentialSource { return m.CredSource }
 
 type EksCredentialsRequest struct {
 	ServiceAccountToken string

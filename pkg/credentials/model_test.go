@@ -9,6 +9,35 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+func TestCredentialMetadata_Source(t *testing.T) {
+	tests := []struct {
+		name       string
+		meta       CredentialMetadata
+		wantSource CredentialSource
+		wantAssoc  string
+	}{
+		{
+			name:       "IMDS source",
+			meta:       CredentialMetadata{Association: "assoc-1", CredSource: SourceIMDS},
+			wantSource: SourceIMDS,
+			wantAssoc:  "assoc-1",
+		},
+		{
+			name:       "Auth Service source",
+			meta:       CredentialMetadata{Association: "assoc-2", CredSource: SourceAuthService},
+			wantSource: SourceAuthService,
+			wantAssoc:  "assoc-2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(tt.meta.Source()).To(Equal(tt.wantSource))
+			g.Expect(tt.meta.AssociationId()).To(Equal(tt.wantAssoc))
+		})
+	}
+}
+
 func TestEksCredentialsResponse_Serialization(t *testing.T) {
 	var (
 		expirationTime     = time.Date(1996, 3, 27, 7, 45, 23, 123_456_789, time.UTC)

@@ -25,7 +25,10 @@ echo "Generating mocks from ${inputfile} to ${outputfile} in package ${package}"
 
 tmp_gen="$(mktemp)"
 year="$(date +"%Y")"
-$(dirname -- "$( readlink -f -- "$0"; )")/../tools/bin/mockgen -source "$(pwd)/${inputfile}" -package "${package}" > "${tmp_gen}"
+project_root="$(git rev-parse --show-toplevel)"
+cwd="$(pwd)"
+relative_path="${cwd#${project_root}/}/${inputfile}"
+$(dirname -- "$( readlink -f -- "$0"; )")/../tools/bin/mockgen -source "$(pwd)/${inputfile}" -package "${package}" | sed "s|$(pwd)/${inputfile}|${relative_path}|g" > "${tmp_gen}"
 mkdir -p $(pwd)/${relativeoutputdir}/
 cat  > "$(pwd)/${relativeoutputdir}/${outputfile}" << EOF
 // Copyright 2023-${year} Amazon.com, Inc. or its affiliates. All Rights Reserved.

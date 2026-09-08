@@ -40,6 +40,10 @@ func (receiver responseMetadataTest) AssociationId() string {
 	return string(receiver)
 }
 
+func (receiver responseMetadataTest) Source() credentials.CredentialSource {
+	return credentials.SourceAuthService
+}
+
 func TestCachedCredentialRetriever_GetIamCredentials_Fetching(t *testing.T) {
 	sampleResponse := credentials.EksCredentialsResponse{
 		Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
