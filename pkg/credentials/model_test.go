@@ -1,6 +1,7 @@
 package credentials
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -78,4 +79,89 @@ func TestEksCredentialsResponse_Serialization(t *testing.T) {
 			g.Expect(err).To(Not(HaveOccurred()))
 		})
 	}
+}
+
+func TestGetPodUIDFromToken(t *testing.T) {
+	// Build a valid unsigned JWT with pod UID
+	validToken := buildTestToken(t, map[string]interface{}{
+		"kubernetes.io": map[string]interface{}{
+			"pod": map[string]interface{}{
+				"uid": "test-pod-uid-123",
+			},
+		},
+	})
+
+	tests := []struct {
+		name    string
+		token   string
+		wantUID string
+		wantErr string
+	}{
+		{
+			name:    "valid token returns pod UID",
+			token:   validToken,
+			wantUID: "test-pod-uid-123",
+		},
+		{
+			name:    "malformed JWT",
+			token:   "not-a-jwt",
+			wantErr: "cannot parse service account token",
+		},
+		{
+			name:    "missing kubernetes.io claims",
+			token:   buildTestToken(t, map[string]interface{}{"foo": "bar"}),
+			wantErr: "token missing kubernetes.io claims",
+		},
+		{
+			name: "missing pod claims",
+			token: buildTestToken(t, map[string]interface{}{
+				"kubernetes.io": map[string]interface{}{"serviceaccount": "sa"},
+			}),
+			wantErr: "token missing pod claims",
+		},
+		{
+			name: "missing pod uid",
+			token: buildTestToken(t, map[string]interface{}{
+				"kubernetes.io": map[string]interface{}{
+					"pod": map[string]interface{}{"name": "my-pod"},
+				},
+			}),
+			wantErr: "token missing pod uid",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			uid, err := GetPodUIDFromToken(tt.token)
+			if tt.wantErr != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(tt.wantErr))
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(uid).To(Equal(tt.wantUID))
+			}
+		})
+	}
+}
+
+// buildTestToken creates an unsigned JWT with the given claims.
+func buildTestToken(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+	header := base64RawURL(t, `{"alg":"none","typ":"JWT"}`)
+	payload := base64RawURL(t, mustJSON(t, claims))
+	return header + "." + payload + "."
+}
+
+func base64RawURL(t *testing.T, s string) string {
+	t.Helper()
+	return base64.RawURLEncoding.EncodeToString([]byte(s))
+}
+
+func mustJSON(t *testing.T, v interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON: %v", err)
+	}
+	return string(b)
 }
