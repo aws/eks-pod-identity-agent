@@ -18,8 +18,13 @@ import (
 //go:generate mockgen.sh eksauth $GOFILE
 
 type Iface interface {
+	// GetIamCredentials fetches IAM credentials for a pod from EKS Auth.
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	// String returns the delegate's name for logging and metrics.
+	String() string
+	// IsIrrecoverable reports whether an error means the credential is gone/invalid
+	IsIrrecoverable(err error) (string, bool)
 }
 
 type service struct {
@@ -44,14 +49,12 @@ func NewService(cfg aws.Config) Iface {
 	}
 }
 
-type responseMetadata string
+// String returns the delegate's name for logging and metrics.
+func (s *service) String() string { return "eks-auth" }
 
-func (r responseMetadata) AssociationId() string {
-	return string(r)
-}
-
-func (r responseMetadata) Source() credentials.CredentialSource {
-	return credentials.SourceAuthService
+// IsIrrecoverable classifies an EKS Auth API error as irrecoverable or transient.
+func (s *service) IsIrrecoverable(err error) (string, bool) {
+	return IsIrrecoverableApiError(err)
 }
 
 func (s *service) GetIamCredentials(ctx context.Context,
@@ -91,5 +94,8 @@ func (s *service) GetIamCredentials(ctx context.Context,
 		Token:           *creds.Credentials.SessionToken,
 		AccountId:       parsedArn.AccountID,
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
-	}, responseMetadata(*creds.PodIdentityAssociation.AssociationId), nil
+	}, credentials.CredentialMetadata{
+		Association: *creds.PodIdentityAssociation.AssociationId,
+		CredSource:  credentials.SourceAuthService,
+	}, nil
 }
