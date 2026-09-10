@@ -19,6 +19,12 @@ type CredentialRetriever interface {
 	// retrieved within the given timeline, this method will error
 	// out
 	GetIamCredentials(ctx context.Context, request *EksCredentialsRequest) (*EksCredentialsResponse, ResponseMetadata, error)
+	// String returns a human-readable name for this retriever (e.g. "imds", "eks-auth").
+	String() string
+	// IsIrrecoverable returns a human-readable error code and true if the error is 
+	// irrecoverable (the credential is gone or invalid and caching it further is pointless).
+	// Returns a code and false if the error is transient/recoverable.
+	IsIrrecoverable(err error) (string, bool)
 }
 
 // CredentialSource identifies where credentials were obtained from.

@@ -68,6 +68,35 @@ func (mr *MockCredentialRetrieverMockRecorder) GetIamCredentials(ctx, request an
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetIamCredentials", reflect.TypeOf((*MockCredentialRetriever)(nil).GetIamCredentials), ctx, request)
 }
 
+// IsIrrecoverable mocks base method.
+func (m *MockCredentialRetriever) IsIrrecoverable(err error) (string, bool) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsIrrecoverable", err)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
+}
+
+// IsIrrecoverable indicates an expected call of IsIrrecoverable.
+func (mr *MockCredentialRetrieverMockRecorder) IsIrrecoverable(err any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsIrrecoverable", reflect.TypeOf((*MockCredentialRetriever)(nil).IsIrrecoverable), err)
+}
+
+// String mocks base method.
+func (m *MockCredentialRetriever) String() string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "String")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// String indicates an expected call of String.
+func (mr *MockCredentialRetrieverMockRecorder) String() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "String", reflect.TypeOf((*MockCredentialRetriever)(nil).String))
+}
+
 // MockResponseMetadata is a mock of ResponseMetadata interface.
 type MockResponseMetadata struct {
 	ctrl     *gomock.Controller

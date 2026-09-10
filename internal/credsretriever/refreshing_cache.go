@@ -157,6 +157,13 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 	return retriever
 }
 
+func (r *cachedCredentialRetriever) String() string { return "cached-retriever" }
+
+// IsIrrecoverable delegates error classification to the underlying delegate.
+func (r *cachedCredentialRetriever) IsIrrecoverable(err error) (string, bool) {
+	return r.delegate.IsIrrecoverable(err)
+}
+
 // GetIamCredentials fetches credentials from the cache if available
 func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
