@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
+	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
@@ -37,6 +38,7 @@ type EksCredentialHandlerOpts struct {
 	MaxCacheSize       int
 	RefreshQPS         int
 	EndpointOverridden bool
+	EnableIMDS         bool
 }
 
 var (
@@ -49,9 +51,27 @@ var (
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
 	credentialsRetriever := eksauth.NewService(opts.Cfg)
 
+	// The IMDS credential source is opt-in. When disabled, the agent behaves
+	// exactly as it did before this feature: a single eksauth delegate, no IMDS
+	// probe, no chain. Only when enabled (and IMDS is actually available on the
+	// node) do we build the [IMDS, eksauth] chain.
+	log := logger.FromContext(context.Background())
+	log.Infof("Wiring credential retriever: EnableIMDS flag = %t", opts.EnableIMDS)
+	if opts.EnableIMDS {
+		ctx := logger.ContextWithField(context.Background(), "cluster-name", opts.ClusterName)
+		if imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+			log.Info("IMDS available and picked up: building [imds, eksauth] chained retriever")
+			imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
+			credentialsRetriever = credsretriever.NewChainedRetriever(imdsSvc, credentialsRetriever)
+		} else {
+			log.Info("IMDS NOT available on node: falling back to eksauth-only (no chain)")
+		}
+	} else {
+		log.Info("IMDS disabled by flag: using eksauth-only retriever (no chain)")
+	}
+
 	tv, err := validation.NewTokenValidator(context.Background())
 	if err != nil {
-		log := logger.FromContext(context.Background())
 		log.Infof("failed to initialize token validator: %v", err)
 	}
 	if tv != nil {
@@ -92,6 +112,14 @@ func (h *EksCredentialHandler) HandleRequest(resp http.ResponseWriter, req *http
 		ClusterName:         h.ClusterName,
 		ServiceAccountToken: req.Header.Get("Authorization"),
 		RequestTargetHost:   req.Host,
+	}
+
+	// Bind podUID into the logger context
+	if podUID, uidErr := credentials.GetPodUIDFromToken(eksCredentialsRequest.ServiceAccountToken); uidErr != nil {
+		log.Infof("could not extract podUID from token for log context: %v", uidErr)
+	} else {
+		ctx = logger.ContextWithField(ctx, "podUID", podUID)
+		log = logger.FromContext(ctx)
 	}
 
 	creds, err := h.GetEksCredentials(ctx, eksCredentialsRequest)
