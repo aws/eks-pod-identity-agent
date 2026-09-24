@@ -177,7 +177,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Fetching(t *testing.T) {
 				g.Expect(*iamCredentials).To(Equal(test.expectedCredentials))
 
 				// Get pod UID from service account token to check cache
-				podUID, err := getPodUIDfromServiceAccountToken(test.request.ServiceAccountToken)
+				podUID, err := credentials.GetPodUIDFromToken(test.request.ServiceAccountToken)
 				g.Expect(err).ToNot(HaveOccurred())
 
 				_, renew, expiration, found := retriever.internalCache.GetWithRenewExpiry(podUID)
@@ -1076,35 +1076,6 @@ func TestCachedCredentialRetriever_TamperedPodUID_DoesNotReturnOtherPodCreds(t *
 	g.Expect(creds.AccountId).To(Equal("fresh-from-delegate"))
 	g.Expect(creds.AccountId).ToNot(Equal(victimCreds.AccountId))
 	g.Expect(testutil.ToFloat64(promLocalValidation.WithLabelValues("failure"))).To(Equal(failureBefore + 1))
-}
-
-func TestGetPodUIDfromServiceAccountToken(t *testing.T) {
-	g := NewWithT(t)
-
-	t.Run("valid UID", func(t *testing.T) {
-		uid, err := getPodUIDfromServiceAccountToken(test.CreateToken(t, test.TokenConfig{
-			Expiry: time.Now().Add(time.Hour),
-			Iat:    time.Now(),
-			Nbf:    time.Now(),
-			PodUID: "abcd1234-5678-9abc-def0-123456789012",
-		}))
-		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(uid).To(Equal("abcd1234-5678-9abc-def0-123456789012"))
-	})
-
-	t.Run("missing pod uid", func(t *testing.T) {
-		_, err := getPodUIDfromServiceAccountToken(test.CreateToken(t, test.TokenConfig{
-			Expiry: time.Now().Add(time.Hour),
-			Iat:    time.Now(),
-			Nbf:    time.Now(),
-		}))
-		g.Expect(err).To(HaveOccurred())
-	})
-
-	t.Run("invalid JWT", func(t *testing.T) {
-		_, err := getPodUIDfromServiceAccountToken("invalid.jwt.token")
-		g.Expect(err).To(HaveOccurred())
-	})
 }
 
 // imdsMetadataTest is a test ResponseMetadata for IMDS-sourced credentials.
