@@ -54,17 +54,26 @@ func (m CredentialMetadata) AssociationId() string    { return m.Association }
 func (m CredentialMetadata) Source() CredentialSource { return m.CredSource }
 
 // NamespaceInfo represents the parsed info file from an IMDS iam-eks namespace.
+//
+// The info file maps each pod UID to a status code string, e.g.:
+//
+//	{
+//	  "LastUpdated": "2026-09-24T21:28:57Z",
+//	  "PodCredentials": { "<podUID>": "0" }
+//	}
+//
+// The per-pod value is a status code where "0" indicates success. The pod's
+// role ARN and actual credentials are not present here; they live in the
+// separate security-credentials/<podUID> file.
 type NamespaceInfo struct {
-	Code           string                        `json:"Code"`
-	LastUpdated    string                        `json:"LastUpdated"`
-	PodCredentials map[string]PodCredentialEntry `json:"PodCredentials"`
+	Code           string            `json:"Code"`
+	LastUpdated    string            `json:"LastUpdated"`
+	PodCredentials map[string]string `json:"PodCredentials"`
 }
 
-// PodCredentialEntry represents a single pod's status in the namespace info file.
-type PodCredentialEntry struct {
-	Code    string `json:"Code"`
-	RoleARN string `json:"RoleARN"`
-}
+// PodCredentialSuccessCode is the value in a namespace info file's
+// PodCredentials map that indicates a pod's credentials are ready.
+const PodCredentialSuccessCode = "0"
 
 type EksCredentialsRequest struct {
 	ServiceAccountToken string
@@ -89,26 +98,29 @@ func (t SdkCompliantExpirationTime) MarshalText() ([]byte, error) {
 }
 
 // GetPodUIDFromToken extracts the pod UID from a Kubernetes service account JWT.
+// It is the single source of truth for pod UID extraction, used by the IMDS
+// delegate, the request handler, and the credential cache. Failures are
+// returned as RequestValidationErrors so the handler surfaces them as HTTP 400.
 func GetPodUIDFromToken(token string) (string, error) {
 	parsed, _, err := jwt.NewParser().ParseUnverified(token, jwt.MapClaims{})
 	if err != nil {
-		return "", errors.NewRequestValidationError(fmt.Sprintf("cannot parse service account token: %v", err))
+		return "", errors.NewRequestValidationError(fmt.Sprintf("Service account token cannot be parsed: %v", err))
 	}
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		return "", errors.NewRequestValidationError("cannot parse token claims")
+		return "", errors.NewRequestValidationError("Service account token claims cannot be parsed")
 	}
 	k8s, ok := claims["kubernetes.io"].(map[string]interface{})
 	if !ok {
-		return "", errors.NewRequestValidationError("token missing kubernetes.io claims")
+		return "", errors.NewRequestValidationError("Service account token missing kubernetes.io claims")
 	}
 	pod, ok := k8s["pod"].(map[string]interface{})
 	if !ok {
-		return "", errors.NewRequestValidationError("token missing pod claims")
+		return "", errors.NewRequestValidationError("Service account token missing pod claims")
 	}
 	uid, ok := pod["uid"].(string)
 	if !ok {
-		return "", errors.NewRequestValidationError("token missing pod uid")
+		return "", errors.NewRequestValidationError("Service account token missing pod uid")
 	}
 	return uid, nil
 }

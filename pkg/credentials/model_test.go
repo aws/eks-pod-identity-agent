@@ -105,19 +105,19 @@ func TestGetPodUIDFromToken(t *testing.T) {
 		{
 			name:    "malformed JWT",
 			token:   "not-a-jwt",
-			wantErr: "cannot parse service account token",
+			wantErr: "Service account token cannot be parsed",
 		},
 		{
 			name:    "missing kubernetes.io claims",
 			token:   buildTestToken(t, map[string]interface{}{"foo": "bar"}),
-			wantErr: "token missing kubernetes.io claims",
+			wantErr: "Service account token missing kubernetes.io claims",
 		},
 		{
 			name: "missing pod claims",
 			token: buildTestToken(t, map[string]interface{}{
 				"kubernetes.io": map[string]interface{}{"serviceaccount": "sa"},
 			}),
-			wantErr: "token missing pod claims",
+			wantErr: "Service account token missing pod claims",
 		},
 		{
 			name: "missing pod uid",
@@ -126,7 +126,7 @@ func TestGetPodUIDFromToken(t *testing.T) {
 					"pod": map[string]interface{}{"name": "my-pod"},
 				},
 			}),
-			wantErr: "token missing pod uid",
+			wantErr: "Service account token missing pod uid",
 		},
 	}
 	for _, tt := range tests {

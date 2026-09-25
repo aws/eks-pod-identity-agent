@@ -192,8 +192,7 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 		return nil, nil, fmt.Errorf("failed to get pod uid from service account token: %w", err)
 	}
 
-	// Bind podUID into the logger context so all downstream logs for this
-	// request are attributable to a specific pod.
+	// Bind podUID into the logger context
 	ctx = logger.ContextWithField(ctx, "podUID", podUID)
 	log = logger.FromContext(ctx)
 
