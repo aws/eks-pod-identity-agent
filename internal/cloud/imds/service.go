@@ -144,11 +144,16 @@ func (s *service) String() string { return "imds" }
 //
 // All other errors (network timeouts, rate limits, etc.) are transient and
 // recoverable by definition.
+//
+// The returned string is a metric dimension for pod_identity_cache_error; for
+// the recoverable case we surface the underlying error text rather than an
+// opaque bucket, so the failure reason is preserved.
 func (s *service) IsIrrecoverable(err error) (string, bool) {
 	if errors.Is(err, ErrPodNotInMapping) {
+		// The pod is gone from the mapping — evicting the cache entry is correct.
 		return "PodNotInMapping", true
 	}
-	return "Unknown", false
+	return err.Error(), false
 }
 
 func (s *service) GetIamCredentials(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
@@ -352,10 +357,10 @@ func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
 	return namespaces, nil
 }
 
-// ProbeIMDS checks whether IMDS is available on this node using Option C
-// (accept 200 or 429). A 200 means IMDS is healthy; a 429 means IMDS is
-// present but throttling. Any other result (transport error, 404 from a
-// metadata proxy, etc.) is treated as "IMDS not available."
+// ProbeIMDS checks whether IMDS is available on this node. A 200 means IMDS is
+// healthy; a 429 means IMDS is present but throttling. Any other result
+// (transport error, 404 from a metadata proxy, etc.) is treated as "IMDS not
+// available."
 func ProbeIMDS(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Options)) bool {
 	log := logger.FromContext(ctx)
 

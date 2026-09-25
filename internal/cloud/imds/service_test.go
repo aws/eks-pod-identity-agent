@@ -248,9 +248,9 @@ func TestIsIrrecoverable(t *testing.T) {
 		wantIrrecovable bool
 	}{
 		{"pod not in mapping is irrecoverable", ErrPodNotInMapping, "PodNotInMapping", true},
-		{"credential not found is recoverable", ErrCredentialNotFound, "Unknown", false},
 		{"wrapped pod-not-in-mapping is irrecoverable", fmt.Errorf("IMDS delegate: %w", ErrPodNotInMapping), "PodNotInMapping", true},
-		{"arbitrary error is recoverable", fmt.Errorf("connection reset"), "Unknown", false},
+		{"credential not found is recoverable, surfaces error text", ErrCredentialNotFound, ErrCredentialNotFound.Error(), false},
+		{"arbitrary error is recoverable, surfaces error text", fmt.Errorf("connection reset"), "connection reset", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
