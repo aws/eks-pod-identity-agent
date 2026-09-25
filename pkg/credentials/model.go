@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
 //go:generate mockgen.sh mockcreds $GOFILE mockcreds
@@ -91,23 +92,23 @@ func (t SdkCompliantExpirationTime) MarshalText() ([]byte, error) {
 func GetPodUIDFromToken(token string) (string, error) {
 	parsed, _, err := jwt.NewParser().ParseUnverified(token, jwt.MapClaims{})
 	if err != nil {
-		return "", fmt.Errorf("cannot parse service account token: %w", err)
+		return "", errors.NewRequestValidationError(fmt.Sprintf("cannot parse service account token: %v", err))
 	}
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		return "", fmt.Errorf("cannot parse token claims")
+		return "", errors.NewRequestValidationError("cannot parse token claims")
 	}
 	k8s, ok := claims["kubernetes.io"].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("token missing kubernetes.io claims")
+		return "", errors.NewRequestValidationError("token missing kubernetes.io claims")
 	}
 	pod, ok := k8s["pod"].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("token missing pod claims")
+		return "", errors.NewRequestValidationError("token missing pod claims")
 	}
 	uid, ok := pod["uid"].(string)
 	if !ok {
-		return "", fmt.Errorf("token missing pod uid")
+		return "", errors.NewRequestValidationError("token missing pod uid")
 	}
 	return uid, nil
 }
