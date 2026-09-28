@@ -104,6 +104,10 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 		"--svid-renewal-fraction=0.75",
 		"--svid-renewal-jitter=0.25",
 		"--bundle-refresh-interval=5m",
+		// Not a workload identity flag. It is the credentials path's cache bound,
+		// which the token tier reads rather than defining a second one, so this
+		// asserts the shared value arrives and not just that the field exists.
+		"--max-cache-size=512",
 	})
 	g.Expect(err).ToNot(HaveOccurred())
 
@@ -118,6 +122,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.75))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.25))
 	g.Expect(opts.BundleRefreshInterval).To(Equal(5 * time.Minute))
+	g.Expect(opts.MaxCacheSize).To(Equal(512))
 }
 
 // TestNewWorkloadIdentityServerOpts_AnOutOfEnvelopeFlag_FailsValidation is the
@@ -148,6 +153,11 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 	originalFraction := svidRenewalFraction
 	originalJitter := svidRenewalJitter
 	originalInterval := bundleRefreshInterval
+	// maxCacheSize is not a workload identity flag, it is the credentials path's
+	// --max-cache-size that both paths now read. It is restored here because a
+	// test that parses it would otherwise leave the AWS credentials cache resized
+	// for every test that runs after it.
+	originalMaxCacheSize := maxCacheSize
 
 	t.Cleanup(func() {
 		clusterName = originalCluster
@@ -156,5 +166,6 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 		svidRenewalFraction = originalFraction
 		svidRenewalJitter = originalJitter
 		bundleRefreshInterval = originalInterval
+		maxCacheSize = originalMaxCacheSize
 	})
 }
