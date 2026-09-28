@@ -24,8 +24,9 @@ const (
 // WorkloadIdentityServerOpts carries configuration from the command line into
 // the workload identity tiers, the way EksCredentialHandlerOpts does for the AWS
 // credentials path. It is a parallel struct rather than a widening of that one
-// because the two paths share no tunable: nothing on the credentials path has an
-// SVID lifetime and nothing here has a credential cache size.
+// because the two paths share almost no tunable: nothing on the credentials path
+// has an SVID lifetime. MaxCacheSize is the exception, and it is deliberately
+// the same flag on both paths rather than a second one.
 //
 // The socket path is deliberately absent. It is a contract with the Pod Identity
 // webhook, so it is the constant configuration.WorkloadIdentitySocketPath rather
@@ -36,6 +37,14 @@ type WorkloadIdentityServerOpts struct {
 	Cfg aws.Config
 	// ClusterName is the EKS cluster the agent runs in.
 	ClusterName string
+	// MaxCacheSize bounds each per-pod cache, in entries. It is --max-cache-size,
+	// the same value the AWS credentials cache is given, because both are sized
+	// by the same thing: the number of pods that can run on this node. A node
+	// budgeted for N credential entries is budgeted for N token entries.
+	//
+	// Zero disables caching on the credentials path. It cannot mean that here —
+	// an uncached tier would mint per request — so the tiers reject it.
+	MaxCacheSize int
 	// X509SVIDDuration is the lifetime requested on every X.509-SVID issuance.
 	// It is a ceiling and not a grant: STS issues the least of this and what its
 	// own policy allows, and reports what it issued in the certificate, so the

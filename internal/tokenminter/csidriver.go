@@ -29,45 +29,49 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 )
 
-// CSIDriverName is the driver the enrolled pod mounts for the SPIFFE socket and
-// whose tokenRequests declaration clears the node audience restriction. It is
-// part of the webhook/CSI/agent contract, so it is aliased from configuration
-// rather than copied.
-const CSIDriverName = configuration.WorkloadIdentityCSIDriver
-
 // VerifyCSIDriverExists reports whether the CSIDriver the mint depends on exists
 // and declares the EKS Auth audience. It is read-only: the object is installed
 // by the Helm chart.
 //
-// Absent, misdeclared, or unreadable is a warning rather than an error — none of
-// those are the agent's to fix, and each one surfaces again per mint as
+// Absent, misdeclared, unreadable, or throttled is a warning rather than an
+// error — none of those are the agent's to fix, and each one surfaces again as
 // ErrTokenMintForbidden. Only an unexpected API failure is returned, so startup
 // can distinguish a broken API server from a cluster that is merely not set up
 // yet.
 func VerifyCSIDriverExists(ctx context.Context, client kubernetes.Interface) error {
 	log := logger.FromContext(ctx)
 
-	existing, err := client.StorageV1().CSIDrivers().Get(ctx, CSIDriverName, metav1.GetOptions{})
+	existing, err := client.StorageV1().CSIDrivers().Get(ctx, configuration.WorkloadIdentityCSIDriver, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		if !declaresAudience(existing, EKSAuthAudience) {
+		if !declaresAudience(existing, configuration.EksAuthAudience) {
 			log.Warnf("CSIDriver %q exists but does not declare tokenRequests audience %q; "+
 				"mints will be refused until the chart that owns it does",
-				CSIDriverName, EKSAuthAudience)
+				configuration.WorkloadIdentityCSIDriver, configuration.EksAuthAudience)
 			return nil
 		}
-		log.Infof("CSIDriver %q declares tokenRequests audience %q", CSIDriverName, EKSAuthAudience)
+		log.Infof("CSIDriver %q declares tokenRequests audience %q", configuration.WorkloadIdentityCSIDriver, configuration.EksAuthAudience)
 		return nil
 	case apierrors.IsNotFound(err):
 		log.Warnf("CSIDriver %q not found; it is installed by the agent's Helm chart and "+
-			"mints are refused until it exists", CSIDriverName)
+			"mints are refused until it exists", configuration.WorkloadIdentityCSIDriver)
 		return nil
 	case apierrors.IsForbidden(err):
 		log.Warnf("not permitted to read CSIDriver %q (%v); skipping the pre-flight check",
-			CSIDriverName, err)
+			configuration.WorkloadIdentityCSIDriver, err)
+		return nil
+	case apierrors.IsTooManyRequests(err):
+		// client-go has already retried this up to its maxRetries, honouring the
+		// Retry-After that API Priority and Fairness sets, so there is nothing
+		// left to retry here. Failing startup on it would be actively harmful:
+		// throttling peaks when a DaemonSet rolls and every node reads this at
+		// once, so each agent would crash-loop and add load to the throttle that
+		// rejected it.
+		log.Warnf("throttled reading CSIDriver %q (%v); skipping the pre-flight check",
+			configuration.WorkloadIdentityCSIDriver, err)
 		return nil
 	default:
-		return fmt.Errorf("getting CSIDriver %q: %w", CSIDriverName, err)
+		return fmt.Errorf("getting CSIDriver %q: %w", configuration.WorkloadIdentityCSIDriver, err)
 	}
 }
 

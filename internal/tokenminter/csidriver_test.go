@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 )
 
@@ -25,14 +26,14 @@ func chartCSIDriver() *storagev1.CSIDriver {
 	podInfo := true
 	return &storagev1.CSIDriver{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: CSIDriverName,
+			Name: configuration.WorkloadIdentityCSIDriver,
 		},
 		Spec: storagev1.CSIDriverSpec{
 			AttachRequired:       &attachNotRequired,
 			PodInfoOnMount:       &podInfo,
 			VolumeLifecycleModes: []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecycleEphemeral},
 			TokenRequests: []storagev1.TokenRequest{
-				{Audience: EKSAuthAudience},
+				{Audience: configuration.EksAuthAudience},
 			},
 		},
 	}
@@ -74,7 +75,7 @@ func TestVerifyCSIDriverExists_Absent_NonFatalAndNoCreate(t *testing.T) {
 	err := VerifyCSIDriverExists(context.Background(), client)
 
 	g.Expect(err).NotTo(HaveOccurred())
-	_, getErr := client.StorageV1().CSIDrivers().Get(context.Background(), CSIDriverName, metav1.GetOptions{})
+	_, getErr := client.StorageV1().CSIDrivers().Get(context.Background(), configuration.WorkloadIdentityCSIDriver, metav1.GetOptions{})
 	g.Expect(apierrors.IsNotFound(getErr)).To(BeTrue(), "the agent must not create the CSIDriver")
 }
 
@@ -91,7 +92,7 @@ func TestVerifyCSIDriverExists_PresentWithoutAudience_NonFatalAndNoWrite(t *test
 	err := VerifyCSIDriverExists(context.Background(), client)
 
 	g.Expect(err).NotTo(HaveOccurred())
-	after, getErr := client.StorageV1().CSIDrivers().Get(context.Background(), CSIDriverName, metav1.GetOptions{})
+	after, getErr := client.StorageV1().CSIDrivers().Get(context.Background(), configuration.WorkloadIdentityCSIDriver, metav1.GetOptions{})
 	g.Expect(getErr).NotTo(HaveOccurred())
 	g.Expect(after.Spec.TokenRequests).To(BeEmpty(), "the agent must not repair a chart-managed object")
 }
@@ -106,7 +107,27 @@ func TestVerifyCSIDriverExists_ForbiddenGet_NonFatal(t *testing.T) {
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewForbidden(
 				schema.GroupResource{Group: "storage.k8s.io", Resource: "csidrivers"},
-				CSIDriverName, errors.New("node identity may not read csidrivers"))
+				configuration.WorkloadIdentityCSIDriver, errors.New("node identity may not read csidrivers"))
+		})
+
+	err := VerifyCSIDriverExists(context.Background(), client)
+
+	g.Expect(err).NotTo(HaveOccurred())
+}
+
+// TestVerifyCSIDriverExists_Throttled_NonFatal proves a throttled read does not
+// fail startup. client-go has already spent its Retry-After retries by the time
+// the error arrives, and throttling peaks exactly when a DaemonSet rolls and
+// every node runs this check at once — so failing here would crash-loop every
+// agent into the throttle that rejected it.
+func TestVerifyCSIDriverExists_Throttled_NonFatal(t *testing.T) {
+	g := NewWithT(t)
+
+	client := fake.NewSimpleClientset()
+	noWrites(client)
+	client.PrependReactor("get", "csidrivers",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewTooManyRequests("throttled by priority and fairness", 1)
 		})
 
 	err := VerifyCSIDriverExists(context.Background(), client)

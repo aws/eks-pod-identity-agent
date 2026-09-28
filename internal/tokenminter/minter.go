@@ -21,25 +21,22 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// EKSAuthAudience is the only audience the agent mints for. It must also appear
-// in the CSIDriver's spec.tokenRequests, or the 1.33 node audience restriction
-// refuses the mint (see csidriver.go). Aliased from configuration rather than
-// copied: the audience is one half of that contract, and the driver name the
-// other.
-const EKSAuthAudience = configuration.EksAuthAudience
-
-// boundObjectKind binds the token to the pod, so it is rejected once the pod is
-// gone.
+// boundObjectKind ties the token to the pod it was minted for.
+//
+// It is not by itself a revocation mechanism. Per the BoundObjectRef API docs,
+// the reference is validated by the API server's TokenReview endpoint, and
+// "other audiences may not" validate it. EKS Auth is another audience, so a
+// token whose pod has been deleted may stay usable there until it expires. That
+// window is expirationSeconds, which is why the mint sets it rather than leaving
+// it to the server.
 const boundObjectKind = "Pod"
 
-// rawMinter mints one token with no caching. It is the seam cache.go wraps and
-// tests fake.
-type rawMinter interface {
-	mint(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.ProjectedToken, error)
-}
+// tokenLifetimeSeconds is the lifetime requested for every mint.
+const tokenLifetimeSeconds int64 = 3600
 
-// apiMinter is the rawMinter backed by the API server, authenticating as the
-// node identity (internal/kube.NewNodeClient).
+// apiMinter is the uncached TokenMinter backed by the API server,
+// authenticating as the node identity (internal/kube.NewNodeClient). CachedMinter
+// wraps one.
 type apiMinter struct {
 	client kubernetes.Interface
 }
@@ -48,15 +45,16 @@ func newAPIMinter(client kubernetes.Interface) *apiMinter {
 	return &apiMinter{client: client}
 }
 
-// mint requests a pod-bound token scoped to the EKS Auth audience, with no
-// expirationSeconds so the cluster default governs the lifetime the cache keys
-// renewal off. A refusal is the not-retryable ErrTokenMintForbidden (usually a
-// missing CSIDriver tokenRequests declaration); any other failure is the
-// retryable ErrTokenMintFailed.
-func (m *apiMinter) mint(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.ProjectedToken, error) {
+// Mint requests a pod-bound token scoped to the EKS Auth audience for
+// tokenLifetimeSeconds.
+func (m *apiMinter) Mint(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.ProjectedToken, error) {
+	// TokenRequestSpec takes a pointer, so the lifetime is copied per request
+	// rather than shared from a package variable.
+	lifetime := tokenLifetimeSeconds
 	req := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
-			Audiences: []string{EKSAuthAudience},
+			Audiences:         []string{configuration.EksAuthAudience},
+			ExpirationSeconds: &lifetime,
 			BoundObjectRef: &authenticationv1.BoundObjectReference{
 				Kind:       boundObjectKind,
 				APIVersion: "v1",
@@ -72,7 +70,17 @@ func (m *apiMinter) mint(ctx context.Context, w *workloadidentity.Workload) (*wo
 		if apierrors.IsForbidden(err) {
 			return nil, wierrors.ErrTokenMintForbidden.Wrapf(err,
 				"TokenRequest for %s/%s audience %q refused",
-				w.Namespace, w.ServiceAccount, EKSAuthAudience)
+				w.Namespace, w.ServiceAccount, configuration.EksAuthAudience)
+		}
+		// Throttling is called out rather than left to the fallthrough. It lands
+		// on the same retryable error, so the cache keeps the pod's existing
+		// token and re-mints on a later sweep, but it says so in the message:
+		// client-go has already exhausted its Retry-After retries by this point,
+		// and a throttled node is worth telling apart from a broken one.
+		if apierrors.IsTooManyRequests(err) {
+			return nil, wierrors.ErrTokenMintFailed.Wrapf(err,
+				"TokenRequest for %s/%s throttled by the API server after client-go exhausted its retries",
+				w.Namespace, w.ServiceAccount)
 		}
 		return nil, wierrors.ErrTokenMintFailed.Wrapf(err,
 			"TokenRequest for %s/%s", w.Namespace, w.ServiceAccount)
@@ -89,4 +97,4 @@ func (m *apiMinter) mint(ctx context.Context, w *workloadidentity.Workload) (*wo
 	}, nil
 }
 
-var _ rawMinter = (*apiMinter)(nil)
+var _ workloadidentity.TokenMinter = (*apiMinter)(nil)

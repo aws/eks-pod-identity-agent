@@ -20,19 +20,20 @@ import (
 
 const (
 	// defaultMinRemaining is the least life a cached token must have to be
-	// served; below it, it is re-minted. Matches the AWS-creds cache floor.
-	defaultMinRemaining = 15 * time.Second
+	// served; below it, it is re-minted.
+	defaultMinRemaining = 1 * time.Minute
 	// defaultRenewFraction is the fraction of a token's life after which the
 	// janitor re-mints it, keeping it warm for the session tier.
 	defaultRenewFraction = 0.8
 	// defaultCleanupInterval is the janitor sweep period.
 	defaultCleanupInterval = 1 * time.Minute
-	// defaultRenewalTimeout bounds one background re-mint.
-	defaultRenewalTimeout = 1 * time.Minute
-	// defaultRefreshQPS bounds background re-mints per second across all pods.
-	defaultRefreshQPS = 3
-	// defaultMaxCacheSize bounds cached tokens (one per pod).
-	defaultMaxCacheSize = 2048
+	// defaultRenewalTimeout bounds one background re-mint. It stays under the
+	// janitor's sweep period so a stalled mint cannot consume a whole sweep.
+	defaultRenewalTimeout = 30 * time.Second
+	// defaultRefreshQPS is the rate and the burst of the background re-mint
+	// limiter. The burst is what binds in practice: a sweep drops the entries it
+	// has no token for rather than waiting for one.
+	defaultRefreshQPS = 2
 	// minRefreshInterval floors the refresh delay so a short-lived token cannot
 	// spin the janitor.
 	minRefreshInterval = 1 * time.Second
@@ -40,16 +41,21 @@ const (
 
 // cacheEntry is one pod's cached token plus what a background refresh needs to
 // re-mint without a caller.
+//
+// No stored context. The AWS-creds cache keeps the originating request's logger
+// to carry its association ID into renewal logs; there is no equivalent value
+// here, so a renewal running hours later would inherit nothing but that first
+// caller's stale request fields. onRefresh builds its logger from the workload.
 type cacheEntry struct {
 	workload *workloadidentity.Workload
 	token    *workloadidentity.ProjectedToken
-	logCtx   context.Context
 }
 
 // CachedMinter is the workloadidentity.TokenMinter the agent uses: it serves a
 // cached token with ample life, mints otherwise, and renews in the background.
 type CachedMinter struct {
-	raw     rawMinter
+	// raw is the uncached minter this decorates, apiMinter in production.
+	raw     workloadidentity.TokenMinter
 	cache   *expiring.Cache[string, cacheEntry]
 	group   singleflight.Group
 	limiter *rate.Limiter
@@ -65,6 +71,11 @@ type CachedMinter struct {
 // CachedMinterOpts configures a CachedMinter; every field takes a documented
 // default when zero.
 type CachedMinterOpts struct {
+	// MaxCacheSize bounds cached tokens, one per pod. It has no default: the
+	// value is --max-cache-size, the same per-node entry budget the AWS
+	// credentials cache is given, since both caches hold one entry per pod on
+	// the node. NewMinter rejects a non-positive value rather than substituting
+	// one, because expiring.NewLru reads zero as unlimited.
 	MaxCacheSize  int
 	MinRemaining  time.Duration
 	RenewFraction float64
@@ -77,12 +88,9 @@ type CachedMinterOpts struct {
 	now func() time.Time
 }
 
-// newCachedMinter builds a CachedMinter over a rawMinter. Shared by the exported
-// wiring and by tests, which pass a fake rawMinter and a controlled clock.
-func newCachedMinter(raw rawMinter, opts CachedMinterOpts) *CachedMinter {
-	if opts.MaxCacheSize <= 0 {
-		opts.MaxCacheSize = defaultMaxCacheSize
-	}
+// newCachedMinter builds a CachedMinter over an uncached minter. Shared by the
+// exported wiring and by tests, which pass a fake minter and a controlled clock.
+func newCachedMinter(raw workloadidentity.TokenMinter, opts CachedMinterOpts) *CachedMinter {
 	if opts.MinRemaining <= 0 {
 		opts.MinRemaining = defaultMinRemaining
 	}
@@ -146,7 +154,7 @@ func (m *CachedMinter) Mint(ctx context.Context, w *workloadidentity.Workload) (
 // cache, and stores a usable one with a refresh scheduled ahead of expiry.
 func (m *CachedMinter) mintAndStore(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.ProjectedToken, error) {
 	start := m.now()
-	token, err := m.raw.mint(ctx, w)
+	token, err := m.raw.Mint(ctx, w)
 	if err == nil && !m.now().Before(token.ExpiresAt.Add(-m.minRemaining)) {
 		err = wierrors.ErrTokenMintFailed.Wrapf(nil,
 			"minted token for %s/%s expires within the %s floor", w.Namespace, w.PodName, m.minRemaining)
@@ -157,32 +165,39 @@ func (m *CachedMinter) mintAndStore(ctx context.Context, w *workloadidentity.Wor
 		return nil, err
 	}
 
-	m.store(logger.CloneToNewIfPresent(ctx, context.Background()), w, token)
+	m.store(w, token)
 	return token, nil
 }
 
 // store writes an entry keyed by pod UID, refresh at a fraction of remaining
 // life, eviction at full expiry.
-func (m *CachedMinter) store(logCtx context.Context, w *workloadidentity.Workload, token *workloadidentity.ProjectedToken) {
+func (m *CachedMinter) store(w *workloadidentity.Workload, token *workloadidentity.ProjectedToken) {
 	lifetime := token.ExpiresAt.Sub(m.now())
 	refresh := time.Duration(float64(lifetime) * m.renewFraction)
 	if refresh < minRefreshInterval {
 		refresh = minRefreshInterval
 	}
-	m.cache.SetWithRefreshExpire(w.PodUID, cacheEntry{workload: w, token: token, logCtx: logCtx}, refresh, lifetime)
+	m.cache.SetWithRefreshExpire(w.PodUID, cacheEntry{workload: w, token: token}, refresh, lifetime)
 }
 
 // onRefresh re-mints a due entry, rate limited so a backlog cannot stampede the
 // API server. A non-retryable failure drops the entry; a retryable one keeps
 // the existing token until it truly expires.
+//
+// There is no caller, so the context is built here: the timeout is what bounds
+// the background TokenRequest, and the log fields name the workload being
+// renewed rather than whoever first asked for it.
 func (m *CachedMinter) onRefresh(uid string, entry cacheEntry) {
 	if !m.limiter.Allow() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(entry.logCtx, m.renewalTimeout)
+	ctx, cancel := context.WithTimeout(
+		logger.ContextWithField(context.Background(),
+			"from", "psat-renewal",
+			"pod", entry.workload.Namespace+"/"+entry.workload.PodName),
+		m.renewalTimeout)
 	defer cancel()
-	ctx = logger.ContextWithField(ctx, "from", "token-renewal")
 	log := logger.FromContext(ctx)
 
 	if _, err := m.mintAndStore(ctx, entry.workload); err != nil {

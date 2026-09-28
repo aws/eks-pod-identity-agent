@@ -204,6 +204,7 @@ func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServ
 	return handlers.WorkloadIdentityServerOpts{
 		Cfg:                   cfg,
 		ClusterName:           clusterName,
+		MaxCacheSize:          maxCacheSize,
 		X509SVIDDuration:      x509SVIDDuration,
 		JWTSVIDDuration:       jwtSVIDDuration,
 		SVIDRenewalFraction:   svidRenewalFraction,

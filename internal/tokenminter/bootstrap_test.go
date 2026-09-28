@@ -26,7 +26,7 @@ func TestNewMinter_ChecksDriverAndMints(t *testing.T) {
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{CleanupInterval: -1})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	got, err := m.Mint(context.Background(), testWorkload())
@@ -45,7 +45,7 @@ func TestNewMinter_MissingDriver_StillStarts(t *testing.T) {
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{CleanupInterval: -1})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(m).NotTo(BeNil())
@@ -63,7 +63,7 @@ func TestNewMinter_HardCheckError_Fails(t *testing.T) {
 			return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
 		})
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{CleanupInterval: -1})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
 
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(m).To(BeNil())
