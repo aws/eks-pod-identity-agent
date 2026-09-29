@@ -3,7 +3,6 @@ package handlers
 import (
 	stderrors "errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,12 +12,11 @@ import (
 // the struct the flags fill, so a validation error can name the flag an operator
 // has to change and cannot drift from the name cmd registers.
 const (
-	FlagX509SVIDDuration         = "x509-svid-duration"
-	FlagJWTSVIDDuration          = "jwt-svid-duration"
-	FlagSVIDRenewalFraction      = "svid-renewal-fraction"
-	FlagSVIDRenewalJitter        = "svid-renewal-jitter"
-	FlagBundleRefreshInterval    = "bundle-refresh-interval"
-	FlagWorkloadIdentityProvider = "workload-identity-provider-arn"
+	FlagX509SVIDDuration      = "x509-svid-duration"
+	FlagJWTSVIDDuration       = "jwt-svid-duration"
+	FlagSVIDRenewalFraction   = "svid-renewal-fraction"
+	FlagSVIDRenewalJitter     = "svid-renewal-jitter"
+	FlagBundleRefreshInterval = "bundle-refresh-interval"
 )
 
 // WorkloadIdentityServerOpts carries configuration from the command line into
@@ -67,15 +65,6 @@ type WorkloadIdentityServerOpts struct {
 	// override a hint the agent cannot live with. The bundle tier owns the floor
 	// applied to a pathological hint.
 	BundleRefreshInterval time.Duration
-	// WorkloadIdentityProviderArn names the identity provider whose trust
-	// material the agent fetches, which sts:GetTrustBundles takes as a required
-	// request input.
-	//
-	// This is a placeholder and not the answer. The provider ARN reaches the
-	// node today only alongside a WorkloadSession, and the bundle tier must not
-	// depend on a session, so the ARN needs a route that does not exist yet. A
-	// flag is what unblocks the bundle tier in the meantime.
-	WorkloadIdentityProviderArn string
 }
 
 // durationEnvelope is the range of requested lifetimes the issuing API accepts
@@ -169,7 +158,6 @@ func (o WorkloadIdentityServerOpts) Validate() error {
 		jwtSVIDDurationEnvelope.validate(o.JWTSVIDDuration),
 		validateSVIDRenewal(o.SVIDRenewalFraction, o.SVIDRenewalJitter),
 		validateBundleRefreshInterval(o.BundleRefreshInterval),
-		validateWorkloadIdentityProviderArn(o.WorkloadIdentityProviderArn),
 	)
 }
 
@@ -215,26 +203,6 @@ func validateBundleRefreshInterval(interval time.Duration) error {
 	if interval < 0 {
 		return fmt.Errorf("--%s is %s: it has to be zero, which follows the refresh hint on the trust bundle, or a positive interval",
 			FlagBundleRefreshInterval, interval)
-	}
-	return nil
-}
-
-// arnFieldSeparators is the number of colons in the shortest well formed ARN,
-// arn:partition:service:region:account:resource.
-const arnFieldSeparators = 5
-
-// validateWorkloadIdentityProviderArn checks the shape of a provided ARN. Empty
-// is accepted: the flag is a placeholder for a value that has no route to the
-// node yet, and the tier that needs it fails with its own error when it is
-// missing. A value that is present and malformed is worth catching here, because
-// the alternative is discovering it on the first trust bundle fetch.
-func validateWorkloadIdentityProviderArn(arn string) error {
-	if arn == "" {
-		return nil
-	}
-	if !strings.HasPrefix(arn, "arn:") || strings.Count(arn, ":") < arnFieldSeparators {
-		return fmt.Errorf("--%s is %q: it has to be an ARN of the form arn:partition:service:region:account:resource",
-			FlagWorkloadIdentityProvider, arn)
 	}
 	return nil
 }

@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
@@ -22,27 +24,16 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/wireproto"
 )
 
-// TestNew_ServesTheStubServicesOverTheSocket is the definition of done in one test:
-// the server binds the socket, serves what the wiring site registers, and a client
-// reaches it over the socket. It registers what cmd registers, so the production
-// wiring is what is covered rather than only the hand-written stub the other tests
-// here use.
-//
-// Every method answers Unimplemented for now, which is the point: the request
-// travels the whole path, through the credentials and the interceptor chain, and
-// comes back with the status the registered handler produced. A method the agent does
-// not serve yet is distinguishable from one it will never serve, and the same call
-// without the SPIFFE header is refused before it reaches a handler at all.
-//
-// The methods are named by string rather than through a generated client, because the
-// generated clients live in the modules only pkg/wireproto may import.
+// TestNew_ServesTheStubServicesOverTheSocket registers what cmd registers and
+// checks a call crosses the socket, credentials and interceptors to reach the
+// handler's Unimplemented, while the same call without the SPIFFE header is
+// refused first. Methods are named by string to avoid depending on request shapes.
 func TestNew_ServesTheStubServicesOverTheSocket(t *testing.T) {
-	unaryMethod := "/" + wireproto.WorkloadAPIServiceName + "/ValidateJWTSVID"
-	streamMethod := "/" + wireproto.WorkloadAPIServiceName + "/FetchX509SVID"
-	sdsStreamMethod := "/" + wireproto.SDSServiceName + "/StreamSecrets"
+	unaryMethod := "/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/ValidateJWTSVID"
+	streamMethod := "/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/FetchX509SVID"
+	sdsStreamMethod := "/" + secretv3.SecretDiscoveryService_ServiceDesc.ServiceName + "/StreamSecrets"
 
 	g := NewWithT(t)
 

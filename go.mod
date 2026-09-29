@@ -5,9 +5,12 @@ go 1.26.6
 require (
 	github.com/aws/aws-sdk-go-v2 v1.39.2
 	github.com/aws/aws-sdk-go-v2/config v1.31.12
+	github.com/aws/aws-sdk-go-v2/credentials v1.18.16
 	github.com/aws/aws-sdk-go-v2/service/eksauth v1.11.7
+	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6
 	github.com/aws/smithy-go v1.23.0
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
+	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/onsi/gomega v1.38.2
 	github.com/prometheus/client_golang v1.20.3
@@ -26,7 +29,6 @@ require (
 )
 
 require (
-	github.com/aws/aws-sdk-go-v2/credentials v1.18.16 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.9 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.9 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.9 // indirect
@@ -35,7 +37,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.29.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.1 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect

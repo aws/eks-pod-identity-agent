@@ -76,19 +76,6 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 	g.Expect(opts.BundleRefreshInterval).To(BeZero())
 }
 
-// TestServerCmd_TheProviderArn_IsNotAFlag pins the decision that the identity
-// provider ARN does not arrive on the command line. WorkloadIdentityServerOpts
-// still carries the field and still validates it, so the bundle tier can be given
-// an ARN once there is a route to the node, but nothing an operator types fills
-// it and a flag reappearing here is a decision rather than an oversight.
-func TestServerCmd_TheProviderArn_IsNotAFlag(t *testing.T) {
-	g := NewWithT(t)
-
-	g.Expect(serverCmd.Flags().Lookup(handlers.FlagWorkloadIdentityProvider)).To(BeNil(),
-		"--%s should not exist", handlers.FlagWorkloadIdentityProvider)
-	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).WorkloadIdentityProviderArn).To(BeEmpty())
-}
-
 // TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions proves the wiring
 // from the command line to the struct the tiers read, so a tier never has to read
 // a flag itself.

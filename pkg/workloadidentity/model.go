@@ -158,53 +158,40 @@ type JWTSVID struct {
 	ExpiresAt time.Time
 }
 
-// BundleSource yields trust material. It is node-scoped, not per workload.
+// BundleSource yields trust material per workload identity provider, not per
+// workload. Callers pass the provider ARN from the workload's WorkloadSession;
+// an implementation fetches with the node's own credentials, never that session.
 //
-// It is split by format to mirror the Workload API, which has FetchX509Bundles
-// and FetchJWTBundles as separate RPCs returning different encodings. One fetch
-// produces both: GetTrustBundles returns one opaque SPIFFE bundle document per
-// trust domain, an RFC 7517 JWK Set holding x509-svid and jwt-svid authorities
-// together. An implementation fetches once, caches once, and exposes these views
-// over it. The split is at the read, not at the fetch, and an implementation
-// making two fetches has misread this.
-//
-// Splitting rather than returning one struct means each caller gets exactly what
-// it needs. Envoy only ever wants the X.509 side, so handing the SDS handler a
-// struct carrying JWK Set bytes and parsed keys it will never touch is noise.
-//
-// Both bundle maps are keyed by trust domain rather than being flat. A
-// conforming SPIFFE verifier selects authorities by the presenting
-// certificate's trust domain, and flattening loses the ability to keep domains
-// apart. At launch each map has one entry, since the agent does not assemble
-// peer domains, but the response shape is already a list keyed by trust domain
-// so passing several through costs nothing.
-//
-// There is deliberately no sequence or generation number. The API does not
-// return one, so an exported counter would be state the agent synthesised with
-// no wire source. Change is detected by comparing parsed authority sets, which
-// the implementation has to do anyway, and signalled through Subscriber.
-// Nothing downstream needs a number: the SDS version must also bump on
-// certificate renewal, so deriving it from a bundle counter would be wrong.
+// The methods split by format to mirror FetchX509Bundles and FetchJWTBundles,
+// but one GetTrustBundles fetch and one cache back all of them. There is no
+// generation number: change is signalled through Subscriber. A stream holds a
+// Lease on its provider for as long as it is open.
 type BundleSource interface {
-	// OwnTrustDomain is the workload's own domain. The Workload API presents
-	// its authorities inline on each X509SVID and every other entry under
-	// federated_bundles, so the handler has to know which is which.
-	OwnTrustDomain() string
+	// Lease keeps the provider's bundles cached and refreshed until release is
+	// called or ctx ends, whichever comes first; releasing twice is harmless. A
+	// stream takes one when it opens. An empty ARN is ErrNotEnrolled.
+	Lease(ctx context.Context, providerArn string) (release func(), err error)
+
+	// OwnTrustDomain is the provider's own domain, which is the workload's. The
+	// Workload API presents its authorities inline on each X509SVID and every
+	// other entry under federated_bundles, so the handler has to know which is
+	// which.
+	OwnTrustDomain(providerArn string) string
 
 	// X509Bundles mirrors FetchX509Bundles: authorities as DER, keyed by trust
 	// domain, decoded from each JWK's x5c member. Envoy wants these
 	// PEM-encoded, which the SDS handler does at the edge.
-	X509Bundles(ctx context.Context) (map[string][][]byte, error)
+	X509Bundles(ctx context.Context, providerArn string) (map[string][][]byte, error)
 
-	// JWTBundles mirrors FetchJWTBundles: the raw JWK Set bytes per trust
-	// domain. Returning bytes rather than parsed keys avoids a lossy parse and
-	// reserialize, since the RPC returns exactly this.
-	JWTBundles(ctx context.Context) (map[string][]byte, error)
+	// JWTBundles mirrors FetchJWTBundles: per trust domain, a JWK Set of the
+	// jwt-svid keys only, which the RPC returns as is. x509-svid entries are
+	// left out because go-spiffe treats every key in the set as a JWT authority.
+	JWTBundles(ctx context.Context, providerArn string) (map[string][]byte, error)
 
 	// JWTAuthority resolves one verification key for ValidateJWTSVID. It is a
 	// lookup rather than a map so the implementation can parse lazily and
 	// cache, and so an unknown key ID is an error at the point it matters.
-	JWTAuthority(trustDomain, keyID string) (crypto.PublicKey, error)
+	JWTAuthority(providerArn, trustDomain, keyID string) (crypto.PublicKey, error)
 }
 
 // Subscriber delivers change notifications to an open stream.

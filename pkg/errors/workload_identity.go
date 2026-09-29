@@ -30,6 +30,12 @@ const (
 	KindBundleUnavailable
 	// KindInvalidAudience is the kind of ErrInvalidAudience.
 	KindInvalidAudience
+	// KindUnknownTrustDomain is the kind of ErrUnknownTrustDomain.
+	KindUnknownTrustDomain
+	// KindUnknownKeyID is the kind of ErrUnknownKeyID.
+	KindUnknownKeyID
+	// KindBundleRefused is the kind of ErrBundleRefused.
+	KindBundleRefused
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -177,6 +183,23 @@ var (
 	// API handler (T10) for a caller-supplied audience the agent will never
 	// accept. Not retryable: the same request will be rejected the same way.
 	ErrInvalidAudience = newWorkloadIdentityError(KindInvalidAudience, "invalid_audience", false)
+
+	// ErrUnknownTrustDomain is produced by the bundle source (T6) when a JWT
+	// authority is asked for in a trust domain the current bundles do not
+	// cover. Not retryable: the same token names the same domain on a retry.
+	ErrUnknownTrustDomain = newWorkloadIdentityError(KindUnknownTrustDomain, "unknown_trust_domain", false)
+
+	// ErrUnknownKeyID is produced by the bundle source (T6) when a known trust
+	// domain holds no JWT authority with the requested key ID. Not retryable:
+	// STS publishes a key before signing with it and the tier refreshes well
+	// inside that lead, so a key the cached bundle lacks is not about to appear.
+	ErrUnknownKeyID = newWorkloadIdentityError(KindUnknownKeyID, "unknown_key_id", false)
+
+	// ErrBundleRefused is produced by the bundle source (T6) when STS refuses a
+	// provider's bundles for a reason a repeat cannot change. Not retryable. It is
+	// distinct from ErrBundleUnavailable so a misconfigured node does not read as
+	// an STS outage.
+	ErrBundleRefused = newWorkloadIdentityError(KindBundleRefused, "bundle_refused", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -234,5 +257,8 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrIssuanceThrottled,
 		ErrBundleUnavailable,
 		ErrInvalidAudience,
+		ErrUnknownTrustDomain,
+		ErrUnknownKeyID,
+		ErrBundleRefused,
 	}
 }
