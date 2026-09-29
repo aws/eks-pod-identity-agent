@@ -77,8 +77,21 @@ const (
 
 type service struct {
 	imdsClient *imds.Client
-	// nsMapping stores map[string]string (podUID → namespace).
-	nsMapping atomic.Value
+	// nsMapping maps podUIDs to IMDS namespaces.
+	nsMapping atomic.Pointer[map[string]string]
+}
+
+// loadMapping returns the current podUID→namespace mapping.
+func (s *service) loadMapping() map[string]string {
+	if m := s.nsMapping.Load(); m != nil {
+		return *m
+	}
+	return nil
+}
+
+// storeMapping atomically replaces the podUID→namespace mapping.
+func (s *service) storeMapping(m map[string]string) {
+	s.nsMapping.Store(&m)
 }
 
 func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Options)) Iface {
@@ -104,7 +117,7 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 	s := &service{
 		imdsClient: imds.NewFromConfig(cfg, opts...),
 	}
-	s.nsMapping.Store(map[string]string{})
+	s.storeMapping(map[string]string{})
 
 	log := logger.FromContext(ctx)
 	if err := s.buildNamespaceMapping(ctx); err != nil {
@@ -124,7 +137,7 @@ func (s *service) IsIrrecoverable(err error) (string, bool) {
 		// ErrPodNotInMapping means the namespace mapping doesn't hold the pod. IMDS
 		// creds are delivered every ~30 mins, and by the time the cache tries to refresh (after some hours),
 		// the creds will be in IMDS and the mapping. So, credentials won't be prematurely evicted.
-		
+
 		// If a pod is absent from the mapping, the credential has been removed from IMDS and the mapping updated,
 		// which means IMDS will no longer hold credentials for the pod.
 		return "PodNotInMapping", true
@@ -141,7 +154,7 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 		return nil, nil, fmt.Errorf("IMDS delegate: %w", err)
 	}
 
-	ns, found := s.lookupNamespace(podUID)
+	ns, found := s.loadMapping()[podUID]
 	if !found {
 		// The namespace mapping only refreshes in the background (every 60s), so a
 		// miss is possible even when credentials do exist in IMDS. The race:
@@ -209,9 +222,9 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 			log.WithField("namespace", ns).Warnf("Failed to read namespace info, skipping: %v", err)
 			continue
 		}
-		for podUID, entry := range info.PodCredentials {
-			if !strings.EqualFold(entry.Code, "Success") {
-				log.WithFields(logrus.Fields{"namespace": ns, "podUID": podUID, "code": entry.Code}).
+		for podUID, code := range info.PodCredentials {
+			if code != credentials.PodCredentialSuccessCode {
+				log.WithFields(logrus.Fields{"namespace": ns, "podUID": podUID, "code": code}).
 					Debug("Skipping pod with non-success code")
 				continue
 			}
@@ -219,17 +232,13 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 		}
 	}
 
-	s.nsMapping.Store(newMap)
+	s.storeMapping(newMap)
 	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces", len(newMap), len(namespaces))
 	return nil
 }
 
-// lookupNamespace returns the IMDS namespace for a pod UID, or false if not mapped.
-func (s *service) lookupNamespace(podUID string) (string, bool) {
-	m := s.nsMapping.Load().(map[string]string)
-	ns, ok := m[podUID]
-	return ns, ok
-}
+// maxMetadataBytes bounds a single IMDS response.
+const maxMetadataBytes = 1 << 20
 
 // getMetadata fetches a metadata path from IMDS.
 func (s *service) getMetadata(ctx context.Context, path string) ([]byte, error) {
@@ -238,7 +247,15 @@ func (s *service) getMetadata(ctx context.Context, path string) ([]byte, error) 
 		return nil, err
 	}
 	defer out.Content.Close()
-	return io.ReadAll(out.Content)
+	// Bound the read; hitting the limit means the response is too large to trust.
+	data, err := io.ReadAll(io.LimitReader(out.Content, maxMetadataBytes))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) >= maxMetadataBytes {
+		return nil, fmt.Errorf("IMDS response for %q exceeds %d-byte limit", path, maxMetadataBytes)
+	}
+	return data, nil
 }
 
 // readNamespaceInfo reads and parses the JSON info file for a given namespace.
