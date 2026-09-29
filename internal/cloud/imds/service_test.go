@@ -44,7 +44,7 @@ func newTestService(handler func(*http.Request) (*http.Response, error)) *servic
 	s := &service{
 		imdsClient: imdsClient,
 	}
-	s.nsMapping.Store(map[string]string{})
+	s.storeMapping(map[string]string{})
 	return s
 }
 
@@ -65,21 +65,17 @@ func expiredCredJSON() string {
 }
 
 func infoJSON(podUIDs ...string) string {
-	pods := make(map[string]credentials.PodCredentialEntry)
+	pods := make(map[string]string)
 	for _, uid := range podUIDs {
-		pods[uid] = credentials.PodCredentialEntry{Code: "success", RoleARN: "arn:aws:iam::123456789012:role/R"}
+		pods[uid] = credentials.PodCredentialSuccessCode
 	}
 	b, _ := json.Marshal(credentials.NamespaceInfo{Code: "Success", LastUpdated: "2025-03-11T18:58:15Z", PodCredentials: pods})
 	return string(b)
 }
 
-// infoJSONWithCodes builds a namespace info JSON where each podUID has the given Code.
+// infoJSONWithCodes builds a namespace info JSON where each podUID has the given status code.
 func infoJSONWithCodes(pods map[string]string) string {
-	entries := make(map[string]credentials.PodCredentialEntry)
-	for uid, code := range pods {
-		entries[uid] = credentials.PodCredentialEntry{Code: code, RoleARN: "arn:aws:iam::123456789012:role/R"}
-	}
-	b, _ := json.Marshal(credentials.NamespaceInfo{Code: "Success", LastUpdated: "2025-03-11T18:58:15Z", PodCredentials: entries})
+	b, _ := json.Marshal(credentials.NamespaceInfo{Code: "Success", LastUpdated: "2025-03-11T18:58:15Z", PodCredentials: pods})
 	return string(b)
 }
 
@@ -119,11 +115,11 @@ func namespaceHandler(n int) func(*http.Request) (*http.Response, error) {
 
 func TestReadCredential(t *testing.T) {
 	tests := []struct {
-		name       string
-		status     int
-		body       string
-		wantErr    string
-		wantKeyId  string
+		name      string
+		status    int
+		body      string
+		wantErr   string
+		wantKeyId string
 	}{
 		{
 			name:      "valid JSON",
@@ -258,6 +254,57 @@ func TestReadNamespaceInfo(t *testing.T) {
 	}
 }
 
+// --- getMetadata size-cap tests ---
+
+// TestGetMetadata_SizeCap verifies the maxMetadataBytes read cap: a body that
+// reaches the limit is rejected, a smaller one is returned whole.
+func TestGetMetadata_SizeCap(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "oversized body is rejected",
+			body:    strings.Repeat("a", 4*maxMetadataBytes),
+			wantErr: true,
+		},
+		{
+			name:    "body at the cap is rejected",
+			body:    strings.Repeat("a", maxMetadataBytes),
+			wantErr: true,
+		},
+		{
+			name:    "body just under the cap is returned whole",
+			body:    strings.Repeat("a", maxMetadataBytes-1),
+			wantLen: maxMetadataBytes - 1,
+		},
+		{
+			name:    "normal-sized body is returned untouched",
+			body:    "iam-eks-1\niam-eks-2",
+			wantLen: len("iam-eks-1\niam-eks-2"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTestService(func(req *http.Request) (*http.Response, error) {
+				return httpResponse(200, tt.body), nil
+			})
+
+			data, err := svc.getMetadata(context.Background(), "")
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "exceeds")
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, data, tt.wantLen)
+			assert.Equal(t, tt.body, string(data))
+		})
+	}
+}
+
 // --- Namespace mapping tests ---
 
 func TestNamespaceMapping_Build(t *testing.T) {
@@ -324,15 +371,15 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) {
 					return httpResponse(200, infoJSONWithCodes(map[string]string{
-						"pod-ok":     "Success",
-						"pod-denied": "access_denied",
-						"pod-lower":  "success",
+						"pod-ok":      "0",
+						"pod-denied":  "AccessDenied",
+						"pod-pending": "1",
 					})), nil
 				},
 			},
-			wantPods:    2,
-			wantLookups: map[string]string{"pod-ok": "1", "pod-lower": "1"},
-			wantMissing: []string{"pod-denied"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-ok": "1"},
+			wantMissing: []string{"pod-denied", "pod-pending"},
 		},
 	}
 	for _, tt := range tests {
@@ -353,18 +400,18 @@ func TestNamespaceMapping_Build(t *testing.T) {
 
 			// Build the mapping: discover namespaces → read info files → populate podUID map.
 			require.NoError(t, svc.buildNamespaceMapping(testCtx()))
-			assert.Len(t, svc.nsMapping.Load().(map[string]string), tt.wantPods)
+			assert.Len(t, svc.loadMapping(), tt.wantPods)
 
 			// Verify expected pods resolve to the correct namespace.
 			for podUID, wantNS := range tt.wantLookups {
-				ns, ok := svc.lookupNamespace(podUID)
+				ns, ok := svc.loadMapping()[podUID]
 				assert.True(t, ok, "expected pod %s in mapping", podUID)
 				assert.Equal(t, wantNS, ns)
 			}
 
 			// Verify pods that should be absent are not in the map.
 			for _, podUID := range tt.wantMissing {
-				_, ok := svc.lookupNamespace(podUID)
+				_, ok := svc.loadMapping()[podUID]
 				assert.False(t, ok, "expected pod %s NOT in mapping", podUID)
 			}
 		})
@@ -394,7 +441,7 @@ func TestNamespaceMapping_BackgroundRefresh_UpdatesMap(t *testing.T) {
 
 	// Initial build sees only pod-old.
 	require.NoError(t, svc.buildNamespaceMapping(ctx))
-	assert.Len(t, svc.nsMapping.Load().(map[string]string), 1)
+	assert.Len(t, svc.loadMapping(), 1)
 
 	// Background refresh picks up pod-new after the ticker fires.
 	svc.startBackgroundRefresh(ctx, 50*time.Millisecond)
@@ -402,8 +449,8 @@ func TestNamespaceMapping_BackgroundRefresh_UpdatesMap(t *testing.T) {
 	cancel()
 
 	// Verify the map was updated with the new pod.
-	assert.Len(t, svc.nsMapping.Load().(map[string]string), 2)
-	_, ok := svc.lookupNamespace("pod-new")
+	assert.Len(t, svc.loadMapping(), 2)
+	_, ok := svc.loadMapping()["pod-new"]
 	assert.True(t, ok)
 }
 
@@ -477,7 +524,7 @@ func TestGetIamCredentials(t *testing.T) {
 				return httpResponse(tt.credCode, tt.credBody), nil
 			})
 			// Pre-populate the namespace mapping (bypasses discovery).
-			svc.nsMapping.Store(tt.mapping)
+			svc.storeMapping(tt.mapping)
 
 			// Build the request — use raw token if provided, otherwise generate a valid JWT.
 			var request *credentials.EksCredentialsRequest
@@ -529,7 +576,7 @@ func TestNewService_BuildsMappingOnConstruction(t *testing.T) {
 	}).(*service)
 
 	// Mapping should be populated immediately after construction.
-	_, ok := svc.lookupNamespace("pod-a")
+	_, ok := svc.loadMapping()["pod-a"]
 	assert.True(t, ok, "mapping should be populated after NewService")
 }
 
@@ -576,7 +623,7 @@ func TestRateLimiter_CancelledContext_ReturnsError(t *testing.T) {
 		ClientEnableState: imds.ClientEnabled,
 	})
 	svc := &service{imdsClient: imdsClient}
-	svc.nsMapping.Store(map[string]string{"pod-1": "1"})
+	svc.storeMapping(map[string]string{"pod-1": "1"})
 
 	// Cancel the context before calling — rate limiter's Wait should return context.Canceled.
 	ctx, cancel := context.WithCancel(testCtx())

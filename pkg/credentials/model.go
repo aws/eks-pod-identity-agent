@@ -22,7 +22,7 @@ type CredentialRetriever interface {
 	GetIamCredentials(ctx context.Context, request *EksCredentialsRequest) (*EksCredentialsResponse, ResponseMetadata, error)
 	// String returns a human-readable name for this retriever (e.g. "imds", "eks-auth").
 	String() string
-	// IsIrrecoverable returns a human-readable error code and true if the error is 
+	// IsIrrecoverable returns a human-readable error code and true if the error is
 	// irrecoverable (the credential is gone or invalid and caching it further is pointless).
 	// Returns a code and false if the error is transient/recoverable.
 	IsIrrecoverable(err error) (string, bool)
@@ -54,17 +54,25 @@ func (m CredentialMetadata) AssociationId() string    { return m.Association }
 func (m CredentialMetadata) Source() CredentialSource { return m.CredSource }
 
 // NamespaceInfo represents the parsed info file from an IMDS iam-eks namespace.
+//
+// The info file maps each pod UID to a status code string, where 0 is success
+// and anything else is failure, e.g.:
+//
+//	{
+//	  "Code": "0",
+//	  "LastUpdated": "2026-09-24T21:28:57Z",
+//	  "PodCredentials": { "<podUIDA>": "0",  <podUIDB>": "1"}
+//	}
+//
 type NamespaceInfo struct {
-	Code           string                        `json:"Code"`
-	LastUpdated    string                        `json:"LastUpdated"`
-	PodCredentials map[string]PodCredentialEntry `json:"PodCredentials"`
+	Code           string            `json:"Code"`
+	LastUpdated    string            `json:"LastUpdated"`
+	PodCredentials map[string]string `json:"PodCredentials"`
 }
 
-// PodCredentialEntry represents a single pod's status in the namespace info file.
-type PodCredentialEntry struct {
-	Code    string `json:"Code"`
-	RoleARN string `json:"RoleARN"`
-}
+// PodCredentialSuccessCode is the value in a namespace info file's
+// PodCredentials map that indicates a pod's credentials were successfully delivered
+const PodCredentialSuccessCode = "0"
 
 type EksCredentialsRequest struct {
 	ServiceAccountToken string
