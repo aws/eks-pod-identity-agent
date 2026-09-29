@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -589,3 +590,68 @@ func TestRateLimiter_CancelledContext_ReturnsError(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// --- IsIrrecoverable tests ---
+
+func TestIsIrrecoverable(t *testing.T) {
+	svc := &service{}
+	tests := []struct {
+		name            string
+		err             error
+		wantCode        string
+		wantIrrecovable bool
+	}{
+		{"pod not in mapping is irrecoverable", ErrPodNotInMapping, "PodNotInMapping", true},
+		{"wrapped pod-not-in-mapping is irrecoverable", fmt.Errorf("IMDS delegate: %w", ErrPodNotInMapping), "PodNotInMapping", true},
+		{"credential not found is recoverable, surfaces error text", ErrCredentialNotFound, ErrCredentialNotFound.Error(), false},
+		{"arbitrary error is recoverable, surfaces error text", fmt.Errorf("connection reset"), "connection reset", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, irrecoverable := svc.IsIrrecoverable(tt.err)
+			assert.Equal(t, tt.wantCode, code)
+			assert.Equal(t, tt.wantIrrecovable, irrecoverable)
+		})
+	}
+}
+
+// --- ProbeIMDS tests ---
+
+// Verifies ProbeIMDS reports IMDS as available on 200 or 429, and unavailable on
+// any other HTTP status.
+func TestProbeIMDS_HTTPStatus_ReturnsExpectedAvailability(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		wantResult bool
+	}{
+		{"returns true on 200", http.StatusOK, "i-1234567890abcdef0", true},
+		{"returns true on 429", http.StatusTooManyRequests, "", true},
+		{"returns false on other error status", http.StatusInternalServerError, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ProbeIMDS(context.Background(), aws.Config{}, func(o *imds.Options) {
+				o.HTTPClient = &mockHTTPClient{handler: func(req *http.Request) (*http.Response, error) {
+					return httpResponse(tt.status, tt.body), nil
+				}}
+				o.ClientEnableState = imds.ClientEnabled
+			})
+			assert.Equal(t, tt.wantResult, result)
+		})
+	}
+}
+
+// Verifies ProbeIMDS reports IMDS as unavailable when the request fails at the
+// transport layer (e.g. no IMDS on the node).
+func TestProbeIMDS_TransportError_ReturnsFalse(t *testing.T) {
+	result := ProbeIMDS(context.Background(), aws.Config{}, func(o *imds.Options) {
+		o.HTTPClient = &mockHTTPClient{handler: func(req *http.Request) (*http.Response, error) {
+			return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("connection refused")}
+		}}
+		o.ClientEnableState = imds.ClientEnabled
+	})
+	assert.False(t, result)
+}

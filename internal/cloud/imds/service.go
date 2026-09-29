@@ -25,6 +25,7 @@ package imds
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/sirupsen/logrus"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
@@ -60,6 +62,10 @@ func (r *rateLimitedHTTPClient) Do(req *http.Request) (*http.Response, error) {
 type Iface interface {
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	// String returns the delegate's name
+	String() string
+	// IsIrrecoverable reports whether an error means the credential is gone/invalid
+	IsIrrecoverable(err error) (string, bool)
 }
 
 const (
@@ -109,6 +115,24 @@ func NewService(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Option
 	return s
 }
 
+// String returns the delegate's name for logging and metrics.
+func (s *service) String() string { return "imds" }
+
+// IsIrrecoverable classifies IMDS errors for the cache's eviction decision.
+func (s *service) IsIrrecoverable(err error) (string, bool) {
+	if errors.Is(err, ErrPodNotInMapping) {
+		// ErrPodNotInMapping means the namespace mapping doesn't hold the pod. IMDS
+		// creds are delivered every ~30 mins, and by the time the cache tries to refresh (after some hours),
+		// the creds will be in IMDS and the mapping. So, credentials won't be prematurely evicted.
+		
+		// If a pod is absent from the mapping, the credential has been removed from IMDS and the mapping updated,
+		// which means IMDS will no longer hold credentials for the pod.
+		return "PodNotInMapping", true
+	}
+	// Every other error is considered recoverable
+	return err.Error(), false
+}
+
 func (s *service) GetIamCredentials(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
 
@@ -119,6 +143,19 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 
 	ns, found := s.lookupNamespace(podUID)
 	if !found {
+		// The namespace mapping only refreshes in the background (every 60s), so a
+		// miss is possible even when credentials do exist in IMDS. The race:
+		//   t=0  pod receives creds via the sync path
+		//   t=1  EKS Auth Service goes down
+		//   t=2  agent restarts, clearing its cached creds
+		//   t=3  creds are placed in IMDS
+		//   t=4  pod requests creds, but the mapping hasn't refreshed yet, so the
+		//        agent doesn't see the podUID and returns an error
+		//
+		// This is unlikely: SDKs refresh credentials close to expiry (hours away),
+		// while the mapping converges within a minute. The alternative — refreshing
+		// on demand — could overload IMDS under bursty workloads and throttle other
+		// critical processes on the node.
 		return nil, nil, ErrPodNotInMapping
 	}
 
@@ -252,4 +289,26 @@ func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
 		}
 	}
 	return namespaces, nil
+}
+
+// ProbeIMDS checks whether IMDS is available on this node. A 200 means IMDS is
+// healthy; a 429 means IMDS is present but throttling. Any other result
+// (transport error, 404 from a metadata proxy, etc.) is treated as "IMDS not
+// available."
+func ProbeIMDS(ctx context.Context, cfg aws.Config, optFns ...func(*imds.Options)) bool {
+	log := logger.FromContext(ctx)
+
+	client := imds.NewFromConfig(cfg, optFns...)
+	_, err := client.GetMetadata(ctx, &imds.GetMetadataInput{Path: "instance-id"})
+
+	var respErr *smithyhttp.ResponseError
+	available := err == nil ||
+		(errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusTooManyRequests)
+
+	if available {
+		log.Info("IMDS probe succeeded, IMDS is available on this node")
+	} else {
+		log.Info("IMDS probe failed, IMDS is not available on this node")
+	}
+	return available
 }
