@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/aws/aws-sdk-go-v2/service/eksauth"
 	"github.com/sirupsen/logrus"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 )
@@ -24,9 +25,10 @@ type Iface interface {
 
 type service struct {
 	eksAuthService *eksauth.Client
+	nodeMetadata   *imds.NodeMetadata
 }
 
-func NewService(cfg aws.Config) Iface {
+func NewService(ctx context.Context, cfg aws.Config) Iface {
 	// Configure HTTP client with custom timeouts
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -41,6 +43,7 @@ func NewService(cfg aws.Config) Iface {
 	eksAuthService := eksauth.NewFromConfig(cfg)
 	return &service{
 		eksAuthService: eksAuthService,
+		nodeMetadata:   imds.FetchNodeMetadata(ctx, cfg),
 	}
 }
 
@@ -56,10 +59,17 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	log.Info("Calling EKS Auth to fetch credentials")
 
 	startRequestTime := time.Now()
-	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, &eksauth.AssumeRoleForPodIdentityInput{
+
+	input := &eksauth.AssumeRoleForPodIdentityInput{
 		ClusterName: aws.String(request.ClusterName),
 		Token:       aws.String(request.ServiceAccountToken),
-	})
+	}
+
+	if s.nodeMetadata != nil {
+		input.Zone = aws.String(s.nodeMetadata.Zone)
+	}
+
+	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, input)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to fetch credentials from EKS Auth: %w", err)
 	}

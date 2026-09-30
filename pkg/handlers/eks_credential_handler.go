@@ -47,7 +47,7 @@ var (
 )
 
 func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
-	credentialsRetriever := eksauth.NewService(opts.Cfg)
+	credentialsRetriever := eksauth.NewService(context.Background(), opts.Cfg)
 
 	tv, err := validation.NewTokenValidator(context.Background())
 	if err != nil {
