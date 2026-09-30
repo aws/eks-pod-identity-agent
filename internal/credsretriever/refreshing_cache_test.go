@@ -15,6 +15,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials/mockcreds"
 	"go.uber.org/mock/gomock"
+	"golang.org/x/time/rate"
 )
 
 type spyTokenValidator struct {
@@ -1088,4 +1089,63 @@ func TestGetPodUIDfromServiceAccountToken(t *testing.T) {
 		_, err := getPodUIDfromServiceAccountToken("invalid.jwt.token")
 		g.Expect(err).To(HaveOccurred())
 	})
+}
+
+// TestCachedCredentialRetriever_OnCredentialRenewal_ConsumesSingleRateLimiterToken
+// is a regression test for the double-token bug in onCredentialRenewal. The
+// previous implementation called both refreshRateLimiter.Allow() and
+// refreshRateLimiter.Wait() in the same branch, consuming two tokens per
+// renewal and halving the effective refresh QPS. A single renewal must consume
+// exactly one token.
+func TestCachedCredentialRetriever_OnCredentialRenewal_ConsumesSingleRateLimiterToken(t *testing.T) {
+	g := NewWithT(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const podUID = "abcd1234-5678-9abc-def0-123456789012"
+
+	// Delegate returns valid, long-lived credentials for the single renewal call
+	// so that onCredentialRenewal takes the success path.
+	longLivedCreds := &credentials.EksCredentialsResponse{
+		Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+	}
+	delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+		Return(longLivedCreds, responseMetadataTest("test"), nil).Times(1)
+
+	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+		Delegate:              delegate,
+		CredentialsRenewalTtl: time.Hour,
+		MaxCacheSize:          5,
+		RefreshQPS:            3,
+		CleanupInterval:       0, // disable janitor; we drive renewal directly
+	})
+
+	// Replace the limiter with one that starts with a full burst of 2 tokens and
+	// a negligible refill rate, so the token count is stable for the duration of
+	// the test and we can measure exactly how many tokens a single renewal
+	// consumes. A burst of 2 ensures neither the old (2-token) nor the new
+	// (1-token) code path would block on an empty bucket.
+	limiter := rate.NewLimiter(rate.Limit(0.0001), 2)
+	retriever.refreshRateLimiter = limiter
+
+	entry := cacheEntry{
+		requestLogCtx: context.Background(),
+		originatingRequest: &credentials.EksCredentialsRequest{
+			ServiceAccountToken: test.CreateToken(t, test.TokenConfig{
+				Expiry: time.Now().Add(time.Hour),
+				Iat:    time.Now(),
+				Nbf:    time.Now(),
+				PodUID: podUID,
+			}),
+		},
+		credentials: longLivedCreds,
+	}
+
+	tokensBefore := limiter.Tokens()
+	retriever.onCredentialRenewal(podUID, entry)
+	tokensConsumed := tokensBefore - limiter.Tokens()
+
+	// Exactly one token for one renewal. The buggy implementation consumed ~2.0.
+	g.Expect(tokensConsumed).To(BeNumerically("~", 1.0, 0.2))
 }

@@ -343,36 +343,37 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		logger.ContextWithField(entry.requestLogCtx, "from", "renewal-thread"), renewalTimeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
-	if r.refreshRateLimiter.Allow() {
-		err := r.refreshRateLimiter.Wait(ctx)
-		if err != nil {
-			log.Errorf("Problem waiting, will schedule refresh to next sweep")
-			return
-		}
-		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
-		if err == nil {
-			// if we retrieved the credentials successfully, exit we don't need to do anything else
-			promCacheState.WithLabelValues("hit").Inc()
-			return
-		}
-
-		errCode, isIrrecoverableError := eksauth.IsIrrecoverableApiError(err)
-		if isIrrecoverableError {
-			log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
-			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
-			podUID, err := getPodUIDfromServiceAccountToken(entry.originatingRequest.ServiceAccountToken)
-			if err != nil {
-				log.Errorf("Could not parse podUID from service account token, will schedule refresh to next sweep")
-				return
-			}
-			r.internalCache.Delete(podUID)
-			return
-		}
-		promCacheError.WithLabelValues("Recoverable", errCode).Inc()
-		log.Infof("Could not renew, will try to keep existing creds. Error is recoverable: %s", err.Error())
-	} else {
-		log.Infof("Rate limited! Will try to keep creds locally")
+	// Pace renewals with the rate limiter to avoid overwhelming EKS Auth when a
+	// backlog of credentials needs refreshing. Wait() consumes exactly one token
+	// and blocks until one is available, bounded by the renewal context. This
+	// branch previously called both Allow() and Wait(), consuming two tokens per
+	// renewal (halving the effective --max-service-qps) and coupling a
+	// non-blocking skip path with a blocking one.
+	if err := r.refreshRateLimiter.Wait(ctx); err != nil {
+		log.Infof("Rate limited, will retry renewal on the next sweep: %s", err.Error())
+		return
 	}
+	_, _, err := r.callDelegateAndCache(ctx, entry.originatingRequest)
+	if err == nil {
+		// if we retrieved the credentials successfully, exit we don't need to do anything else
+		promCacheState.WithLabelValues("hit").Inc()
+		return
+	}
+
+	errCode, isIrrecoverableError := eksauth.IsIrrecoverableApiError(err)
+	if isIrrecoverableError {
+		log.Infof("Removing credentials from cache, got non recoverable error: %s", err.Error())
+		promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
+		podUID, err := getPodUIDfromServiceAccountToken(entry.originatingRequest.ServiceAccountToken)
+		if err != nil {
+			log.Errorf("Could not parse podUID from service account token, will schedule refresh to next sweep")
+			return
+		}
+		r.internalCache.Delete(podUID)
+		return
+	}
+	promCacheError.WithLabelValues("Recoverable", errCode).Inc()
+	log.Infof("Could not renew, will try to keep existing creds. Error is recoverable: %s", err.Error())
 
 	// if there was an error, try to keep the old credentials in the agent if they haven't expired
 	oldCreds := entry.credentials
