@@ -33,6 +33,7 @@ var (
 	maxCacheSize            int
 	refreshQps              int
 	rotateCredentials       bool
+	enableIMDSCredentials   bool
 )
 
 var serverCmd = &cobra.Command{
@@ -68,7 +69,7 @@ func startServers(pCtx context.Context, cfg aws.Config) {
 	ctx, cancel := context.WithCancel(pCtx)
 	wg := sync.WaitGroup{}
 
-	servers := createServers(cfg)
+	servers := createServers(ctx, cfg)
 
 	// start servers
 	for _, srv := range servers {
@@ -89,18 +90,19 @@ func startServers(pCtx context.Context, cfg aws.Config) {
 	wg.Wait()
 }
 
-func createServers(cfg aws.Config) []*server.Server {
+func createServers(ctx context.Context, cfg aws.Config) []*server.Server {
 	servers := make([]*server.Server, len(bindHosts))
 	// listen on all bindHosts
 	for i, ip := range bindHosts {
 		addr := fmt.Sprintf("%s:%d", ip, serverPort)
-		servers[i] = server.NewEksCredentialServer(addr, handlers.EksCredentialHandlerOpts{
+		servers[i] = server.NewEksCredentialServer(ctx, addr, handlers.EksCredentialHandlerOpts{
 			Cfg:                cfg,
 			ClusterName:        clusterName,
 			CredentialRenewal:  maxCredentialRenewal,
 			MaxCacheSize:       maxCacheSize,
 			RefreshQPS:         refreshQps,
 			EndpointOverridden: overrideEksAuthEndpoint != "",
+			EnableIMDS:         enableIMDSCredentials,
 		})
 	}
 
@@ -148,5 +150,7 @@ func init() {
 		[]string{configuration.DefaultIpv4TargetHost, "[" + configuration.DefaultIpv6TargetHost + "]"}, "Hosts to bind server to")
 	serverCmd.Flags().BoolVar(&rotateCredentials, "rotate-credentials", false, "Enable credentials rotation from shared credentials file")
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
+	serverCmd.Flags().BoolVar(&enableIMDSCredentials, "enable-imds-credentials", false,
+		"Enable consuming credentials from IMDS when available on the node")
 
 }
