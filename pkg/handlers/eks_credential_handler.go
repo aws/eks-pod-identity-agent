@@ -51,7 +51,8 @@ var (
 func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts) *EksCredentialHandler {
 	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
 	log := logger.FromContext(ctx)
-	credentialsRetriever := eksauth.NewService(opts.Cfg)
+	authSvc := eksauth.NewService(opts.Cfg)
+	var credentialsRetriever credentials.CredentialRetriever = authSvc
 
 	// IMDS credential discovery is feature-flagged, default disabled
 	if opts.EnableIMDS {
@@ -77,6 +78,7 @@ func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts)
 	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
 		retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
 			Delegate:              credentialsRetriever,
+			AuthoritativeDelegate: authSvc,
 			CredentialsRenewalTtl: opts.CredentialRenewal,
 			MaxCacheSize:          opts.MaxCacheSize,
 			RefreshQPS:            opts.RefreshQPS,
