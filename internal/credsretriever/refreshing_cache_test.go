@@ -157,6 +157,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Fetching(t *testing.T) {
 			}
 			opts := CachedCredentialRetrieverOpts{
 				Delegate:              delegate,
+				AuthoritativeDelegate: delegate,
 				CredentialsRenewalTtl: ttlToRefreshDuration,
 				MaxCacheSize:          5,
 				CleanupInterval:       0, // Disable janitor in tests
@@ -279,6 +280,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Caching(t *testing.T) {
 
 			opts := CachedCredentialRetrieverOpts{
 				Delegate:              delegate,
+				AuthoritativeDelegate: delegate,
 				CredentialsRenewalTtl: 1 * time.Minute,
 				MaxCacheSize:          5,
 				CleanupInterval:       0, // Disable janitor in tests
@@ -470,6 +472,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_Refresh(t *testing.T) {
 
 			opts := CachedCredentialRetrieverOpts{
 				Delegate:              delegate,
+				AuthoritativeDelegate: delegate,
 				CredentialsRenewalTtl: ttlToRefreshDuration,
 				MaxCacheSize:          5,
 				CleanupInterval:       ttlToRefreshDuration / 10,
@@ -569,6 +572,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 
 			opts := CachedCredentialRetrieverOpts{
 				Delegate:              delegate,
+				AuthoritativeDelegate: delegate,
 				CredentialsRenewalTtl: 1 * time.Minute,
 				MaxCacheSize:          5,
 				CleanupInterval:       0, // Disable janitor in tests
@@ -632,6 +636,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_MissingPodUID(t *testing.T)
 	mockDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
 	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 		Delegate:              mockDelegate,
+		AuthoritativeDelegate: mockDelegate,
 		CredentialsRenewalTtl: time.Hour,
 		MaxCacheSize:          100,
 		RefreshQPS:            3,
@@ -655,6 +660,7 @@ func TestCachedCredentialRetriever_CallDelegateAndCache_MissingPodUID(t *testing
 	mockDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
 	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 		Delegate:              mockDelegate,
+		AuthoritativeDelegate: mockDelegate,
 		CredentialsRenewalTtl: time.Hour,
 		MaxCacheSize:          100,
 		RefreshQPS:            3,
@@ -665,7 +671,7 @@ func TestCachedCredentialRetriever_CallDelegateAndCache_MissingPodUID(t *testing
 		ServiceAccountToken: test.CreateToken(t, test.TokenConfig{Expiry: time.Now().Add(time.Hour), Iat: time.Now(), Nbf: time.Now()}),
 	}
 
-	_, _, err := retriever.callDelegateAndCache(context.Background(), request)
+	_, _, err := retriever.callDelegateAndCache(context.Background(), mockDelegate, request)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("failed to get pod uid from service account token"))
 }
@@ -679,6 +685,7 @@ func TestCachedCredentialRetriever_OnCredentialRenewal_MissingPodUID(t *testing.
 	mockDelegate.EXPECT().IsIrrecoverable(gomock.Any()).Return("Unknown", false).AnyTimes()
 	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 		Delegate:              mockDelegate,
+		AuthoritativeDelegate: mockDelegate,
 		CredentialsRenewalTtl: time.Hour,
 		MaxCacheSize:          100,
 		RefreshQPS:            3,
@@ -715,6 +722,7 @@ func TestCachedCredentialRetriever_UncachedPodDelegateFailure_ReturnsEmptyCreden
 
 	opts := CachedCredentialRetrieverOpts{
 		Delegate:              delegate,
+		AuthoritativeDelegate: delegate,
 		CredentialsRenewalTtl: time.Hour,
 		MaxCacheSize:          5,
 		CleanupInterval:       0, // Disable janitor in tests
@@ -828,6 +836,7 @@ func TestCachedCredentialRetriever_ValidateTokenOnlyWhenExpected(t *testing.T) {
 			spy := &spyTokenValidator{}
 			retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 				Delegate:              delegate,
+				AuthoritativeDelegate: delegate,
 				TokenValidator:        spy,
 				CredentialsRenewalTtl: time.Hour,
 				MaxCacheSize:          100,
@@ -902,6 +911,7 @@ func TestCachedCredentialRetriever_ValidateTokenOutcome(t *testing.T) {
 		spy := &spyTokenValidator{}
 		retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 			Delegate:              mockcreds.NewMockCredentialRetriever(ctrl),
+			AuthoritativeDelegate: mockcreds.NewMockCredentialRetriever(ctrl),
 			TokenValidator:        spy,
 			CredentialsRenewalTtl: time.Hour,
 			MaxCacheSize:          100,
@@ -950,66 +960,6 @@ func TestCachedCredentialRetriever_ValidateTokenOutcome(t *testing.T) {
 		g.Expect(creds).To(Equal(validCreds))
 		g.Expect(spy.validateTokenCalled).To(BeFalse())
 	})
-
-	t.Run("unsuccessful validation falls through to delegate", func(t *testing.T) {
-		g := NewWithT(t)
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-		ctx := context.Background()
-
-		podUID := "pod1"
-		cachedCreds := &credentials.EksCredentialsResponse{
-			AccountId:  "cached",
-			Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
-		}
-		freshCreds := &credentials.EksCredentialsResponse{
-			AccountId:  "fresh",
-			Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
-		}
-
-		delegate := mockcreds.NewMockCredentialRetriever(ctrl)
-		delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
-			Return(freshCreds, responseMetadataTest("test"), nil).Times(1)
-
-		spy := &spyTokenValidator{validateTokenErr: fmt.Errorf("signature mismatch")}
-		retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
-			Delegate:              delegate,
-			TokenValidator:        spy,
-			CredentialsRenewalTtl: time.Hour,
-			MaxCacheSize:          100,
-			RefreshQPS:            3,
-			CleanupInterval:       0,
-		})
-
-		// Create a request with the same pod but different token
-		jwt1 := test.CreateToken(t, test.TokenConfig{
-			Expiry: time.Now().Add(time.Hour),
-			Iat:    time.Now(),
-			Nbf:    time.Now(),
-			PodUID: podUID,
-		})
-		retriever.internalCache.Add(podUID, cacheEntry{
-			requestLogCtx:      ctx,
-			originatingRequest: &credentials.EksCredentialsRequest{ServiceAccountToken: jwt1},
-			credentials:        cachedCreds,
-		})
-
-		jwt2 := test.CreateToken(t, test.TokenConfig{
-			Expiry: time.Now().Add(time.Hour),
-			Iat:    time.Now().Add(time.Minute),
-			Nbf:    time.Now(),
-			PodUID: podUID,
-		})
-		request := &credentials.EksCredentialsRequest{ServiceAccountToken: jwt2}
-
-		failureBefore := testutil.ToFloat64(promLocalValidation.WithLabelValues("failure"))
-		creds, _, err := retriever.GetIamCredentials(ctx, request)
-		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(spy.validateTokenCalled).To(BeTrue())
-		// Should have gotten fresh creds from the delegate, not the cached ones
-		g.Expect(creds.AccountId).To(Equal("fresh"))
-		g.Expect(testutil.ToFloat64(promLocalValidation.WithLabelValues("failure"))).To(Equal(failureBefore + 1))
-	})
 }
 
 func TestCachedCredentialRetriever_TamperedPodUID_DoesNotReturnOtherPodCreds(t *testing.T) {
@@ -1037,6 +987,7 @@ func TestCachedCredentialRetriever_TamperedPodUID_DoesNotReturnOtherPodCreds(t *
 	spy := &spyTokenValidator{validateTokenErr: fmt.Errorf("signature mismatch")}
 	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 		Delegate:              delegate,
+		AuthoritativeDelegate: delegate,
 		TokenValidator:        spy,
 		CredentialsRenewalTtl: time.Hour,
 		MaxCacheSize:          100,
@@ -1345,6 +1296,7 @@ func TestCachedCredentialRetriever_OnCredentialRenewal_SourceAware(t *testing.T)
 func newSourceTestRetriever(delegate credentials.CredentialRetriever) *cachedCredentialRetriever {
 	return newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
 		Delegate:              delegate,
+		AuthoritativeDelegate: delegate,
 		CredentialsRenewalTtl: 3 * time.Hour,
 		MaxCacheSize:          100,
 		RefreshQPS:            3,
@@ -1361,4 +1313,166 @@ func sourceTestToken(t *testing.T, podUID string) string {
 		Nbf:    time.Now(),
 		PodUID: podUID,
 	})
+}
+
+// TestCachedCredentialRetriever_DelegateRouting verifies that when a token
+// is unknown or fails validation, the authoritativeDelegate is called. And,
+// validated tokens don't call delegates (served from cache).
+func TestCachedCredentialRetriever_DelegateRouting(t *testing.T) {
+	const samePodUID = "pod1"
+
+	tests := []struct {
+		name string
+		validationErr error // error from local token validation
+		seedCached bool // whether to seed the cache with an entry for the pod
+		sameToken bool // whether to reuse the token in the cache
+		wantAuthoritative   bool // authoritative delegate called
+		wantServedFromCache bool // no delegate called - served from cache
+	}{
+		{
+			name:              "cache miss admits via authoritative delegate",
+			seedCached:        false,
+			wantAuthoritative: true,
+		},
+		{
+			name:              "different token failing validation admits via authoritative delegate",
+			seedCached:        true,
+			validationErr:     fmt.Errorf("signature mismatch"),
+			wantAuthoritative: true,
+		},
+		{
+			name:                "different token passing validation is served from cache",
+			seedCached:          true,
+			validationErr:       nil,
+			wantServedFromCache: true,
+		},
+		{
+			name:                "same token is served from cache",
+			seedCached:          true,
+			sameToken:           true,
+			wantServedFromCache: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			ctx := context.Background()
+
+			// Distinct creds so the assertions can tell the source apart.
+			cachedCreds := &credentials.EksCredentialsResponse{
+				AccountId:  "cached",
+				Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+			}
+			freshCreds := &credentials.EksCredentialsResponse{
+				AccountId:  "fresh",
+				Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+			}
+
+			generalDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
+			authoritativeDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
+
+			// Set delegate expectations for the scenario.
+			if tc.wantAuthoritative {
+				authoritativeDelegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+					Return(freshCreds, responseMetadataTest("assoc"), nil).Times(1)
+				generalDelegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).Times(0)
+			} else {
+				// Served from cache: neither delegate is consulted.
+				authoritativeDelegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).Times(0)
+				generalDelegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).Times(0)
+			}
+
+			// Build the retriever with both delegates and the scenario's validator result.
+			retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+				Delegate:              generalDelegate,
+				AuthoritativeDelegate: authoritativeDelegate,
+				TokenValidator:        &spyTokenValidator{validateTokenErr: tc.validationErr},
+				CredentialsRenewalTtl: time.Hour,
+				MaxCacheSize:          100,
+				RefreshQPS:            3,
+				CleanupInterval:       0,
+			})
+
+			// Create the token the request will carry (also used to seed the cache).
+			seededToken := test.CreateToken(t, test.TokenConfig{
+				Expiry: time.Now().Add(time.Hour), Iat: time.Now(), Nbf: time.Now(), PodUID: samePodUID,
+			})
+			requestToken := seededToken
+			if tc.seedCached {
+				// Seed a cache entry for the pod under the first token.
+				retriever.internalCache.Add(samePodUID, cacheEntry{
+					requestLogCtx:      ctx,
+					originatingRequest: &credentials.EksCredentialsRequest{ServiceAccountToken: seededToken},
+					credentials:        cachedCreds,
+				})
+				if !tc.sameToken {
+					// Request with a different token for the same pod.
+					requestToken = test.CreateToken(t, test.TokenConfig{
+						Expiry: time.Now().Add(time.Hour), Iat: time.Now().Add(time.Minute), Nbf: time.Now(), PodUID: samePodUID,
+					})
+				}
+			}
+
+			// Fetch credentials and verify which source served them.
+			creds, _, err := retriever.GetIamCredentials(ctx, &credentials.EksCredentialsRequest{ServiceAccountToken: requestToken})
+			g.Expect(err).ToNot(HaveOccurred())
+			if tc.wantAuthoritative {
+				// Fresh creds prove the authoritative delegate served.
+				g.Expect(creds.AccountId).To(Equal("fresh"))
+			}
+			if tc.wantServedFromCache {
+				// Cached creds prove no delegate was called.
+				g.Expect(creds.AccountId).To(Equal("cached"))
+			}
+		})
+	}
+}
+
+// TestCachedCredentialRetriever_RefreshUsesGeneralDelegate verifies the
+// background refresh of an already-cached entry uses the general delegate.
+func TestCachedCredentialRetriever_RefreshUsesGeneralDelegate(t *testing.T) {
+	g := NewWithT(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	podUID := "refresh-pod"
+	refreshed := &credentials.EksCredentialsResponse{
+		AccessKeyId: "AKIA-refreshed",
+		Expiration:  credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+	}
+
+	// The general delegate must serve the refresh; the authoritative one must not.
+	generalDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	generalDelegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+		Return(refreshed, responseMetadataTest("assoc"), nil).Times(1)
+
+	authoritativeDelegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	authoritativeDelegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).Times(0)
+
+	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+		Delegate:              generalDelegate,
+		AuthoritativeDelegate: authoritativeDelegate,
+		CredentialsRenewalTtl: time.Hour,
+		MaxCacheSize:          100,
+		RefreshQPS:            3,
+		CleanupInterval:       0,
+	})
+
+	// Seed a cached entry, then trigger a background refresh on it.
+	entry := cacheEntry{
+		requestLogCtx:      context.Background(),
+		originatingRequest: &credentials.EksCredentialsRequest{ServiceAccountToken: sourceTestToken(t, podUID)},
+		credentials:        &credentials.EksCredentialsResponse{Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)}},
+		metadata:           responseMetadataTest("assoc"),
+	}
+	retriever.internalCache.Add(podUID, entry)
+	retriever.onCredentialRenewal(podUID, entry)
+
+	// Verify the entry was refreshed from the general delegate.
+	updated, found := retriever.internalCache.Get(podUID)
+	g.Expect(found).To(BeTrue())
+	g.Expect(updated.credentials.AccessKeyId).To(Equal("AKIA-refreshed"))
 }

@@ -31,8 +31,10 @@ type cachedCredentialRetriever struct {
 	// internalActiveRequestCache, but not internalCache, it means an active request is ongoing,
 	// other requests to the same service token should wait for this active request.
 	internalActiveRequestCache *expiring.Cache[string, error]
-	// delegate is who we are actually getting the credentials from
+	// delegate is the credential source for trusted tokens
 	delegate credentials.CredentialRetriever
+	// authoritativeDelegate is the credential source that can validate untrusted tokens
+	authoritativeDelegate credentials.CredentialRetriever
 	// tokenValidator performs local JWT validation when available
 	tokenValidator atomic.Value // stores tokenValidator interface
 	tvInitInFlight atomic.Bool
@@ -116,6 +118,7 @@ const (
 
 type CachedCredentialRetrieverOpts struct {
 	Delegate              credentials.CredentialRetriever
+	AuthoritativeDelegate credentials.CredentialRetriever
 	TokenValidator        tokenValidator
 	CredentialsRenewalTtl time.Duration
 	MaxCacheSize          int
@@ -128,8 +131,8 @@ type CachedCredentialRetrieverOpts struct {
 // It renews credentials indefinitely until the association is removed and
 // no longer needed
 func NewCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) credentials.CredentialRetriever {
-	if opts.Delegate == nil {
-		panic("Delegate is not allowed to be empty")
+	if opts.Delegate == nil || opts.AuthoritativeDelegate == nil {
+		panic("Delegate and AuthoritativeDelegate must be non-nil")
 	}
 
 	if opts.CleanupInterval <= 0 {
@@ -151,6 +154,7 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 	internalActiveRequestCache := expiring.NewLru[string, error](opts.MaxCacheSize, 0, 0)
 	retriever := &cachedCredentialRetriever{
 		delegate:                   opts.Delegate,
+		authoritativeDelegate:      opts.AuthoritativeDelegate,
 		internalCache:              internalCache,
 		internalActiveRequestCache: internalActiveRequestCache,
 		credentialsRenewalTtl:      opts.CredentialsRenewalTtl,
@@ -217,7 +221,9 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
 	promCacheState.WithLabelValues("miss").Inc()
 
-	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, request)
+	// The token is not trusted by the cache, so admit it via the authoritative
+	// delegate (EKS Auth).
+	iamCredentials, metadata, err := r.callDelegateAndCache(ctx, r.authoritativeDelegate, request)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -309,6 +315,7 @@ func (r *cachedCredentialRetriever) waitForActiveRequest(ctx context.Context,
 }
 
 func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
+	delegate credentials.CredentialRetriever,
 	request *credentials.EksCredentialsRequest) (cacheEntry, credentials.ResponseMetadata, error) {
 	log := logger.FromContext(ctx)
 
@@ -317,7 +324,7 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 		return cacheEntry{}, nil, fmt.Errorf("failed to get pod uid from service account token: %w", err)
 	}
 
-	newCacheEntry, err := r.fetchCredentialsFromDelegate(ctx, request)
+	newCacheEntry, err := r.fetchCredentialsFromDelegate(ctx, delegate, request)
 	if err != nil {
 		return cacheEntry{}, nil, fmt.Errorf("error getting credentials to cache: %w", err)
 	}
@@ -376,8 +383,9 @@ func (r *cachedCredentialRetriever) getCacheTtls(source credentials.CredentialSo
 }
 
 func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Context,
+	delegate credentials.CredentialRetriever,
 	request *credentials.EksCredentialsRequest) (cacheEntry, error) {
-	iamCredentials, metadata, err := r.delegate.GetIamCredentials(ctx, request)
+	iamCredentials, metadata, err := delegate.GetIamCredentials(ctx, request)
 	if err != nil {
 		return cacheEntry{}, err
 	}
@@ -407,7 +415,8 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 			log.Errorf("Problem waiting, will schedule refresh to next sweep")
 			return
 		}
-		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
+		// Refresh an already-cached entry via the general delegate.
+		_, _, err = r.callDelegateAndCache(ctx, r.delegate, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
 			promCacheState.WithLabelValues("hit").Inc()
