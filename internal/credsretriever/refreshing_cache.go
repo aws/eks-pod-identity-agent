@@ -344,12 +344,12 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 	defer cancel()
 	log := logger.FromContext(ctx)
 	if r.refreshRateLimiter.Allow() {
-		err := r.refreshRateLimiter.Wait(ctx)
-		if err != nil {
-			log.Errorf("Problem waiting, will schedule refresh to next sweep")
-			return
-		}
-		_, _, err = r.callDelegateAndCache(ctx, entry.originatingRequest)
+		// Allow() already consumes one token from the rate limiter and is
+		// non-blocking. We must not additionally call Wait() here: doing so
+		// consumed a second token per renewal (halving effective refresh QPS)
+		// and could block the janitor goroutine. The else branch below is the
+		// intended "skip this sweep when rate limited" behavior.
+		_, _, err := r.callDelegateAndCache(ctx, entry.originatingRequest)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
 			promCacheState.WithLabelValues("hit").Inc()
