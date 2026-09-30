@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
+	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
@@ -37,6 +38,7 @@ type EksCredentialHandlerOpts struct {
 	MaxCacheSize       int
 	RefreshQPS         int
 	EndpointOverridden bool
+	EnableIMDS         bool
 }
 
 var (
@@ -46,12 +48,26 @@ var (
 	}, []string{"code"})
 )
 
-func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
+func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts) *EksCredentialHandler {
+	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
+	log := logger.FromContext(ctx)
 	credentialsRetriever := eksauth.NewService(opts.Cfg)
 
-	tv, err := validation.NewTokenValidator(context.Background())
+	// IMDS credential discovery is feature-flagged, default disabled
+	if opts.EnableIMDS {
+		// Check if IMDS is present on the node
+		if imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+			// If so, configure the agent's credential delegates to be a chain of [imds, eksAuth]
+			log.Info("IMDS available: using [imds, eksauth] chained retriever")
+			imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
+			credentialsRetriever = credsretriever.NewChainedRetriever(imdsSvc, credentialsRetriever)
+		} else {
+			log.Info("IMDS not available on node: using eksauth-only retriever")
+		}
+	}
+
+	tv, err := validation.NewTokenValidator(ctx)
 	if err != nil {
-		log := logger.FromContext(context.Background())
 		log.Infof("failed to initialize token validator: %v", err)
 	}
 	if tv != nil {
