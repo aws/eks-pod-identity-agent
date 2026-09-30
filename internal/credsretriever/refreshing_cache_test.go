@@ -1095,8 +1095,8 @@ func TestGetPodUIDfromServiceAccountToken(t *testing.T) {
 // is a regression test for the double-token bug in onCredentialRenewal. The
 // previous implementation called both refreshRateLimiter.Allow() and
 // refreshRateLimiter.Wait() in the same branch, consuming two tokens per
-// renewal and halving the effective refresh QPS. A single successful renewal
-// must consume exactly one token.
+// renewal and halving the effective refresh QPS. A single renewal must consume
+// exactly one token.
 func TestCachedCredentialRetriever_OnCredentialRenewal_ConsumesSingleRateLimiterToken(t *testing.T) {
 	g := NewWithT(t)
 	ctrl := gomock.NewController(t)
