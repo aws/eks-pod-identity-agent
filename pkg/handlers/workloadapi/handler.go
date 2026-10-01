@@ -146,7 +146,7 @@ func (h *Handler) FetchX509Bundles(_ *workload.X509BundlesRequest, stream grpc.S
 	})
 }
 
-// FetchJWTSVID returns one JWT-SVID per requested audience. It is unary, takes no
+// FetchJWTSVID returns JWT-SVIDs covering all requested audiences. It is unary, takes no
 // bundle lease, and subscribes to nothing.
 //
 // PLACEHOLDER(T10): attest, then read TokenSource for the requested audiences.

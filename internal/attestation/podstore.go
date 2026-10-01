@@ -64,7 +64,8 @@ type PodGetter interface {
 
 // PodStore is a node-scoped view of pods backed by a shared informer.
 type PodStore struct {
-	indexer cache.Indexer
+	indexer  cache.Indexer
+	informer cache.SharedIndexInformer
 }
 
 // podUIDIndexFunc keys a pod object by its UID for the byPodUID index.
@@ -183,7 +184,36 @@ func NewPodStore(ctx context.Context, clientset kubernetes.Interface, nodeName s
 		"pods": len(indexer.ListKeys()),
 	}).Info("podstore: node-scoped pod informer synced")
 
-	return &PodStore{indexer: indexer}, nil
+	return &PodStore{indexer: indexer, informer: podInformer}, nil
+}
+
+// OnPodDeleted reuses this node's watch. Callbacks must return promptly.
+func (s *PodStore) OnPodDeleted(fn func(podUID string)) error {
+	if fn == nil {
+		return fmt.Errorf("pod deletion callback is required")
+	}
+	if s == nil || s.informer == nil {
+		return fmt.Errorf("pod store has no informer to report pod deletions from")
+	}
+	_, err := s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: podDeletedHandler(fn),
+	})
+	if err != nil {
+		return fmt.Errorf("adding pod deletion handler: %w", err)
+	}
+	return nil
+}
+
+func podDeletedHandler(fn func(string)) func(interface{}) {
+	return func(obj interface{}) {
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			obj = tombstone.Obj
+		}
+		pod, ok := obj.(*corev1.Pod)
+		if ok && pod != nil && pod.UID != "" {
+			fn(string(pod.UID))
+		}
+	}
 }
 
 // logPodEvent renders one watch event for the node-scoped pod informer. It is
@@ -217,6 +247,15 @@ func logPodEvent(log *logrus.Entry, verb string, obj interface{}) {
 // and projection logic can be tested without an informer or a cluster.
 func newPodStoreFromIndexer(indexer cache.Indexer) *PodStore {
 	return &PodStore{indexer: indexer}
+}
+
+// HasPod checks the node-scoped cache without calling the API server.
+func (s *PodStore) HasPod(uid string) bool {
+	if s == nil || s.indexer == nil || uid == "" {
+		return false
+	}
+	_, found := s.PodByUID(uid)
+	return found
 }
 
 // PodByUID returns the pod with uid from the node-scoped cache. A UID absent

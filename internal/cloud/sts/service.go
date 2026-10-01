@@ -50,6 +50,8 @@ type Iface interface {
 	// the request, this call names no identity: STS takes it from whoever signed, so
 	// creds have to be the workload's own.
 	GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req CertificateRequest) (*IssuedCertificate, error)
+
+	GetWebIdentityToken(ctx context.Context, creds aws.Credentials, req WebIdentityTokenRequest) (*IssuedWebIdentityToken, error)
 }
 
 const (

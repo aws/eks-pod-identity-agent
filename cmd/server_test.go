@@ -35,7 +35,7 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		},
 		{
 			flag:               handlers.FlagJWTSVIDDuration,
-			expectedDefault:    "6h0m0s",
+			expectedDefault:    "1h0m0s",
 			expectedUsageBound: fmt.Sprintf("between %s and %s", jwtLower, jwtUpper),
 		},
 		// Half life, which STS recommended on 2026-10-02.
@@ -76,7 +76,7 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 
 	g.Expect(opts.Validate()).To(Succeed())
 	g.Expect(opts.X509SVIDDuration).To(Equal(12 * time.Hour))
-	g.Expect(opts.JWTSVIDDuration).To(Equal(6 * time.Hour))
+	g.Expect(opts.JWTSVIDDuration).To(Equal(time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.5))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.1))
 	g.Expect(opts.SVIDKeyType).To(Equal(workloadidentity.DefaultKeyType))
@@ -93,7 +93,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	err := serverCmd.Flags().Parse([]string{
 		"--cluster-name=cluster-a",
 		"--x509-svid-duration=1h",
-		"--jwt-svid-duration=2h",
+		"--jwt-svid-duration=30m",
 		"--svid-renewal-fraction=0.75",
 		"--svid-renewal-jitter=0.25",
 		// Not a workload identity flag. It is the credentials path's cache bound,
@@ -110,7 +110,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	g.Expect(opts.Cfg.Region).To(Equal("us-west-2"))
 	g.Expect(opts.ClusterName).To(Equal("cluster-a"))
 	g.Expect(opts.X509SVIDDuration).To(Equal(time.Hour))
-	g.Expect(opts.JWTSVIDDuration).To(Equal(2 * time.Hour))
+	g.Expect(opts.JWTSVIDDuration).To(Equal(30 * time.Minute))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.75))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.25))
 	g.Expect(opts.MaxCacheSize).To(Equal(512))

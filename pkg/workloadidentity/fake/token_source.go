@@ -32,7 +32,7 @@ type TokenSource struct {
 	// Result is returned by JWTSVIDs when Func and Err are nil, regardless of
 	// how many audiences were asked for. A copy of the slice is returned, so a
 	// caller mutating what it got cannot corrupt the canned value. The elements
-	// are shared. Use Func to vary the answer per audience.
+	// are shared. Use Func to vary the answer by audience set.
 	Result []*jwtsvid.SVID
 	// Err, when non-nil and Func is nil, is returned by JWTSVIDs together with a
 	// nil slice.

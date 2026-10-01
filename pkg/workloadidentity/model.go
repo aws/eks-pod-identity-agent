@@ -129,18 +129,14 @@ type CertSource interface {
 	X509SVIDs(ctx context.Context, w *Workload) ([]*x509svid.SVID, error)
 }
 
-// TokenSource yields JWT-SVIDs for a workload. Audiences is plural because
-// FetchJWTSVID takes a repeated audience field.
-//
-// The implementation fans out to one STS call and one cache entry per audience
-// because the Workload API returns independently renewable JWT-SVIDs. A token
-// carrying several audiences would couple their cache and renewal lifecycles.
+// TokenSource yields JWT-SVIDs covering the complete requested audience set.
+// FetchJWTSVID returns SVIDs for workload identities, not one SVID per audience.
 //
 // It yields go-spiffe's jwtsvid.SVID, which keeps the token unexported: only
 // jwtsvid.ParseInsecure or ParseAndValidate build one whose Marshal returns it,
 // and both check exp, iat and nbf against the wall clock. Hint is never set.
 type TokenSource interface {
-	// JWTSVIDs returns one JWT-SVID per requested audience.
+	// JWTSVIDs returns the workload's JWT-SVIDs with all requested audiences.
 	JWTSVIDs(ctx context.Context, w *Workload, audiences []string) ([]*jwtsvid.SVID, error)
 }
 

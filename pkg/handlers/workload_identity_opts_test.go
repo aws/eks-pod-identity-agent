@@ -16,7 +16,7 @@ func validWorkloadIdentityOpts() WorkloadIdentityServerOpts {
 	return WorkloadIdentityServerOpts{
 		ClusterName:         "cluster-a",
 		X509SVIDDuration:    6 * time.Hour,
-		JWTSVIDDuration:     6 * time.Hour,
+		JWTSVIDDuration:     time.Hour,
 		SVIDRenewalFraction: 0.5,
 		SVIDRenewalJitter:   0.1,
 	}
@@ -42,43 +42,43 @@ func TestValidate_SVIDDurations_AreBoundedByTheirEnvelopes(t *testing.T) {
 		{
 			name:         "both at the bottom of their envelopes",
 			x509Duration: time.Hour,
-			jwtDuration:  time.Hour,
+			jwtDuration:  time.Minute,
 		},
 		{
 			name:         "both at the top of their envelopes",
 			x509Duration: 12 * time.Hour,
-			jwtDuration:  12 * time.Hour,
+			jwtDuration:  time.Hour,
 		},
 		{
 			name:          "x509 one nanosecond below its envelope",
 			x509Duration:  time.Hour - time.Nanosecond,
-			jwtDuration:   6 * time.Hour,
+			jwtDuration:   5 * time.Minute,
 			expectedError: "--x509-svid-duration is 59m59.999999999s: a requested X.509-SVID lifetime has to be between 1h0m0s and 12h0m0s inclusive",
 		},
 		{
 			name:          "x509 one nanosecond above its envelope",
 			x509Duration:  12*time.Hour + time.Nanosecond,
-			jwtDuration:   6 * time.Hour,
+			jwtDuration:   5 * time.Minute,
 			expectedError: "--x509-svid-duration is 12h0m0.000000001s: a requested X.509-SVID lifetime has to be between 1h0m0s and 12h0m0s inclusive",
 		},
 		{
 			name:          "jwt one nanosecond below its envelope",
 			x509Duration:  6 * time.Hour,
-			jwtDuration:   time.Hour - time.Nanosecond,
-			expectedError: "--jwt-svid-duration is 59m59.999999999s: a requested JWT-SVID lifetime has to be between 1h0m0s and 12h0m0s inclusive",
+			jwtDuration:   time.Minute - time.Nanosecond,
+			expectedError: "--jwt-svid-duration is 59.999999999s: a requested JWT-SVID lifetime has to be between 1m0s and 1h0m0s inclusive",
 		},
 		{
 			name:          "jwt one nanosecond above its envelope",
 			x509Duration:  6 * time.Hour,
-			jwtDuration:   12*time.Hour + time.Nanosecond,
-			expectedError: "--jwt-svid-duration is 12h0m0.000000001s: a requested JWT-SVID lifetime has to be between 1h0m0s and 12h0m0s inclusive",
+			jwtDuration:   time.Hour + time.Nanosecond,
+			expectedError: "--jwt-svid-duration is 1h0m0.000000001s: a requested JWT-SVID lifetime has to be between 1m0s and 1h0m0s inclusive",
 		},
 		{
 			// a duration flag left off the command line entirely still has a
 			// default, so a zero here means an operator asked for zero
 			name:          "x509 left at zero",
 			x509Duration:  0,
-			jwtDuration:   6 * time.Hour,
+			jwtDuration:   5 * time.Minute,
 			expectedError: "--x509-svid-duration is 0s",
 		},
 		{
@@ -251,7 +251,7 @@ func TestSVIDDurationEnvelopes_MatchTheApiModel(t *testing.T) {
 	g.Expect(x509SVIDDurationEnvelope.min).To(Equal(time.Duration(3600) * time.Second))
 	g.Expect(x509SVIDDurationEnvelope.max).To(Equal(time.Duration(43200) * time.Second))
 
-	// a JWT-SVID carries the same 3600 to 43200 range as an X.509-SVID
-	g.Expect(jwtSVIDDurationEnvelope.min).To(Equal(time.Duration(3600) * time.Second))
-	g.Expect(jwtSVIDDurationEnvelope.max).To(Equal(time.Duration(43200) * time.Second))
+	// sts:GetWebIdentityToken DurationSeconds: 60 to 3600
+	g.Expect(jwtSVIDDurationEnvelope.min).To(Equal(time.Duration(60) * time.Second))
+	g.Expect(jwtSVIDDurationEnvelope.max).To(Equal(time.Duration(3600) * time.Second))
 }
