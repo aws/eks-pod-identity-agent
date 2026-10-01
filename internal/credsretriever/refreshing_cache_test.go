@@ -1089,3 +1089,201 @@ func TestGetPodUIDfromServiceAccountToken(t *testing.T) {
 		g.Expect(err).To(HaveOccurred())
 	})
 }
+
+// fakePodChecker is a test double for podPresenceChecker.
+type fakePodChecker struct {
+	present bool
+	known   bool
+	calls   int
+}
+
+func (f *fakePodChecker) IsPresent(_ string) (bool, bool) {
+	f.calls++
+	return f.present, f.known
+}
+
+func newRenewalEntry(t *testing.T, podUID string) cacheEntry {
+	t.Helper()
+	return cacheEntry{
+		requestLogCtx: context.Background(),
+		originatingRequest: &credentials.EksCredentialsRequest{
+			ServiceAccountToken: test.CreateToken(t, test.TokenConfig{
+				Expiry: time.Now().Add(time.Hour),
+				Iat:    time.Now(),
+				Nbf:    time.Now(),
+				PodUID: podUID,
+			}),
+		},
+		credentials: &credentials.EksCredentialsResponse{
+			Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+		},
+	}
+}
+
+// TestCachedCredentialRetriever_OnCredentialRenewal_SkipsRenewalForDeletedPod
+// verifies that when the pod checker reports a pod is known to be gone, the
+// renewal path evicts the entry and never calls the delegate (no
+// AssumeRoleForPodIdentity call for a terminated pod).
+func TestCachedCredentialRetriever_OnCredentialRenewal_SkipsRenewalForDeletedPod(t *testing.T) {
+	g := NewWithT(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const podUID = "abcd1234-5678-9abc-def0-123456789012"
+
+	// The delegate must NOT be called for a pod that no longer exists.
+	delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).Times(0)
+
+	checker := &fakePodChecker{present: false, known: true}
+	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+		Delegate:              delegate,
+		CredentialsRenewalTtl: time.Hour,
+		MaxCacheSize:          5,
+		RefreshQPS:            3,
+		CleanupInterval:       0, // disable janitor; drive renewal directly
+		PodChecker:            checker,
+	})
+
+	entry := newRenewalEntry(t, podUID)
+	retriever.internalCache.Add(podUID, entry)
+
+	retriever.onCredentialRenewal(podUID, entry)
+
+	_, found := retriever.internalCache.Get(podUID)
+	g.Expect(found).To(BeFalse()) // entry evicted instead of renewed
+	g.Expect(checker.calls).To(Equal(1))
+}
+
+// TestCachedCredentialRetriever_OnCredentialRenewal_RenewsForLivePod verifies
+// that when the pod checker reports the pod is still present, renewal proceeds
+// normally and the entry is kept in the cache.
+func TestCachedCredentialRetriever_OnCredentialRenewal_RenewsForLivePod(t *testing.T) {
+	g := NewWithT(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const podUID = "abcd1234-5678-9abc-def0-123456789012"
+
+	longLivedCreds := &credentials.EksCredentialsResponse{
+		Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+	}
+	delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+		Return(longLivedCreds, responseMetadataTest("test"), nil).Times(1)
+
+	checker := &fakePodChecker{present: true, known: true}
+	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+		Delegate:              delegate,
+		CredentialsRenewalTtl: time.Hour,
+		MaxCacheSize:          5,
+		RefreshQPS:            3,
+		CleanupInterval:       0,
+		PodChecker:            checker,
+	})
+
+	entry := newRenewalEntry(t, podUID)
+	retriever.internalCache.Add(podUID, entry)
+
+	retriever.onCredentialRenewal(podUID, entry)
+
+	_, found := retriever.internalCache.Get(podUID)
+	g.Expect(found).To(BeTrue()) // entry renewed and kept
+	g.Expect(checker.calls).To(Equal(1))
+}
+
+// TestCachedCredentialRetriever_OnCredentialRenewal_RenewsWhenPresenceUnknown
+// verifies the guard rail: when the checker cannot determine presence yet
+// (known == false, e.g. an informer that has not synced), renewal proceeds so
+// credentials for live pods are never evicted.
+func TestCachedCredentialRetriever_OnCredentialRenewal_RenewsWhenPresenceUnknown(t *testing.T) {
+	g := NewWithT(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const podUID = "abcd1234-5678-9abc-def0-123456789012"
+
+	longLivedCreds := &credentials.EksCredentialsResponse{
+		Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+	}
+	delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+	delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+		Return(longLivedCreds, responseMetadataTest("test"), nil).Times(1)
+
+	// present=false but known=false: the checker can't tell, so we must NOT evict.
+	checker := &fakePodChecker{present: false, known: false}
+	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+		Delegate:              delegate,
+		CredentialsRenewalTtl: time.Hour,
+		MaxCacheSize:          5,
+		RefreshQPS:            3,
+		CleanupInterval:       0,
+		PodChecker:            checker,
+	})
+
+	entry := newRenewalEntry(t, podUID)
+	retriever.internalCache.Add(podUID, entry)
+
+	retriever.onCredentialRenewal(podUID, entry)
+
+	_, found := retriever.internalCache.Get(podUID)
+	g.Expect(found).To(BeTrue()) // not evicted; renewal proceeded
+	g.Expect(checker.calls).To(Equal(1))
+}
+
+// fakeCheckerNotifier implements both podPresenceChecker and podDeletionNotifier
+// so the retriever registers its eviction callback.
+type fakeCheckerNotifier struct {
+	present   bool
+	known     bool
+	onDeleted func(string)
+}
+
+func (f *fakeCheckerNotifier) IsPresent(_ string) (bool, bool) { return f.present, f.known }
+func (f *fakeCheckerNotifier) SetOnPodDeleted(fn func(string)) { f.onDeleted = fn }
+
+// TestCachedCredentialRetriever_RegistersPodDeletionCallback verifies that when
+// the pod checker supports deletion notifications, the retriever registers a
+// callback that evicts the pod's cached credentials immediately.
+func TestCachedCredentialRetriever_RegistersPodDeletionCallback(t *testing.T) {
+	g := NewWithT(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const podUID = "abcd1234-5678-9abc-def0-123456789012"
+
+	// No renewal happens in this test, so the delegate must not be called.
+	delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+
+	checker := &fakeCheckerNotifier{present: true, known: true}
+	retriever := newCachedCredentialRetriever(CachedCredentialRetrieverOpts{
+		Delegate:              delegate,
+		CredentialsRenewalTtl: time.Hour,
+		MaxCacheSize:          5,
+		RefreshQPS:            3,
+		CleanupInterval:       0,
+		PodChecker:            checker,
+	})
+
+	// The retriever must have registered a deletion callback.
+	g.Expect(checker.onDeleted).ToNot(BeNil())
+
+	// Firing the callback evicts the cached entry for that pod UID and counts it.
+	retriever.internalCache.Add(podUID, newRenewalEntry(t, podUID))
+	_, found := retriever.internalCache.Get(podUID)
+	g.Expect(found).To(BeTrue())
+
+	before := testutil.ToFloat64(promCacheState.WithLabelValues("pod_deleted"))
+	checker.onDeleted(podUID)
+
+	_, found = retriever.internalCache.Get(podUID)
+	g.Expect(found).To(BeFalse())
+	g.Expect(testutil.ToFloat64(promCacheState.WithLabelValues("pod_deleted"))).
+		To(Equal(before + 1)) // counted exactly one eviction
+
+	// Firing the callback for a pod with nothing cached must NOT count: the
+	// metric reflects ghost credentials cleaned up, not every pod deletion.
+	checker.onDeleted("no-such-pod-uid")
+	g.Expect(testutil.ToFloat64(promCacheState.WithLabelValues("pod_deleted"))).
+		To(Equal(before + 1)) // unchanged
+}

@@ -44,6 +44,7 @@ The following table lists the configurable parameters for this chart and their d
 | `nameOverride`            | Override the name of the chart                          | `eks-pod-identity-agent` |
 | `nodeSelector`            | Node labels for pod assignment                          | `{}`                     |
 | `podAnnotations`          | annotations to add to each pod                          | `{}`                     |
+| `podLivenessCheck.enabled`| Watch node pods and skip/evict credential renewals for deleted pods. Requires a dedicated ServiceAccount (`serviceAccount.create=true` or `serviceAccount.name`); grants cluster-wide read-only `pods` `list`/`watch`. | `false` |
 | `priorityClassName`       | Name of the priorityClass                               | `system-node-critical`   |
 | `resources`               | Resources for containers in pod                         | `{}`                     |
 | `tolerations`             | Optional deployment tolerations                         | `all`                    |
