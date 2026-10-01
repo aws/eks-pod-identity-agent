@@ -16,6 +16,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podwatcher"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 
@@ -92,7 +93,20 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	return newCredentialManager(ctx, opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+	// Watch pods on this node so the cache can skip renewing credentials for
+	// pods that no longer exist and evict them promptly. If the watcher cannot
+	// be built (missing NODE_NAME, no in-cluster config, or missing RBAC), fail
+	// open: renewal proceeds for every entry as before.
+	cacheOpts := credcache.Opts{}
+	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
+		if watcher, werr := podwatcher.New(context.Background()); werr != nil {
+			log.Infof("pod watcher unavailable, renewals will not check pod liveness: %v", werr)
+		} else {
+			cacheOpts.PodChecker = watcher
+		}
+	}
+
+	return newCredentialManager(ctx, opts, cacheOpts, credentialsRetriever, authSvc, tv)
 }
 
 // newCredentialManager is NewCredentialManager over delegates it's given: general
