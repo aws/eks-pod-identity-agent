@@ -42,6 +42,12 @@ type Iface interface {
 	// GetTrustBundles returns the trust bundles for the named workload
 	// identity provider, one entry per trust domain, in response order.
 	GetTrustBundles(ctx context.Context, providerArn string) ([]TrustBundle, error)
+
+	// GetWorkloadIdentityCertificate mints an X.509-SVID for the workload
+	// identity that creds already carries. Unlike GetTrustBundles it is signed
+	// with a workload's session rather than the node role, because STS reads the
+	// subject off the caller's session and there is no request input naming it.
+	GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req CertificateRequest) (*IssuedCertificate, error)
 }
 
 // TrustBundle is one entry of a GetTrustBundles response.
@@ -96,7 +102,7 @@ func (s *service) GetTrustBundles(ctx context.Context, providerArn string) ([]Tr
 	}.Encode()
 
 	var decoded getTrustBundlesResponse
-	if err := s.call(ctx, body, &decoded); err != nil {
+	if err := s.call(ctx, nil, body, &decoded); err != nil {
 		return nil, &smithy.OperationError{
 			ServiceID:     awssts.ServiceID,
 			OperationName: operationGetTrustBundles,
@@ -127,20 +133,30 @@ type getTrustBundlesResponse struct {
 }
 
 // call signs and sends one awsQuery request and decodes a successful response
-// into out. It makes one attempt. The bundle tier owns retrying, on its own
+// into out. It makes one attempt. The calling tier owns retrying, on its own
 // backoff, and a retry loop here would multiply that against every node's
 // schedule during an STS outage.
-func (s *service) call(ctx context.Context, body string, out any) error {
+//
+// signWith names the credentials to sign with. Nil means the client's own, which
+// is the node role: that is what GetTrustBundles wants, since it names its target
+// provider as a request input. An operation whose result depends on who asked,
+// GetWorkloadIdentityCertificate being the one, passes a workload's session
+// credentials instead.
+func (s *service) call(ctx context.Context, signWith *aws.Credentials, body string, out any) error {
 	endpoint, signingRegion, err := s.resolveEndpoint(ctx)
 	if err != nil {
 		return err
 	}
-	if s.options.Credentials == nil {
+	var creds aws.Credentials
+	switch {
+	case signWith != nil:
+		creds = *signWith
+	case s.options.Credentials == nil:
 		return errors.New("no AWS credentials are configured to sign the request with")
-	}
-	creds, err := s.options.Credentials.Retrieve(ctx)
-	if err != nil {
-		return fmt.Errorf("retrieving credentials to sign the request: %w", err)
+	default:
+		if creds, err = s.options.Credentials.Retrieve(ctx); err != nil {
+			return fmt.Errorf("retrieving credentials to sign the request: %w", err)
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.URI.String(), strings.NewReader(body))

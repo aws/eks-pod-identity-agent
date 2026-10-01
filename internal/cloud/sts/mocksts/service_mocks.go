@@ -25,6 +25,7 @@ import (
 	context "context"
 	reflect "reflect"
 
+	aws "github.com/aws/aws-sdk-go-v2/aws"
 	sts "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	gomock "go.uber.org/mock/gomock"
 )
@@ -65,4 +66,19 @@ func (m *MockIface) GetTrustBundles(ctx context.Context, providerArn string) ([]
 func (mr *MockIfaceMockRecorder) GetTrustBundles(ctx, providerArn any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTrustBundles", reflect.TypeOf((*MockIface)(nil).GetTrustBundles), ctx, providerArn)
+}
+
+// GetWorkloadIdentityCertificate mocks base method.
+func (m *MockIface) GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetWorkloadIdentityCertificate", ctx, creds, req)
+	ret0, _ := ret[0].(*sts.IssuedCertificate)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetWorkloadIdentityCertificate indicates an expected call of GetWorkloadIdentityCertificate.
+func (mr *MockIfaceMockRecorder) GetWorkloadIdentityCertificate(ctx, creds, req any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkloadIdentityCertificate", reflect.TypeOf((*MockIface)(nil).GetWorkloadIdentityCertificate), ctx, creds, req)
 }

@@ -36,6 +36,8 @@ const (
 	KindUnknownKeyID
 	// KindBundleRefused is the kind of ErrBundleRefused.
 	KindBundleRefused
+	// KindIssuanceRefused is the kind of ErrIssuanceRefused.
+	KindIssuanceRefused
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -200,6 +202,25 @@ var (
 	// distinct from ErrBundleUnavailable so a misconfigured node does not read as
 	// an STS outage.
 	ErrBundleRefused = newWorkloadIdentityError(KindBundleRefused, "bundle_refused", false)
+
+	// ErrIssuanceRefused is produced by the certificate source (T7) and the token
+	// source (T8) when STS refuses issuance for a reason a repeat cannot change.
+	//
+	// For certificates it covers the three exceptions
+	// sts:GetWorkloadIdentityCertificate models, which is its whole modeled set:
+	// MalformedCertificateSigningRequestException, a request that failed the
+	// server side PKCS#10 parse, proof of possession or key type check, so the
+	// agent's own defect; SignerNotConfiguredException, a Provider with no
+	// outbound signer for the format, so the customer's configuration; and
+	// RegionalSignerUnavailableException, a signer whose material is absent in
+	// the caller's Region. It also covers the common STS refusals that reach the
+	// operation, such as AccessDenied and ValidationError.
+	//
+	// Not retryable, which is what separates it from ErrIssuanceFailed: retrying a
+	// deterministic refusal spends a signing operation at the customer's
+	// certificate authority to get the same answer, and a malformed request is the
+	// agent's own defect rather than an outage.
+	ErrIssuanceRefused = newWorkloadIdentityError(KindIssuanceRefused, "issuance_refused", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -260,5 +281,6 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrUnknownTrustDomain,
 		ErrUnknownKeyID,
 		ErrBundleRefused,
+		ErrIssuanceRefused,
 	}
 }
