@@ -1,0 +1,35 @@
+{{- if .Values.podLivenessCheck.enabled }}
+{{- $ctx := (dict "Values" .Values "Release" .Release "Chart" .Chart) -}}
+{{- $saName := include "eks-pod-identity-agent.serviceAccountName" . -}}
+{{- if not $saName }}
+{{- fail "podLivenessCheck.enabled=true requires a dedicated ServiceAccount: set serviceAccount.create=true (or serviceAccount.name to a pre-existing account). Cluster-wide pods list/watch must not be bound to the namespace \"default\" ServiceAccount." }}
+{{- end }}
+{{- $name := printf "%s-pod-reader" (include "eks-pod-identity-agent.fullname" $ctx) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eks-pod-identity-agent.labels" $ctx | nindent 4 }}
+rules:
+  # Node-scoped at runtime via a spec.nodeName field selector; RBAC itself cannot
+  # be restricted by field selector, so the grant is cluster-wide but read-only.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "eks-pod-identity-agent.labels" $ctx | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
