@@ -30,6 +30,8 @@ const (
 	KindBundleUnavailable
 	// KindInvalidAudience is the kind of ErrInvalidAudience.
 	KindInvalidAudience
+	// KindSessionRefused is the kind of ErrSessionRefused.
+	KindSessionRefused
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -177,6 +179,13 @@ var (
 	// API handler (T10) for a caller-supplied audience the agent will never
 	// accept. Not retryable: the same request will be rejected the same way.
 	ErrInvalidAudience = newWorkloadIdentityError(KindInvalidAudience, "invalid_audience", false)
+
+	// ErrSessionRefused is produced by the session provider (T5) when EKS Auth
+	// refuses the exchange with AccessDenied (such as a role missing
+	// sts:SetContext) or InvalidToken. Not retryable: a repeat gets the same
+	// answer. It is distinct from ErrSessionUnavailable so a misconfigured role
+	// or node does not read as an EKS Auth outage.
+	ErrSessionRefused = newWorkloadIdentityError(KindSessionRefused, "session_refused", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -234,5 +243,6 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrIssuanceThrottled,
 		ErrBundleUnavailable,
 		ErrInvalidAudience,
+		ErrSessionRefused,
 	}
 }

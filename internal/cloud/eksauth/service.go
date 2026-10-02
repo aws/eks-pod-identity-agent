@@ -59,13 +59,18 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, &eksauth.AssumeRoleForPodIdentityInput{
 		ClusterName: aws.String(request.ClusterName),
 		Token:       aws.String(request.ServiceAccountToken),
-	})
+	}, withWorkloadIdentityProviderArn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to fetch credentials from EKS Auth: %w", err)
 	}
 
-	if creds.Credentials == nil || creds.AssumedRoleUser == nil {
-		return nil, nil, fmt.Errorf("invalid response from server: credentials or assumed role empty: %v", creds)
+	// Check every pointer dereferenced below. The cache's janitor and the
+	// workload identity session tier call this on their own goroutines, where a
+	// panic ends the agent.
+	c, u, a := creds.Credentials, creds.AssumedRoleUser, creds.PodIdentityAssociation
+	if c == nil || c.AccessKeyId == nil || c.SecretAccessKey == nil || c.SessionToken == nil || c.Expiration == nil ||
+		u == nil || u.Arn == nil || u.AssumeRoleId == nil || a == nil || a.AssociationId == nil {
+		return nil, nil, fmt.Errorf("invalid response from server: credentials, assumed role or association empty: %v", creds)
 	}
 
 	log.WithFields(logrus.Fields{
@@ -80,6 +85,9 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to parse arn from assumed role: %v", err)
 	}
+	// EKS Auth sets the member only on an enrolled vend. A missing or unreadable
+	// one reads as not enrolled rather than failing every pod's credentials.
+	providerArn, _ := creds.ResultMetadata.Get(workloadIdentityProviderArnKey{}).(string)
 
 	return &credentials.EksCredentialsResponse{
 		AccessKeyId:     *creds.Credentials.AccessKeyId,
@@ -87,5 +95,6 @@ func (s *service) GetIamCredentials(ctx context.Context,
 		Token:           *creds.Credentials.SessionToken,
 		AccountId:       parsedArn.AccountID,
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
+		ProviderArn:     providerArn,
 	}, responseMetadata(*creds.PodIdentityAssociation.AssociationId), nil
 }
