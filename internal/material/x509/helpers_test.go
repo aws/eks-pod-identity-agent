@@ -213,6 +213,7 @@ func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.Sessio
 	s, err := New(Opts{
 		Issuer:          issuer,
 		SessionProvider: sessions,
+		Notifier:        &fake.Subscriber{},
 		MaxCacheSize:    10,
 		Duration:        6 * time.Hour,
 		RenewFraction:   0.5,

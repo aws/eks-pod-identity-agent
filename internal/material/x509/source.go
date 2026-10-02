@@ -81,7 +81,7 @@ const (
 	// defaultRefreshQPS is the rate and burst of background replacements, in calls per
 	// second.
 	//
-	// Two is low, for the billing reason above. A sweep accrues tokens while it runs, so
+	// Two is low, for the reason above. A sweep accrues tokens while it runs, so
 	// this is not a cap of two per sweep; the throughput is roughly two per second of
 	// sweep. Work the limit turns away is skipped rather than queued, and the next sweep
 	// picks it up a minute later.
@@ -101,8 +101,8 @@ type Issuer interface {
 	GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req sts.CertificateRequest) (*sts.IssuedCertificate, error)
 }
 
-// Opts configures the tier. Issuer, SessionProvider and MaxCacheSize have to be
-// supplied; everything else falls back to the defaults above.
+// Opts configures the tier. Issuer, SessionProvider, Notifier and MaxCacheSize have
+// to be supplied; everything else falls back to the defaults above.
 type Opts struct {
 	// Issuer makes the call to STS. Required.
 	Issuer Issuer
@@ -111,6 +111,14 @@ type Opts struct {
 	// takes the identity for the certificate from who signed the call, so these
 	// credentials decide whose certificate comes back. Required.
 	SessionProvider workloadidentity.SessionProvider
+
+	// Notifier is told when a pod's certificate has changed, so the streams serving
+	// that pod wake up and send the new one. Required.
+	//
+	// Without it a replacement never reaches a workload: the agent would hold a fresh
+	// certificate while the pod carried on with the old one until its stream was
+	// re-established. One hub serves the node, and this tier only publishes to it.
+	Notifier workloadidentity.WorkloadNotifier
 
 	// MaxCacheSize is the most certificates we will hold, one per pod. It comes from
 	// --max-cache-size, the same per-node budget the other per-pod caches use.
@@ -164,6 +172,7 @@ type entry struct {
 type Source struct {
 	issuer          Issuer
 	sessionProvider workloadidentity.SessionProvider
+	notifier        workloadidentity.WorkloadNotifier
 	cache           *expiring.Cache[string, entry]
 
 	// group makes sure that several requests arriving for the same pod at once result
@@ -197,6 +206,9 @@ func New(opts Opts) (*Source, error) {
 	if opts.SessionProvider == nil {
 		return nil, errors.New("an X.509-SVID source needs a session provider")
 	}
+	if opts.Notifier == nil {
+		return nil, errors.New("an X.509-SVID source needs a change notifier")
+	}
 	if opts.MaxCacheSize <= 0 {
 		return nil, fmt.Errorf("an X.509-SVID source needs a positive cache bound, got %d", opts.MaxCacheSize)
 	}
@@ -225,6 +237,7 @@ func New(opts Opts) (*Source, error) {
 	s := &Source{
 		issuer:          opts.Issuer,
 		sessionProvider: opts.SessionProvider,
+		notifier:        opts.Notifier,
 		// Each entry gets its own expiry when we store it, taken from the certificate,
 		// so the cache-wide default here is never actually used.
 		cache:          expiring.NewLru[string, entry](opts.MaxCacheSize, expiring.NoExpiration, opts.CleanupInterval),
@@ -390,6 +403,15 @@ func (s *Source) store(w *workloadidentity.Workload, svid *workloadidentity.X509
 		renewalDelay(now, renewAt),
 		svid.NotAfter.Sub(now),
 	)
+
+	// Told after the cache holds the new certificate, never before. A stream woken
+	// first would re-read and find the old one, and nothing would wake it again until
+	// the next change.
+	//
+	// Only on success, which is why this sits in store rather than in issueAndStore:
+	// a failed replacement changes nothing a stream could send, and an eviction is not
+	// a change either.
+	s.notifier.NotifyWorkloadChange(w.PodUID)
 }
 
 // onRefresh replaces a certificate that is due, and is called by the cache's
@@ -441,15 +463,13 @@ func (s *Source) onRefresh(uid string, cached entry) {
 // where ghost renewals for terminated pods consume EKS Auth capacity; here each one is a
 // signing operation against the customer's own certificate authority.
 //
-// Deliberately a named set rather than "not retryable". ErrIssuanceRefused is also not
-// retryable, and means a malformed request or a Provider with no signer, neither of
-// which says anything about whether the pod is still there.
-//
-// ErrSessionRefused belongs in this set and is not referenced yet because it arrives
-// with T5. Add it when T5 merges.
+// A named set rather than "not retryable". ErrIssuanceRefused is also not retryable,
+// and means a malformed request or a Provider with no signer, neither of which says
+// anything about whether the pod is still there.
 func workloadGone(err error) bool {
 	return errors.Is(err, wierrors.ErrNotEnrolled) ||
-		errors.Is(err, wierrors.ErrTokenMintForbidden)
+		errors.Is(err, wierrors.ErrTokenMintForbidden) ||
+		errors.Is(err, wierrors.ErrSessionRefused)
 }
 
 // onEvicted is where the entry, and the pod's private key inside it, becomes garbage

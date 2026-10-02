@@ -23,6 +23,7 @@ import (
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 )
 
 func TestNewRejectsAnIncompleteConfiguration(t *testing.T) {
@@ -40,10 +41,16 @@ func TestNewRejectsAnIncompleteConfiguration(t *testing.T) {
 		_, err := New(Opts{Issuer: issuer, MaxCacheSize: 1})
 		assert.ErrorContains(t, err, "session provider")
 	})
+	t.Run("no change notifier", func(t *testing.T) {
+		// Without one a replacement never reaches a workload, so this is refused rather
+		// than defaulted to a no-op.
+		_, err := New(Opts{Issuer: issuer, SessionProvider: testSessions(time.Now()), MaxCacheSize: 1})
+		assert.ErrorContains(t, err, "change notifier")
+	})
 	t.Run("an unbounded cache is refused", func(t *testing.T) {
 		// expiring.NewLru reads zero as unlimited, and an unbounded cache of private
 		// keys is not something to arrive at by accident.
-		_, err := New(Opts{Issuer: issuer, SessionProvider: testSessions(time.Now()), MaxCacheSize: 0})
+		_, err := New(Opts{Issuer: issuer, SessionProvider: testSessions(time.Now()), Notifier: &fake.Subscriber{}, MaxCacheSize: 0})
 		assert.ErrorContains(t, err, "positive cache bound")
 	})
 }
@@ -282,6 +289,11 @@ func TestRenewalForAGonePodDropsTheCertificate(t *testing.T) {
 			wantKept: false,
 		},
 		{
+			name:     "EKS Auth refuses the session exchange",
+			renewErr: wierrors.ErrSessionRefused.Wrapf(nil, "pod is gone"),
+			wantKept: false,
+		},
+		{
 			name:     "STS is unavailable, so the pod may well still be running",
 			renewErr: wierrors.ErrIssuanceFailed.Wrapf(nil, "STS is down"),
 			wantKept: true,
@@ -319,6 +331,56 @@ func TestRenewalForAGonePodDropsTheCertificate(t *testing.T) {
 			assert.Equal(t, tc.wantKept, stillCached)
 		})
 	}
+}
+
+// TestStoreNotifiesTheOpenStreams covers what makes a replacement reach a workload.
+// Without it the agent holds a fresh certificate while the pod carries on with the old
+// one, which is T10's definition of done: a renewal produces a fresh response on an
+// already-open stream.
+func TestStoreNotifiesTheOpenStreams(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	issuer := &fakeIssuer{respond: func(attempt int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		if attempt > 2 {
+			return nil, errors.New("STS is unavailable")
+		}
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+	}}
+	notifier := &fake.Subscriber{}
+	source, err := New(Opts{
+		Issuer:          issuer,
+		SessionProvider: testSessions(now.Add(time.Hour)),
+		Notifier:        notifier,
+		MaxCacheSize:    10,
+		Duration:        6 * time.Hour,
+		RenewFraction:   0.5,
+		RenewJitter:     0.1,
+		CleanupInterval: -1,
+		now:             clockAt(&now),
+		draw:            func() float64 { return 0.5 },
+	})
+	require.NoError(t, err)
+	w := testWorkload(testPodUID)
+
+	_, err = source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+	assert.Equal(t, []string{testPodUID}, notifier.WorkloadChanges(),
+		"the first issuance is a change too: a stream primed before it has nothing to send")
+
+	// A successful replacement notifies again.
+	cached, ok := source.cache.Get(testPodUID)
+	require.True(t, ok)
+	source.onRefresh(testPodUID, cached)
+	require.Equal(t, 2, issuer.calls())
+	assert.Equal(t, []string{testPodUID, testPodUID}, notifier.WorkloadChanges())
+
+	// A failed replacement notifies nothing: the stream would re-read what it already
+	// has, and the certificate it holds is unchanged.
+	cached, ok = source.cache.Get(testPodUID)
+	require.True(t, ok)
+	source.onRefresh(testPodUID, cached)
+	require.Equal(t, 3, issuer.calls(), "the third attempt ran and failed")
+	assert.Len(t, notifier.WorkloadChanges(), 2, "a failed replacement is not a change")
 }
 
 // TestExpiredCertificateStopsBeingServed is the other half of that: holding a
