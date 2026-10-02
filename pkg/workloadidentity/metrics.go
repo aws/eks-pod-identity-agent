@@ -43,7 +43,14 @@ const (
 	MetricBundleChangeTotal = "workload_identity_bundle_change_total"
 	// MetricSubscriptionsActive gauges open stream subscriptions. T9: {rpc}.
 	MetricSubscriptionsActive = "workload_identity_subscriptions_active"
-	// MetricNotificationTotal counts notifications delivered to streams. T9: {rpc, outcome}.
+	// MetricNotificationTotal counts notifications delivered to streams. T9: {rpc, delivery}.
+	//
+	// The second label was {outcome} when this name was declared. It is
+	// {delivery} instead because neither thing that can happen to a signal is a
+	// failure: it either lands in an empty channel or coalesces into one already
+	// pending, and both are the tier working as specified. Labelling a coalesced
+	// signal "failure" would alarm on the mechanism that keeps a slow stream from
+	// being handed a superseded credential.
 	MetricNotificationTotal = "workload_identity_notification_total"
 	// MetricCacheTotal counts cache lookups. All tiers: {tier, result}.
 	MetricCacheTotal = "workload_identity_cache_total"
@@ -77,8 +84,11 @@ const (
 	LabelError = "error"
 	// LabelFormat carries the credential format, FormatX509SVID or FormatJWTSVID.
 	LabelFormat = "format"
-	// LabelRPC carries the name of the RPC being served.
+	// LabelRPC carries the name of the RPC being served, one of the RPC values.
 	LabelRPC = "rpc"
+	// LabelDelivery carries how a change notification reached a subscription,
+	// one of the Delivery values. It is on MetricNotificationTotal only.
+	LabelDelivery = "delivery"
 	// LabelTier carries the cache tier, one of the CacheTier values.
 	LabelTier = "tier"
 	// LabelResult carries the cache lookup result, one of the CacheResult values.
@@ -99,6 +109,46 @@ const (
 	FormatX509SVID = "x509_svid"
 	// FormatJWTSVID is a JWT-SVID.
 	FormatJWTSVID = "jwt_svid"
+)
+
+// Values for LabelRPC, one per RPC the workload identity socket serves.
+//
+// These are metric label values and not wire method names: the wire names are
+// mixed case, such as FetchX509SVID, and a Prometheus label value is
+// lower_snake_case. Code that needs the wire name reads it off the generated
+// service descriptor through pkg/wireproto instead.
+//
+// The two WIT RPCs on the Workload API interface have no value here, because the
+// agent answers them Unimplemented and never subscribes or counts for them.
+const (
+	// RPCFetchX509SVID is the SPIFFE Workload API FetchX509SVID stream.
+	RPCFetchX509SVID = "fetch_x509_svid"
+	// RPCFetchX509Bundles is the SPIFFE Workload API FetchX509Bundles stream.
+	RPCFetchX509Bundles = "fetch_x509_bundles"
+	// RPCFetchJWTSVID is the unary SPIFFE Workload API FetchJWTSVID.
+	RPCFetchJWTSVID = "fetch_jwt_svid"
+	// RPCFetchJWTBundles is the SPIFFE Workload API FetchJWTBundles stream.
+	RPCFetchJWTBundles = "fetch_jwt_bundles"
+	// RPCValidateJWTSVID is the unary SPIFFE Workload API ValidateJWTSVID.
+	RPCValidateJWTSVID = "validate_jwt_svid"
+	// RPCStreamSecrets is the Envoy SDS StreamSecrets stream.
+	RPCStreamSecrets = "stream_secrets"
+)
+
+// Values for LabelDelivery, how one change notification reached a subscription.
+//
+// There is no value for a signal nobody read. A subscription that is released
+// between a publish and a read is normal, and the notification tier cannot tell
+// that case from one where the read is simply still to come.
+const (
+	// DeliverySignalled means the signal landed in an empty channel, so the
+	// subscriber had nothing pending and will wake on it.
+	DeliverySignalled = "signalled"
+	// DeliveryCoalesced means a signal was already pending and unread, so this
+	// one replaced it rather than queueing behind it. The subscriber wakes once
+	// and reads the newest state. A sustained rate here is a slow stream, not an
+	// error.
+	DeliveryCoalesced = "coalesced"
 )
 
 // Values for LabelTier, naming which cache a lookup hit.

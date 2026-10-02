@@ -13,8 +13,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/eksauth"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/notify"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
@@ -163,6 +166,12 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 
+	// The change notification tier, built once because both sides of it have to
+	// be the same value: the handlers subscribe through it and the bundle and
+	// SVID tiers publish to it. A second hub means a rotation that reaches no
+	// stream. It owns no goroutine, so there is nothing to start or shut down.
+	notificationHub := notify.NewHub()
+
 	// The workload identity socket is bound here, last, so a socket that cannot be
 	// bound fails the boot before anything is serving. The path is the constant
 	// rather than a flag because it is a contract with the Pod Identity webhook and
@@ -172,10 +181,7 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 		// The shutdown budget is left to the package: this server's streams are held
 		// open by design, so its drain is bounded by a few seconds rather than by the
 		// HTTP servers' request timeout. See grpcserver.DefaultShutdownWait.
-		//
-		// Stubs answering Unimplemented, until the SPIFFE Workload API and Envoy SDS
-		// handlers replace them one at a time.
-		Register: grpcserver.RegisterStubServices,
+		Register: registerWorkloadIdentityServices(notificationHub),
 	})
 	if err != nil {
 		return nil, err
@@ -190,6 +196,19 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, workloadIdentityServer)
 
 	return servers, nil
+}
+
+// registerWorkloadIdentityServices returns the registration the workload identity
+// gRPC server runs before it accepts anything. The hub is threaded in here
+// because this is where the handlers that subscribe to it are registered, each
+// taking its own hub.ForRPC(<its label>).
+//
+// PLACEHOLDER(T10): the stubs answer every method with Unimplemented. The Workload
+// API and SDS handlers replace one stub each here and nothing else changes.
+func registerWorkloadIdentityServices(hub *notify.Hub) func(registrar grpc.ServiceRegistrar) {
+	return func(registrar grpc.ServiceRegistrar) {
+		grpcserver.RegisterStubServices(registrar)
+	}
 }
 
 // newWorkloadIdentityServerOpts collects the workload identity flag values into

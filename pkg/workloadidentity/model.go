@@ -182,7 +182,9 @@ type JWTSVID struct {
 // There is deliberately no sequence or generation number. The API does not
 // return one, so an exported counter would be state the agent synthesised with
 // no wire source. Change is detected by comparing parsed authority sets, which
-// the implementation has to do anyway, and signalled through Subscriber.
+// the implementation has to do anyway, and signalled through BundleNotifier.
+// The two authority sets are compared separately, because they rotate
+// independently and BundleNotifier reports them as separate events.
 // Nothing downstream needs a number: the SDS version must also bump on
 // certificate renewal, so deriving it from a bundle counter would be wrong.
 type BundleSource interface {
@@ -207,11 +209,77 @@ type BundleSource interface {
 	JWTAuthority(trustDomain, keyID string) (crypto.PublicKey, error)
 }
 
-// Subscriber delivers change notifications to an open stream.
+// Subscriber is the read side of the notification tier: a handler can learn that
+// its own material changed and cannot make anything change for anybody else.
+// Publishing lives on BundleNotifier and WorkloadNotifier. One implementation
+// satisfies all three, and each caller is handed only the side it needs.
+//
+// One method per kind of stream rather than one method and a set of interests,
+// because only three combinations exist and they are stable. Nothing wants both
+// authority sets, so no call has to express a combination.
+//
+// Every method takes the provider ARN from the caller's WorkloadSession, so a
+// rotation in one provider's bundles does not wake another provider's streams. An
+// empty ARN is reached by no bundle change, which a caller should have refused
+// with ErrNotEnrolled before subscribing.
+//
+// No method carries the RPC it subscribes for, even though the subscription
+// metrics are labelled by RPC; the implementation takes that label at wiring time.
+//
+// On every method: the channel arrives with one signal pending, so a handler's
+// loop is wait-then-send and its first pass is the initial response. Release is
+// idempotent and the subscription also ends with ctx, so a handler that returns
+// without releasing does not leak. Nothing is required to observe a signal.
 type Subscriber interface {
-	// Subscribe returns a channel signalled on every change relevant to the
-	// workload, and a cancel function that releases the subscription.
-	Subscribe(ctx context.Context, w *Workload) (<-chan struct{}, func())
-	// BroadcastBundleChange notifies every open subscription.
-	BroadcastBundleChange()
+	// SubscribeToWorkloadMaterial is signalled when the workload's own
+	// credentials change and when its provider's X.509 authorities do.
+	//
+	// It is for the streams serving an SVID together with the material to verify
+	// peers: FetchX509SVID, whose response embeds the bundle, and Envoy SDS,
+	// which serves both as secrets on one stream. Both reasons to wake arrive on
+	// one channel, so a handler never selects across two.
+	SubscribeToWorkloadMaterial(ctx context.Context, w *Workload, providerArn string) (<-chan struct{}, func())
+
+	// SubscribeToCertBundles is signalled only by the provider's X.509
+	// authorities changing. For FetchX509Bundles, which has a workload and
+	// deliberately does not pass it: a renewed SVID is not something a bundle
+	// stream can act on.
+	SubscribeToCertBundles(ctx context.Context, providerArn string) (<-chan struct{}, func())
+
+	// SubscribeToJWTBundles is signalled only by the provider's JWT authorities
+	// changing. For FetchJWTBundles.
+	//
+	// Separate from SubscribeToCertBundles because the two sets rotate
+	// independently: a JWT signing key typically rolls more often than a
+	// certificate authority, and a shared signal would wake every SVID stream on
+	// the node for a key roll none of them can observe.
+	SubscribeToJWTBundles(ctx context.Context, providerArn string) (<-chan struct{}, func())
+}
+
+// BundleNotifier is how the trust bundle tier reports a rotation, one method per
+// authority set. Separate from Subscriber so only the tiers entitled to wake
+// another pod's stream hold the methods that do it.
+//
+// Both name a provider, since a node hosts workloads of several and a rotation in
+// one is not news to the others. One fetch can change both sets, in which case
+// the publisher calls both; no stream subscribes to both, so neither call reaches
+// the other's audience.
+type BundleNotifier interface {
+	// NotifyCertBundleChange signals the provider's subscriptions that take
+	// X.509 authorities: workload material and cert bundle streams.
+	NotifyCertBundleChange(providerArn string)
+
+	// NotifyJWTBundleChange signals the provider's JWT bundle subscriptions.
+	NotifyJWTBundleChange(providerArn string)
+}
+
+// WorkloadNotifier is how a per-pod material tier reports that one workload's
+// credentials changed, so only that pod's streams are woken.
+type WorkloadNotifier interface {
+	// NotifyWorkloadChange signals the pod's workload material subscriptions and
+	// nothing else. A pod with no open stream is not an error.
+	//
+	// It must not block: a renewal loop stalling on one slow subscriber would
+	// stall renewals for the whole node.
+	NotifyWorkloadChange(podUID string)
 }

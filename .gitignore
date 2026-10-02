@@ -2,3 +2,7 @@ _output
 .DS_Store
 hack/tools/bin
 .idea
+
+# `go mod vendor` output. CI vendors before running tests and the directory is
+# regenerated from go.mod, so it is build output rather than source.
+vendor/
