@@ -32,6 +32,8 @@ const (
 	KindInvalidAudience
 	// KindSessionRefused is the kind of ErrSessionRefused.
 	KindSessionRefused
+	// KindBundleRefused is the kind of ErrBundleRefused.
+	KindBundleRefused
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -130,15 +132,16 @@ func newWorkloadIdentityError(kind Kind, label string, retryable bool) *Workload
 }
 
 var (
-	// ErrUnattestable is produced by the attestor (T3) when the process on the
-	// other end of an accepted connection cannot be resolved to a pod, including
-	// a caller arriving over something other than a Unix socket. Not retryable:
-	// retrying re-reads the same kernel facts and gets the same answer.
+	// ErrUnattestable is produced by the attestor (T3) when the caller on an
+	// accepted connection, including one not on a Unix socket, cannot be resolved
+	// to a pod, and by the bundle source (T6) for a nil workload. Not retryable: a
+	// retry re-reads the same kernel facts and gets the same answer.
 	ErrUnattestable = newWorkloadIdentityError(KindUnattestable, "unattestable", false)
 
 	// ErrNotEnrolled is produced by the token minter (T4) and the session
-	// provider (T5) when the attested pod has no workload identity association.
-	// Not retryable: the pod has no association and a retry cannot create one.
+	// provider (T5) when the attested pod has no workload identity association,
+	// and by the bundle source (T6) for a session that names no provider. Not
+	// retryable: the pod has no association and a retry cannot create one.
 	ErrNotEnrolled = newWorkloadIdentityError(KindNotEnrolled, "not_enrolled", false)
 
 	// ErrTokenMintFailed is produced by the token minter (T4) when a TokenRequest
@@ -186,6 +189,12 @@ var (
 	// answer. It is distinct from ErrSessionUnavailable so a misconfigured role
 	// or node does not read as an EKS Auth outage.
 	ErrSessionRefused = newWorkloadIdentityError(KindSessionRefused, "session_refused", false)
+
+	// ErrBundleRefused is produced by the bundle source (T6) when STS refuses a
+	// provider's bundles for a reason a repeat cannot change. Not retryable. It is
+	// distinct from ErrBundleUnavailable so a workload role missing
+	// sts:GetTrustBundles does not read as an STS outage.
+	ErrBundleRefused = newWorkloadIdentityError(KindBundleRefused, "bundle_refused", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -244,5 +253,6 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrBundleUnavailable,
 		ErrInvalidAudience,
 		ErrSessionRefused,
+		ErrBundleRefused,
 	}
 }

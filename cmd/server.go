@@ -40,11 +40,10 @@ var (
 	// Workload identity tunables. The values the workload identity path shares
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
 	// package configuration and deliberately not flags.
-	x509SVIDDuration      time.Duration
-	jwtSVIDDuration       time.Duration
-	svidRenewalFraction   float64
-	svidRenewalJitter     float64
-	bundleRefreshInterval time.Duration
+	x509SVIDDuration    time.Duration
+	jwtSVIDDuration     time.Duration
+	svidRenewalFraction float64
+	svidRenewalJitter   float64
 )
 
 var serverCmd = &cobra.Command{
@@ -221,14 +220,13 @@ func registerWorkloadIdentityServices(hub *notify.Hub) func(registrar grpc.Servi
 // server is given its addr.
 func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServerOpts {
 	return handlers.WorkloadIdentityServerOpts{
-		Cfg:                   cfg,
-		ClusterName:           clusterName,
-		MaxCacheSize:          maxCacheSize,
-		X509SVIDDuration:      x509SVIDDuration,
-		JWTSVIDDuration:       jwtSVIDDuration,
-		SVIDRenewalFraction:   svidRenewalFraction,
-		SVIDRenewalJitter:     svidRenewalJitter,
-		BundleRefreshInterval: bundleRefreshInterval,
+		Cfg:                 cfg,
+		ClusterName:         clusterName,
+		MaxCacheSize:        maxCacheSize,
+		X509SVIDDuration:    x509SVIDDuration,
+		JWTSVIDDuration:     jwtSVIDDuration,
+		SVIDRenewalFraction: svidRenewalFraction,
+		SVIDRenewalJitter:   svidRenewalJitter,
 	}
 }
 
@@ -286,6 +284,4 @@ func init() {
 		"Fraction of an SVID's issued lifetime at which renewal starts")
 	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
 		"Jitter applied to the renewal point, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
-	serverCmd.Flags().DurationVar(&bundleRefreshInterval, handlers.FlagBundleRefreshInterval, 0,
-		"Override for how often trust material is refetched. Zero follows the refresh hint carried on the trust bundle")
 }

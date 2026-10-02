@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
 )
 
 // Workload is an attested caller. Every field is established by the agent,
@@ -94,6 +95,14 @@ type WorkloadSession struct {
 	ExpiresAt time.Time
 }
 
+// ProviderArnResolver names an attested workload's identity provider. A workload
+// with none is ErrNotEnrolled, never an empty ARN. At launch the ARN comes from
+// the workload's session (SessionProviderArns); post-GA it can come from the
+// credentials cache instead.
+type ProviderArnResolver interface {
+	ProviderArn(ctx context.Context, w *Workload) (string, error)
+}
+
 // CertSource yields every X.509-SVID a workload is entitled to, minting or
 // renewing as needed. It is plural because FetchX509SVID returns a repeated
 // svids field, so the handler emits a list either way.
@@ -158,55 +167,40 @@ type JWTSVID struct {
 	ExpiresAt time.Time
 }
 
-// BundleSource yields trust material. It is node-scoped, not per workload.
+// BundleSource yields trust material per workload identity provider, not per
+// workload. Every method takes the attested workload, so where the provider ARN
+// comes from and whose credentials sign sts:GetTrustBundles can change without
+// the interface changing.
 //
-// It is split by format to mirror the Workload API, which has FetchX509Bundles
-// and FetchJWTBundles as separate RPCs returning different encodings. One fetch
-// produces both: GetTrustBundles returns one opaque SPIFFE bundle document per
-// trust domain, an RFC 7517 JWK Set holding x509-svid and jwt-svid authorities
-// together. An implementation fetches once, caches once, and exposes these views
-// over it. The split is at the read, not at the fetch, and an implementation
-// making two fetches has misread this.
-//
-// Splitting rather than returning one struct means each caller gets exactly what
-// it needs. Envoy only ever wants the X.509 side, so handing the SDS handler a
-// struct carrying JWK Set bytes and parsed keys it will never touch is noise.
-//
-// Both bundle maps are keyed by trust domain rather than being flat. A
-// conforming SPIFFE verifier selects authorities by the presenting
-// certificate's trust domain, and flattening loses the ability to keep domains
-// apart. At launch each map has one entry, since the agent does not assemble
-// peer domains, but the response shape is already a list keyed by trust domain
-// so passing several through costs nothing.
-//
-// There is deliberately no sequence or generation number. The API does not
-// return one, so an exported counter would be state the agent synthesised with
-// no wire source. Change is detected by comparing parsed authority sets, which
-// the implementation has to do anyway, and signalled through BundleNotifier.
-// The two authority sets are compared separately, because they rotate
-// independently and BundleNotifier reports them as separate events.
-// Nothing downstream needs a number: the SDS version must also bump on
-// certificate renewal, so deriving it from a bundle counter would be wrong.
+// The methods split by format to mirror FetchX509Bundles and FetchJWTBundles,
+// but one fetch and one cache back all of them. There is no generation number:
+// each changed authority set is signalled through BundleNotifier. A stream holds
+// a Lease on its provider for as long as it is open.
 type BundleSource interface {
-	// OwnTrustDomain is the workload's own domain. The Workload API presents
-	// its authorities inline on each X509SVID and every other entry under
-	// federated_bundles, so the handler has to know which is which.
-	OwnTrustDomain() string
+	// Lease keeps the workload's provider cached and refreshed until release is
+	// called or ctx ends, whichever comes first; releasing twice is harmless. A
+	// stream takes one when it opens.
+	Lease(ctx context.Context, w *Workload) (release func(), err error)
+
+	// OwnTrustDomain is the provider's own domain, which is the workload's. The
+	// Workload API presents its authorities inline on each X509SVID and every
+	// other entry under federated_bundles, so the handler has to know which.
+	OwnTrustDomain(ctx context.Context, w *Workload) (string, error)
 
 	// X509Bundles mirrors FetchX509Bundles: authorities as DER, keyed by trust
 	// domain, decoded from each JWK's x5c member. Envoy wants these
 	// PEM-encoded, which the SDS handler does at the edge.
-	X509Bundles(ctx context.Context) (map[string][][]byte, error)
+	X509Bundles(ctx context.Context, w *Workload) (map[string][][]byte, error)
 
-	// JWTBundles mirrors FetchJWTBundles: the raw JWK Set bytes per trust
-	// domain. Returning bytes rather than parsed keys avoids a lossy parse and
-	// reserialize, since the RPC returns exactly this.
-	JWTBundles(ctx context.Context) (map[string][]byte, error)
+	// JWTBundles mirrors FetchJWTBundles: per trust domain, a JWK Set of the
+	// jwt-svid keys only, which the RPC returns as is. x509-svid entries are
+	// left out because go-spiffe treats every key in the set as a JWT authority.
+	JWTBundles(ctx context.Context, w *Workload) (map[string][]byte, error)
 
-	// JWTAuthority resolves one verification key for ValidateJWTSVID. It is a
-	// lookup rather than a map so the implementation can parse lazily and
-	// cache, and so an unknown key ID is an error at the point it matters.
-	JWTAuthority(trustDomain, keyID string) (crypto.PublicKey, error)
+	// JWTSource returns the provider's JWT authorities as a point-in-time
+	// source that go-spiffe's jwtsvid.ParseAndValidate reads directly, so
+	// ValidateJWTSVID parses nothing itself.
+	JWTSource(ctx context.Context, w *Workload) (jwtbundle.Source, error)
 }
 
 // Subscriber is the read side of the notification tier: a handler can learn that

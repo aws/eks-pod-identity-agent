@@ -37,9 +37,6 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		},
 		{flag: handlers.FlagSVIDRenewalFraction, expectedDefault: "0.5"},
 		{flag: handlers.FlagSVIDRenewalJitter, expectedDefault: "0.1"},
-		// the bundle tier settles this one; unset means it follows the refresh
-		// hint carried on the trust bundle
-		{flag: handlers.FlagBundleRefreshInterval, expectedDefault: "0s"},
 	}
 
 	for _, tc := range testCases {
@@ -73,20 +70,6 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 	g.Expect(opts.JWTSVIDDuration).To(Equal(6 * time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.5))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.1))
-	g.Expect(opts.BundleRefreshInterval).To(BeZero())
-}
-
-// TestServerCmd_TheProviderArn_IsNotAFlag pins the decision that the identity
-// provider ARN does not arrive on the command line. WorkloadIdentityServerOpts
-// still carries the field and still validates it, so the bundle tier can be given
-// an ARN once there is a route to the node, but nothing an operator types fills
-// it and a flag reappearing here is a decision rather than an oversight.
-func TestServerCmd_TheProviderArn_IsNotAFlag(t *testing.T) {
-	g := NewWithT(t)
-
-	g.Expect(serverCmd.Flags().Lookup(handlers.FlagWorkloadIdentityProvider)).To(BeNil(),
-		"--%s should not exist", handlers.FlagWorkloadIdentityProvider)
-	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).WorkloadIdentityProviderArn).To(BeEmpty())
 }
 
 // TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions proves the wiring
@@ -103,7 +86,6 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 		"--jwt-svid-duration=2h",
 		"--svid-renewal-fraction=0.75",
 		"--svid-renewal-jitter=0.25",
-		"--bundle-refresh-interval=5m",
 		// Not a workload identity flag. It is the credentials path's cache bound,
 		// which the token tier reads rather than defining a second one, so this
 		// asserts the shared value arrives and not just that the field exists.
@@ -121,7 +103,6 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	g.Expect(opts.JWTSVIDDuration).To(Equal(2 * time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.75))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.25))
-	g.Expect(opts.BundleRefreshInterval).To(Equal(5 * time.Minute))
 	g.Expect(opts.MaxCacheSize).To(Equal(512))
 }
 
@@ -152,7 +133,6 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 	originalJWT := jwtSVIDDuration
 	originalFraction := svidRenewalFraction
 	originalJitter := svidRenewalJitter
-	originalInterval := bundleRefreshInterval
 	// maxCacheSize is not a workload identity flag, it is the credentials path's
 	// --max-cache-size that both paths now read. It is restored here because a
 	// test that parses it would otherwise leave the AWS credentials cache resized
@@ -165,7 +145,6 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 		jwtSVIDDuration = originalJWT
 		svidRenewalFraction = originalFraction
 		svidRenewalJitter = originalJitter
-		bundleRefreshInterval = originalInterval
 		maxCacheSize = originalMaxCacheSize
 	})
 }

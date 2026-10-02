@@ -220,98 +220,6 @@ func TestValidate_SVIDRenewal_KeepsTheRenewalBandInsideTheLifetime(t *testing.T)
 	}
 }
 
-func TestValidate_BundleRefreshInterval_AcceptsZeroAndRejectsNegative(t *testing.T) {
-	testCases := []struct {
-		name          string
-		interval      time.Duration
-		expectedError string
-	}{
-		{
-			name:     "zero follows the refresh hint on the bundle",
-			interval: 0,
-		},
-		{
-			name:     "a positive override is accepted",
-			interval: 5 * time.Minute,
-		},
-		{
-			name:          "a negative override is rejected",
-			interval:      -time.Second,
-			expectedError: "--bundle-refresh-interval is -1s: it has to be zero",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			opts := validWorkloadIdentityOpts()
-			opts.BundleRefreshInterval = tc.interval
-
-			err := opts.Validate()
-			if tc.expectedError == "" {
-				g.Expect(err).To(Succeed())
-				return
-			}
-			g.Expect(err).To(HaveOccurred())
-			g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-		})
-	}
-}
-
-func TestValidate_ProviderArn_AcceptsAbsentAndWellFormed(t *testing.T) {
-	testCases := []struct {
-		name          string
-		arn           string
-		expectedError string
-	}{
-		{
-			name: "absent, since no route to the node exists yet",
-			arn:  "",
-		},
-		{
-			name: "a well formed provider ARN",
-			arn:  "arn:aws:iam::123456789012:workload-identity-provider/provider-a",
-		},
-		{
-			name: "a well formed ARN in another partition",
-			arn:  "arn:aws-cn:iam::123456789012:workload-identity-provider/provider-a",
-		},
-		{
-			name:          "something that is not an ARN",
-			arn:           "provider-a",
-			expectedError: `--workload-identity-provider-arn is "provider-a"`,
-		},
-		{
-			name:          "an ARN missing fields",
-			arn:           "arn:aws:iam:provider-a",
-			expectedError: `--workload-identity-provider-arn is "arn:aws:iam:provider-a"`,
-		},
-		{
-			name:          "whitespace",
-			arn:           " ",
-			expectedError: `--workload-identity-provider-arn is " "`,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			opts := validWorkloadIdentityOpts()
-			opts.WorkloadIdentityProviderArn = tc.arn
-
-			err := opts.Validate()
-			if tc.expectedError == "" {
-				g.Expect(err).To(Succeed())
-				return
-			}
-			g.Expect(err).To(HaveOccurred())
-			g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-		})
-	}
-}
-
 // TestValidate_SeveralBadValues_AreAllReported proves the joined error rather
 // than the first failure, so an operator fixing a config does not need one
 // restart per bad flag.
@@ -319,12 +227,10 @@ func TestValidate_SeveralBadValues_AreAllReported(t *testing.T) {
 	g := NewWithT(t)
 
 	opts := WorkloadIdentityServerOpts{
-		X509SVIDDuration:            24 * time.Hour,
-		JWTSVIDDuration:             time.Second,
-		SVIDRenewalFraction:         2,
-		SVIDRenewalJitter:           3,
-		BundleRefreshInterval:       -time.Minute,
-		WorkloadIdentityProviderArn: "nope",
+		X509SVIDDuration:    24 * time.Hour,
+		JWTSVIDDuration:     time.Second,
+		SVIDRenewalFraction: 2,
+		SVIDRenewalJitter:   3,
 	}
 
 	err := opts.Validate()
@@ -333,8 +239,6 @@ func TestValidate_SeveralBadValues_AreAllReported(t *testing.T) {
 	g.Expect(err.Error()).To(ContainSubstring("--" + FlagJWTSVIDDuration))
 	g.Expect(err.Error()).To(ContainSubstring("--" + FlagSVIDRenewalFraction))
 	g.Expect(err.Error()).To(ContainSubstring("--" + FlagSVIDRenewalJitter))
-	g.Expect(err.Error()).To(ContainSubstring("--" + FlagBundleRefreshInterval))
-	g.Expect(err.Error()).To(ContainSubstring("--" + FlagWorkloadIdentityProvider))
 }
 
 // TestSVIDDurationEnvelopes_MatchTheApiModel pins the envelopes to the numbers

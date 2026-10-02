@@ -162,13 +162,10 @@ func (g *Gate) WaitForBlocked(ctx context.Context, n int) error {
 	return nil
 }
 
-// enter is called first by every context-taking method on every fake in this
-// package. It returns ctx.Err() if ctx is already done, without parking. If the
-// gate is closed it parks the call, which then wakes on Release, returning nil,
-// or on ctx being cancelled, returning ctx.Err(). Release wins a tie: a call that
-// is already released when it notices ctx is done returns nil, so releasing a
-// call whose ctx is also expiring is not a coin flip. A call whose ctx is done
-// before the Release still returns ctx.Err().
+// enter gates every context-taking fake method except BundleSource.Lease. A done
+// ctx returns ctx.Err() at once; a closed gate parks the call until Release
+// (nil) or ctx ends (ctx.Err()). Release wins a tie, so releasing a call whose ctx
+// is also expiring is not a coin flip.
 func (g *Gate) enter(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err

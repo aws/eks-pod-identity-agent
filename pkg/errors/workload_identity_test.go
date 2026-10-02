@@ -107,10 +107,16 @@ func taxonomyCases() []taxonomyCase {
 			expectedRetryable: false,
 		},
 		{
-			name:              "session refused",
-			err:               ErrSessionRefused,
-			expectedKind:      KindSessionRefused,
-			expectedLabel:     "session_refused",
+			name:          "session refused",
+			err:           ErrSessionRefused,
+			expectedKind:  KindSessionRefused,
+			expectedLabel: "session_refused",
+		},
+		{
+			name:              "bundle refused",
+			err:               ErrBundleRefused,
+			expectedKind:      KindBundleRefused,
+			expectedLabel:     "bundle_refused",
 			expectedRetryable: false,
 		},
 	}
@@ -319,14 +325,14 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 	g := NewWithT(t)
 	taxonomy := WorkloadIdentityTaxonomy()
 
-	g.Expect(taxonomy).To(HaveLen(10))
+	g.Expect(taxonomy).To(HaveLen(11))
 
 	seenKinds := make(map[Kind]bool, len(taxonomy))
 	seenLabels := make(map[string]bool, len(taxonomy))
 	for i, member := range taxonomy {
 		g.Expect(member).ToNot(BeNil())
 
-		// kinds are contiguous 1..10 in slice order, so there is no gap and no
+		// kinds are contiguous 1..11 in slice order, so there is no gap and no
 		// duplicate
 		g.Expect(member.Kind()).To(Equal(Kind(i + 1)))
 		g.Expect(seenKinds).ToNot(HaveKey(member.Kind()))
@@ -341,8 +347,8 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		g.Expect(MetricLabel(member)).ToNot(Equal(MetricLabelUnknown))
 	}
 
-	g.Expect(seenKinds).To(HaveLen(10))
-	g.Expect(seenLabels).To(HaveLen(10))
+	g.Expect(seenKinds).To(HaveLen(11))
+	g.Expect(seenLabels).To(HaveLen(11))
 
 	// every sentinel declared in the package is reachable from the taxonomy
 	g.Expect(taxonomy).To(ConsistOf(
@@ -356,6 +362,7 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		ErrBundleUnavailable,
 		ErrInvalidAudience,
 		ErrSessionRefused,
+		ErrBundleRefused,
 	))
 }
 
