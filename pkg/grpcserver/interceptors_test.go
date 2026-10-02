@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -15,7 +17,6 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/wireproto"
 )
 
 // TestInterceptors drives the server this package builds, rather than one assembled
@@ -246,8 +247,8 @@ func TestMetadataGate_AppliesToEveryService(t *testing.T) {
 	g := NewWithT(t)
 
 	for _, method := range []string{
-		"/" + wireproto.WorkloadAPIServiceName + "/FetchX509SVID",
-		"/" + wireproto.SDSServiceName + "/StreamSecrets",
+		"/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/FetchX509SVID",
+		"/" + secretv3.SecretDiscoveryService_ServiceDesc.ServiceName + "/StreamSecrets",
 		"/grpc.health.v1.Health/Check",
 		stubUnaryMethod,
 	} {

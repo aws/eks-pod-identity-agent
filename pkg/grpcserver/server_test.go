@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
@@ -22,7 +24,6 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/wireproto"
 )
 
 // TestNew_ServesTheStubServicesOverTheSocket is the definition of done in one test:
@@ -37,12 +38,12 @@ import (
 // not serve yet is distinguishable from one it will never serve, and the same call
 // without the SPIFFE header is refused before it reaches a handler at all.
 //
-// The methods are named by string rather than through a generated client, because the
-// generated clients live in the modules only pkg/wireproto may import.
+// The methods are named by string rather than through a generated client, so one pair
+// of helpers drives every service with an empty message, which decodes as any request.
 func TestNew_ServesTheStubServicesOverTheSocket(t *testing.T) {
-	unaryMethod := "/" + wireproto.WorkloadAPIServiceName + "/ValidateJWTSVID"
-	streamMethod := "/" + wireproto.WorkloadAPIServiceName + "/FetchX509SVID"
-	sdsStreamMethod := "/" + wireproto.SDSServiceName + "/StreamSecrets"
+	unaryMethod := "/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/ValidateJWTSVID"
+	streamMethod := "/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/FetchX509SVID"
+	sdsStreamMethod := "/" + secretv3.SecretDiscoveryService_ServiceDesc.ServiceName + "/StreamSecrets"
 
 	g := NewWithT(t)
 

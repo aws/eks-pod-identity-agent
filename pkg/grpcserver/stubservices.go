@@ -1,9 +1,9 @@
 package grpcserver
 
 import (
+	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
-
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/wireproto"
 )
 
 // RegisterStubServices registers the two services the workload identity socket will
@@ -22,18 +22,18 @@ import (
 // would understate the cost by the whole of the dependency the swap exists to
 // remove.
 func RegisterStubServices(registrar grpc.ServiceRegistrar) {
-	wireproto.RegisterWorkloadAPIServer(registrar, stubWorkloadAPI{})
-	wireproto.RegisterSecretDiscoveryServiceServer(registrar, stubSDS{})
+	workload.RegisterSpiffeWorkloadAPIServer(registrar, stubWorkloadAPI{})
+	secretv3.RegisterSecretDiscoveryServiceServer(registrar, stubSDS{})
 }
 
 // stubWorkloadAPI answers every SPIFFE Workload API method with Unimplemented. The
 // embedded struct supplies all of them, and it is embedded by value because the
 // generated registration rejects a nil pointer embed.
 type stubWorkloadAPI struct {
-	wireproto.UnimplementedSpiffeWorkloadAPIServer
+	workload.UnimplementedSpiffeWorkloadAPIServer
 }
 
 // stubSDS answers every Envoy SDS method with Unimplemented.
 type stubSDS struct {
-	wireproto.UnimplementedSecretDiscoveryServiceServer
+	secretv3.UnimplementedSecretDiscoveryServiceServer
 }

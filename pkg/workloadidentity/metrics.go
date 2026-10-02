@@ -116,7 +116,7 @@ const (
 // These are metric label values and not wire method names: the wire names are
 // mixed case, such as FetchX509SVID, and a Prometheus label value is
 // lower_snake_case. Code that needs the wire name reads it off the generated
-// service descriptor through pkg/wireproto instead.
+// service descriptor instead.
 //
 // The two WIT RPCs on the Workload API interface have no value here, because the
 // agent answers them Unimplemented and never subscribes or counts for them.

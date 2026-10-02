@@ -10,11 +10,6 @@
 // nobody at AWS wrote, so the specified behaviour wins over anything more
 // convenient.
 //
-// The wire types come from pkg/wireproto rather than go-spiffe directly, so the
-// later swap to a pruned proto subset is an edit of one file.
-// TestRestrictedModules_AreImportedOnlyFromWireproto enforces that. grpc is
-// outside the boundary, so its stream types are named directly.
-//
 // Skeleton. Every method has its final signature, and the three streaming RPCs
 // carry their real subscription lifecycle and send loop, which is where the
 // notification tier's contract shows up. Assembling the responses, the error
@@ -24,13 +19,13 @@ package workloadapi
 import (
 	"context"
 
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/wireproto"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -69,7 +64,7 @@ type Opts struct {
 // two WIT methods the agent does not serve, which is why they are not declared
 // below.
 type Handler struct {
-	wireproto.UnimplementedSpiffeWorkloadAPIServer
+	workload.UnimplementedSpiffeWorkloadAPIServer
 
 	opts Opts
 }
@@ -82,7 +77,7 @@ func New(opts Opts) *Handler {
 // Register attaches the handler to a gRPC server. It is what the wiring site
 // passes as grpcserver.Opts.Register, in place of the stub this replaces.
 func (h *Handler) Register(registrar grpc.ServiceRegistrar) {
-	wireproto.RegisterWorkloadAPIServer(registrar, h)
+	workload.RegisterSpiffeWorkloadAPIServer(registrar, h)
 }
 
 // FetchX509SVID streams the caller's X.509-SVIDs with its provider's trust
@@ -93,7 +88,7 @@ func (h *Handler) Register(registrar grpc.ServiceRegistrar) {
 // One subscription carries both reasons to wake. The stream is deliberately not
 // deduplicated, matching SPIRE and left open in T10: a rotation re-sends the
 // response even though the certificate did not change.
-func (h *Handler) FetchX509SVID(_ *wireproto.X509SVIDRequest, stream grpc.ServerStreamingServer[wireproto.X509SVIDResponse]) error {
+func (h *Handler) FetchX509SVID(_ *workload.X509SVIDRequest, stream grpc.ServerStreamingServer[workload.X509SVIDResponse]) error {
 	ctx := stream.Context()
 
 	caller, session, err := h.caller(ctx)
@@ -124,7 +119,7 @@ func (h *Handler) FetchX509SVID(_ *wireproto.X509SVIDRequest, stream grpc.Server
 //
 // Subscribes through SubscribeToCertBundles, so a renewed SVID it could not act
 // on never wakes it, and deduplicates as SPIRE's bundle streams do.
-func (h *Handler) FetchX509Bundles(_ *wireproto.X509BundlesRequest, stream grpc.ServerStreamingServer[wireproto.X509BundlesResponse]) error {
+func (h *Handler) FetchX509Bundles(_ *workload.X509BundlesRequest, stream grpc.ServerStreamingServer[workload.X509BundlesResponse]) error {
 	ctx := stream.Context()
 
 	caller, session, err := h.caller(ctx)
@@ -137,7 +132,7 @@ func (h *Handler) FetchX509Bundles(_ *wireproto.X509BundlesRequest, stream grpc.
 
 	// PLACEHOLDER(T10): take the bundle lease, as in FetchX509SVID.
 
-	var last *wireproto.X509BundlesResponse
+	var last *workload.X509BundlesResponse
 	return serveStream(ctx, signals, func() error {
 		response, err := h.buildX509BundlesResponse(ctx, caller, session)
 		if err != nil {
@@ -158,7 +153,7 @@ func (h *Handler) FetchX509Bundles(_ *wireproto.X509BundlesRequest, stream grpc.
 // bundle lease, and subscribes to nothing.
 //
 // PLACEHOLDER(T10): attest, then read TokenSource for the requested audiences.
-func (h *Handler) FetchJWTSVID(_ context.Context, _ *wireproto.JWTSVIDRequest) (*wireproto.JWTSVIDResponse, error) {
+func (h *Handler) FetchJWTSVID(_ context.Context, _ *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "FetchJWTSVID is not implemented yet")
 }
 
@@ -167,7 +162,7 @@ func (h *Handler) FetchJWTSVID(_ context.Context, _ *wireproto.JWTSVIDRequest) (
 //
 // The only stream a JWT key roll reaches, which is why a roll does not wake every
 // SVID stream on the node. Deduplicates as FetchX509Bundles does.
-func (h *Handler) FetchJWTBundles(_ *wireproto.JWTBundlesRequest, stream grpc.ServerStreamingServer[wireproto.JWTBundlesResponse]) error {
+func (h *Handler) FetchJWTBundles(_ *workload.JWTBundlesRequest, stream grpc.ServerStreamingServer[workload.JWTBundlesResponse]) error {
 	ctx := stream.Context()
 
 	caller, session, err := h.caller(ctx)
@@ -180,7 +175,7 @@ func (h *Handler) FetchJWTBundles(_ *wireproto.JWTBundlesRequest, stream grpc.Se
 
 	// PLACEHOLDER(T10): take the bundle lease, as in FetchX509SVID.
 
-	var last *wireproto.JWTBundlesResponse
+	var last *workload.JWTBundlesResponse
 	return serveStream(ctx, signals, func() error {
 		response, err := h.buildJWTBundlesResponse(ctx, caller, session)
 		if err != nil {
@@ -204,7 +199,7 @@ func (h *Handler) FetchJWTBundles(_ *wireproto.JWTBundlesRequest, stream grpc.Se
 // PLACEHOLDER(T10): read the JWT bundles first, then validate with go-spiffe's
 // jwtsvid.ParseAndValidate. Reading first keeps a bundle outage reported as
 // Unavailable rather than as a rejected token.
-func (h *Handler) ValidateJWTSVID(_ context.Context, _ *wireproto.ValidateJWTSVIDRequest) (*wireproto.ValidateJWTSVIDResponse, error) {
+func (h *Handler) ValidateJWTSVID(_ context.Context, _ *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "ValidateJWTSVID is not implemented yet")
 }
 
@@ -272,22 +267,22 @@ func statusError(err error) error {
 //
 // PLACEHOLDER(T10): read CertSource and BundleSource, translate onto the wire
 // types.
-func (h *Handler) buildX509SVIDResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*wireproto.X509SVIDResponse, error) {
+func (h *Handler) buildX509SVIDResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*workload.X509SVIDResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "building an X509SVIDResponse is not implemented yet")
 }
 
 // buildX509BundlesResponse assembles the current X.509 trust bundle response.
 //
 // PLACEHOLDER(T10): read BundleSource.X509Bundles for the session's provider.
-func (h *Handler) buildX509BundlesResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*wireproto.X509BundlesResponse, error) {
+func (h *Handler) buildX509BundlesResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*workload.X509BundlesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "building an X509BundlesResponse is not implemented yet")
 }
 
 // buildJWTBundlesResponse assembles the current JWT trust bundle response.
 //
 // PLACEHOLDER(T10): read BundleSource.JWTBundles for the session's provider.
-func (h *Handler) buildJWTBundlesResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*wireproto.JWTBundlesResponse, error) {
+func (h *Handler) buildJWTBundlesResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*workload.JWTBundlesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "building a JWTBundlesResponse is not implemented yet")
 }
 
-var _ wireproto.SpiffeWorkloadAPIServer = (*Handler)(nil)
+var _ workload.SpiffeWorkloadAPIServer = (*Handler)(nil)
