@@ -28,7 +28,7 @@ const labelConstantPrefix = "Label"
 
 // valueConstantPrefixes marks the constants that carry a label value. Every one
 // of them has to be in labelValueSets, so the lower_snake_case check sees it.
-var valueConstantPrefixes = []string{"Outcome", "Format", "CacheTier", "CacheResult", "Reason"}
+var valueConstantPrefixes = []string{"Outcome", "Format", "CacheTier", "CacheResult", "Reason", "RPC", "Delivery"}
 
 // prometheusMetricName is the metric name grammar Prometheus enforces.
 var prometheusMetricName = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
@@ -46,6 +46,7 @@ var labelNames = []string{
 	LabelError,
 	LabelFormat,
 	LabelRPC,
+	LabelDelivery,
 	LabelTier,
 	LabelResult,
 }
@@ -55,10 +56,19 @@ var labelNames = []string{
 // TestDeclaredConstants_EveryValueConstant_IsCoveredByLabelValueSets, so a value
 // constant missing from these sets fails rather than going unchecked.
 var labelValueSets = map[string][]string{
-	"outcome": {OutcomeSuccess, OutcomeFailure},
-	"format":  {FormatX509SVID, FormatJWTSVID},
-	"tier":    {CacheTierToken, CacheTierSession, CacheTierX509SVID, CacheTierJWTSVID, CacheTierBundle},
-	"result":  {CacheResultHit, CacheResultMiss, CacheResultExpired, CacheResultEvicted},
+	"outcome":  {OutcomeSuccess, OutcomeFailure},
+	"format":   {FormatX509SVID, FormatJWTSVID},
+	"tier":     {CacheTierToken, CacheTierSession, CacheTierX509SVID, CacheTierJWTSVID, CacheTierBundle},
+	"result":   {CacheResultHit, CacheResultMiss, CacheResultExpired, CacheResultEvicted},
+	"delivery": {DeliverySignalled, DeliveryCoalesced},
+	"rpc": {
+		RPCFetchX509SVID,
+		RPCFetchX509Bundles,
+		RPCFetchJWTSVID,
+		RPCFetchJWTBundles,
+		RPCValidateJWTSVID,
+		RPCStreamSecrets,
+	},
 	"reason": {
 		ReasonNotUnixSocket,
 		ReasonPeerCredFailed,

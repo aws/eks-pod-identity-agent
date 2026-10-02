@@ -12,18 +12,18 @@ import (
 // the struct the flags fill, so a validation error can name the flag an operator
 // has to change and cannot drift from the name cmd registers.
 const (
-	FlagX509SVIDDuration      = "x509-svid-duration"
-	FlagJWTSVIDDuration       = "jwt-svid-duration"
-	FlagSVIDRenewalFraction   = "svid-renewal-fraction"
-	FlagSVIDRenewalJitter     = "svid-renewal-jitter"
-	FlagBundleRefreshInterval = "bundle-refresh-interval"
+	FlagX509SVIDDuration    = "x509-svid-duration"
+	FlagJWTSVIDDuration     = "jwt-svid-duration"
+	FlagSVIDRenewalFraction = "svid-renewal-fraction"
+	FlagSVIDRenewalJitter   = "svid-renewal-jitter"
 )
 
 // WorkloadIdentityServerOpts carries configuration from the command line into
 // the workload identity tiers, the way EksCredentialHandlerOpts does for the AWS
 // credentials path. It is a parallel struct rather than a widening of that one
-// because the two paths share no tunable: nothing on the credentials path has an
-// SVID lifetime and nothing here has a credential cache size.
+// because the two paths share almost no tunable: nothing on the credentials path
+// has an SVID lifetime. MaxCacheSize is the exception, and it is deliberately
+// the same flag on both paths rather than a second one.
 //
 // The socket path is deliberately absent. It is a contract with the Pod Identity
 // webhook, so it is the constant configuration.WorkloadIdentitySocketPath rather
@@ -34,6 +34,14 @@ type WorkloadIdentityServerOpts struct {
 	Cfg aws.Config
 	// ClusterName is the EKS cluster the agent runs in.
 	ClusterName string
+	// MaxCacheSize bounds each per-pod cache, in entries. It is --max-cache-size,
+	// the same value the AWS credentials cache is given, because both are sized
+	// by the same thing: the number of pods that can run on this node. A node
+	// budgeted for N credential entries is budgeted for N token entries.
+	//
+	// Zero disables caching on the credentials path. It cannot mean that here —
+	// an uncached tier would mint per request — so the tiers reject it.
+	MaxCacheSize int
 	// X509SVIDDuration is the lifetime requested on every X.509-SVID issuance.
 	// It is a ceiling and not a grant: STS issues the least of this and what its
 	// own policy allows, and reports what it issued in the certificate, so the
@@ -59,12 +67,6 @@ type WorkloadIdentityServerOpts struct {
 	// same renewal instant, which is a self-inflicted thundering herd against
 	// STS. Zero disables jitter, which is only useful in a test.
 	SVIDRenewalJitter float64
-	// BundleRefreshInterval overrides how often trust material is refetched.
-	// Zero means the bundle tier follows the refresh hint carried in the bundle
-	// document instead, which is the intended behaviour; the flag exists to
-	// override a hint the agent cannot live with. The bundle tier owns the floor
-	// applied to a pathological hint.
-	BundleRefreshInterval time.Duration
 }
 
 // durationEnvelope is the range of requested lifetimes the issuing API accepts
@@ -157,7 +159,6 @@ func (o WorkloadIdentityServerOpts) Validate() error {
 		x509SVIDDurationEnvelope.validate(o.X509SVIDDuration),
 		jwtSVIDDurationEnvelope.validate(o.JWTSVIDDuration),
 		validateSVIDRenewal(o.SVIDRenewalFraction, o.SVIDRenewalJitter),
-		validateBundleRefreshInterval(o.BundleRefreshInterval),
 	)
 }
 
@@ -193,16 +194,4 @@ func validateSVIDRenewal(fraction, jitter float64) error {
 	}
 
 	return stderrors.Join(errs...)
-}
-
-// validateBundleRefreshInterval rejects a negative override. Zero is the
-// intended value and means the bundle tier follows the refresh hint on the
-// bundle document; the floor that protects against a pathological hint belongs
-// to that tier, which applies it to the hint as well as to this override.
-func validateBundleRefreshInterval(interval time.Duration) error {
-	if interval < 0 {
-		return fmt.Errorf("--%s is %s: it has to be zero, which follows the refresh hint on the trust bundle, or a positive interval",
-			FlagBundleRefreshInterval, interval)
-	}
-	return nil
 }

@@ -15,6 +15,16 @@ import (
 // hanging the suite.
 const subscriberTestTimeout = 2 * time.Second
 
+// subscriberTestProviderArn is the identity provider the default subscription's
+// session names. Every subscribe carries one, so a bundle change has a provider
+// to be scoped to.
+const subscriberTestProviderArn = "arn:aws:iam::111122223333:workload-identity-provider/provider-a"
+
+// subscriberOtherProviderArn is a second provider on the same node, for the
+// tests that prove a rotation reaches one provider's subscriptions and not the
+// other's.
+const subscriberOtherProviderArn = "arn:aws:iam::111122223333:workload-identity-provider/provider-b"
+
 // subscriberTestWorkload is the attested caller the default subscription is for.
 var subscriberTestWorkload = &workloadidentity.Workload{
 	PodUID:         "pod-uid-1",
@@ -24,7 +34,7 @@ var subscriberTestWorkload = &workloadidentity.Workload{
 	NodeName:       "my-node",
 }
 
-// subscriberSubscribeResult is what a Subscribe call running in another goroutine
+// subscriberSubscribeResult is what a subscribe call running in another goroutine
 // hands back to the test.
 type subscriberSubscribeResult struct {
 	ch     <-chan struct{}
@@ -54,6 +64,20 @@ func subscriberSignals(ch <-chan struct{}) int {
 			signals++
 		default:
 			return signals
+		}
+	}
+}
+
+// subscriberDrainPrimes asserts every channel came back with exactly the prime
+// pending and consumes it, so the assertions after it count real publishes only.
+//
+// It doubles as the test that a live subscribe is primed, which is the part of T9
+// a handler can observe: a wait-then-send loop has nothing to send without it.
+func subscriberDrainPrimes(t *testing.T, channels ...<-chan struct{}) {
+	t.Helper()
+	for i, ch := range channels {
+		if signals := subscriberSignals(ch); signals != 1 {
+			t.Fatalf("subscription %d came back with %d pending signals, want the prime only", i, signals)
 		}
 	}
 }
@@ -93,28 +117,77 @@ func TestSubscriptionLive_ZeroValue_IsLiveAndReceivesNothing(t *testing.T) {
 	g.Expect(sub.Live()).To(BeTrue())
 }
 
-func TestSubscriberSubscribe_Called_ReturnsChannelAndCancelFunc(t *testing.T) {
+func TestSubscriberSubscribeToWorkloadMaterial_Called_ReturnsChannelAndReleaseFunc(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
 
-	ch, cancel := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, release := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
 	g.Expect(ch).To(Not(BeNil()))
-	g.Expect(cancel).To(Not(BeNil()))
+	g.Expect(release).To(Not(BeNil()))
 	g.Expect(subscriber.SubscribeCalls()).To(Equal(1))
-	g.Expect(subscriber.BroadcastCalls()).To(Equal(0))
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(0))
+	g.Expect(subscriber.JWTBundleCalls()).To(Equal(0))
+	g.Expect(subscriber.WorkloadChanges()).To(BeEmpty())
 	g.Expect(subscriber.CancelCalls()).To(Equal(0))
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(1))
 
 	subs := subscriber.Subscriptions()
 	g.Expect(subs).To(HaveLen(1))
+	g.Expect(subs[0].Kind).To(Equal(KindWorkloadMaterial))
 	g.Expect(subs[0].Workload).To(BeIdenticalTo(subscriberTestWorkload))
 	g.Expect(*subs[0].Workload).To(Equal(*subscriberTestWorkload))
+	g.Expect(subs[0].ProviderArn).To(Equal(subscriberTestProviderArn))
 	g.Expect(subs[0].Chan()).To(BeIdenticalTo(ch))
 	g.Expect(subs[0].Live()).To(BeTrue())
 	g.Expect(subs[0].Notified()).To(Equal(0))
 	g.Expect(subscriberSignals(ch)).To(Equal(0))
+}
+
+func TestSubscriberSubscribeToBundles_Called_RecordsKindAndNoWorkload(t *testing.T) {
+	testCases := []struct {
+		name      string
+		subscribe func(*Subscriber) (<-chan struct{}, func())
+		wantKind  SubscriptionKind
+	}{
+		{
+			name: "cert bundles",
+			subscribe: func(s *Subscriber) (<-chan struct{}, func()) {
+				return s.SubscribeToCertBundles(context.Background(), subscriberTestProviderArn)
+			},
+			wantKind: KindCertBundles,
+		},
+		{
+			name: "jwt bundles",
+			subscribe: func(s *Subscriber) (<-chan struct{}, func()) {
+				return s.SubscribeToJWTBundles(context.Background(), subscriberTestProviderArn)
+			},
+			wantKind: KindJWTBundles,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			subscriber := &Subscriber{}
+			ch, release := tc.subscribe(subscriber)
+
+			g.Expect(ch).To(Not(BeNil()))
+			g.Expect(release).To(Not(BeNil()))
+			g.Expect(subscriber.SubscribeCalls()).To(Equal(1))
+
+			subs := subscriber.Subscriptions()
+			g.Expect(subs).To(HaveLen(1))
+			g.Expect(subs[0].Kind).To(Equal(tc.wantKind))
+			// A bundle stream has a workload and deliberately does not pass it,
+			// which is what keeps a renewal it cannot act on from waking it.
+			g.Expect(subs[0].Workload).To(BeNil())
+			g.Expect(subs[0].ProviderArn).To(Equal(subscriberTestProviderArn))
+		})
+	}
 }
 
 func TestSubscriberSubscribe_CalledRepeatedly_RecordsSubscriptionsInOrder(t *testing.T) {
@@ -124,8 +197,8 @@ func TestSubscriberSubscribe_CalledRepeatedly_RecordsSubscriptionsInOrder(t *tes
 	first := subscriberWorkload("pod-a")
 	second := subscriberWorkload("pod-b")
 
-	firstCh, firstCancel := subscriber.Subscribe(context.Background(), first)
-	secondCh, _ := subscriber.Subscribe(context.Background(), second)
+	firstCh, firstRelease := subscriber.SubscribeToWorkloadMaterial(context.Background(), first, subscriberTestProviderArn)
+	secondCh, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), second, subscriberTestProviderArn)
 
 	g.Expect(subscriber.SubscribeCalls()).To(Equal(2))
 	subs := subscriber.Subscriptions()
@@ -135,9 +208,9 @@ func TestSubscriberSubscribe_CalledRepeatedly_RecordsSubscriptionsInOrder(t *tes
 	g.Expect(subs[1].Workload).To(BeIdenticalTo(second))
 	g.Expect(subs[1].Chan()).To(BeIdenticalTo(secondCh))
 
-	// Subscriptions keeps cancelled subscriptions, in subscribe order, and hands
+	// Subscriptions keeps released subscriptions, in subscribe order, and hands
 	// back a copy of the slice.
-	firstCancel()
+	firstRelease()
 	kept := subscriber.Subscriptions()
 	g.Expect(kept).To(HaveLen(2))
 	g.Expect(kept[0]).To(BeIdenticalTo(subs[0]))
@@ -148,7 +221,7 @@ func TestSubscriberSubscribe_CalledRepeatedly_RecordsSubscriptionsInOrder(t *tes
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(1))
 }
 
-func TestSubscriberBroadcastBundleChange_Called_SignalsEveryLiveSubscription(t *testing.T) {
+func TestSubscriberNotifyCertBundles_Called_SignalsLiveSubscriptionsOfThatProvider(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
@@ -156,21 +229,24 @@ func TestSubscriberBroadcastBundleChange_Called_SignalsEveryLiveSubscription(t *
 	t.Cleanup(cancelLive)
 	doneCtx, cancelDone := context.WithCancel(context.Background())
 
-	firstCh, _ := subscriber.Subscribe(liveCtx, subscriberWorkload("pod-a"))
-	secondCh, _ := subscriber.Subscribe(liveCtx, subscriberWorkload("pod-b"))
-	cancelledCh, cancelThird := subscriber.Subscribe(liveCtx, subscriberWorkload("pod-c"))
-	doneCh, _ := subscriber.Subscribe(doneCtx, subscriberWorkload("pod-d"))
-	cancelThird()
+	firstCh, _ := subscriber.SubscribeToWorkloadMaterial(liveCtx, subscriberWorkload("pod-a"), subscriberTestProviderArn)
+	secondCh, _ := subscriber.SubscribeToCertBundles(liveCtx, subscriberTestProviderArn)
+	releasedCh, releaseThird := subscriber.SubscribeToWorkloadMaterial(liveCtx, subscriberWorkload("pod-c"), subscriberTestProviderArn)
+	doneCh, _ := subscriber.SubscribeToWorkloadMaterial(doneCtx, subscriberWorkload("pod-d"), subscriberTestProviderArn)
+	// All four were live at subscribe, so all four are primed. The two that stop
+	// being live do so afterwards.
+	subscriberDrainPrimes(t, firstCh, secondCh, releasedCh, doneCh)
+	releaseThird()
 	cancelDone()
 
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(2))
 
-	subscriberDo(t, subscriber.BroadcastBundleChange)
+	subscriberDo(t, func() { subscriber.NotifyCertBundleChange(subscriberTestProviderArn) })
 
-	g.Expect(subscriber.BroadcastCalls()).To(Equal(1))
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(1))
 	g.Expect(subscriberSignals(firstCh)).To(Equal(1))
 	g.Expect(subscriberSignals(secondCh)).To(Equal(1))
-	g.Expect(subscriberSignals(cancelledCh)).To(Equal(0))
+	g.Expect(subscriberSignals(releasedCh)).To(Equal(0))
 	g.Expect(subscriberSignals(doneCh)).To(Equal(0))
 
 	subs := subscriber.Subscriptions()
@@ -181,58 +257,113 @@ func TestSubscriberBroadcastBundleChange_Called_SignalsEveryLiveSubscription(t *
 	g.Expect(subs[3].Notified()).To(Equal(0))
 }
 
-func TestSubscriberNotify_MatchingPodUID_SignalsOnlyThatPodsSubscriptions(t *testing.T) {
+func TestSubscriberNotifyBundles_CertAndJWT_ReachOnlyTheirOwnSubscriptions(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
-	firstCh, _ := subscriber.Subscribe(context.Background(), subscriberWorkload("pod-a"))
-	secondCh, _ := subscriber.Subscribe(context.Background(), subscriberWorkload("pod-a"))
-	otherCh, _ := subscriber.Subscribe(context.Background(), subscriberWorkload("pod-b"))
-	nilCh, _ := subscriber.Subscribe(context.Background(), nil)
+	materialCh, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	certCh, _ := subscriber.SubscribeToCertBundles(context.Background(), subscriberTestProviderArn)
+	jwtCh, _ := subscriber.SubscribeToJWTBundles(context.Background(), subscriberTestProviderArn)
+	subscriberDrainPrimes(t, materialCh, certCh, jwtCh)
 
-	g.Expect(subscriber.Notify("pod-a")).To(Equal(2))
+	// The X.509 authorities verify the peers of a stream serving an SVID, so a
+	// workload material subscription takes that change as well as its own pod's.
+	g.Expect(subscriber.NotifyCertBundles(subscriberTestProviderArn)).To(Equal(2))
+	g.Expect(subscriberSignals(materialCh)).To(Equal(1))
+	g.Expect(subscriberSignals(certCh)).To(Equal(1))
+	g.Expect(subscriberSignals(jwtCh)).To(Equal(0))
+
+	// A JWT key roll reaches only the JWT bundle stream. That is the whole point
+	// of splitting the two: the SVID streams cannot observe it.
+	g.Expect(subscriber.NotifyJWTBundles(subscriberTestProviderArn)).To(Equal(1))
+	g.Expect(subscriberSignals(jwtCh)).To(Equal(1))
+	g.Expect(subscriberSignals(materialCh)).To(Equal(0))
+	g.Expect(subscriberSignals(certCh)).To(Equal(0))
+
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(1))
+	g.Expect(subscriber.JWTBundleCalls()).To(Equal(1))
+}
+
+func TestSubscriberNotifyBundles_OtherProvider_SignalsNothing(t *testing.T) {
+	g := NewWithT(t)
+
+	subscriber := &Subscriber{}
+	materialCh, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	jwtCh, _ := subscriber.SubscribeToJWTBundles(context.Background(), subscriberTestProviderArn)
+	subscriberDrainPrimes(t, materialCh, jwtCh)
+
+	// A node hosts the pods of however many providers its associations name, and a
+	// rotation in one of them is not news to the others.
+	g.Expect(subscriber.NotifyCertBundles(subscriberOtherProviderArn)).To(Equal(0))
+	g.Expect(subscriber.NotifyJWTBundles(subscriberOtherProviderArn)).To(Equal(0))
+	g.Expect(subscriberSignals(materialCh)).To(Equal(0))
+	g.Expect(subscriberSignals(jwtCh)).To(Equal(0))
+
+	g.Expect(subscriber.NotifyCertBundles(subscriberTestProviderArn)).To(Equal(1))
+	g.Expect(subscriberSignals(materialCh)).To(Equal(1))
+}
+
+func TestSubscriberNotifyWorkload_MatchingPodUID_SignalsOnlyThatPodsSubscriptions(t *testing.T) {
+	g := NewWithT(t)
+
+	subscriber := &Subscriber{}
+	firstCh, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberWorkload("pod-a"), subscriberTestProviderArn)
+	secondCh, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberWorkload("pod-a"), subscriberTestProviderArn)
+	otherCh, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberWorkload("pod-b"), subscriberTestProviderArn)
+	bundleCh, _ := subscriber.SubscribeToCertBundles(context.Background(), subscriberTestProviderArn)
+	subscriberDrainPrimes(t, firstCh, secondCh, otherCh, bundleCh)
+
+	// Two streams for one pod both wake, which is what a library holding an SVID
+	// stream beside a bundle stream looks like.
+	g.Expect(subscriber.NotifyWorkload("pod-a")).To(Equal(2))
 	g.Expect(subscriberSignals(firstCh)).To(Equal(1))
 	g.Expect(subscriberSignals(secondCh)).To(Equal(1))
 	g.Expect(subscriberSignals(otherCh)).To(Equal(0))
-	g.Expect(subscriberSignals(nilCh)).To(Equal(0))
+	// A bundle subscription carries no pod, so no renewal can reach it.
+	g.Expect(subscriberSignals(bundleCh)).To(Equal(0))
 
-	g.Expect(subscriber.Notify("pod-b")).To(Equal(1))
+	g.Expect(subscriber.NotifyWorkload("pod-b")).To(Equal(1))
 	g.Expect(subscriberSignals(otherCh)).To(Equal(1))
 
-	g.Expect(subscriber.Notify("pod-unknown")).To(Equal(0))
-	g.Expect(subscriber.Notify("")).To(Equal(0))
-	g.Expect(subscriber.BroadcastCalls()).To(Equal(0))
+	g.Expect(subscriber.NotifyWorkload("pod-unknown")).To(Equal(0))
+	g.Expect(subscriber.NotifyWorkload("")).To(Equal(0))
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(0))
+	// Every publish is recorded with the UID it named, in call order, which is what
+	// a material tier is asserted on rather than a bare count.
+	g.Expect(subscriber.WorkloadChanges()).To(Equal([]string{"pod-a", "pod-b", "pod-unknown", ""}))
 }
 
-func TestSubscriberNotify_BufferAlreadyFull_CoalescesAndReportsNoSignal(t *testing.T) {
+func TestSubscriberNotifyWorkload_BufferAlreadyFull_CoalescesAndReportsNoSignal(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
-	ch, _ := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, _ := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(1))
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(1))
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
 	g.Expect(subscriberSignals(ch)).To(Equal(1))
 
 	// Once the pending signal is read the next one lands again.
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(1))
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(1))
 	g.Expect(subscriber.Subscriptions()[0].Notified()).To(Equal(2))
 }
 
-func TestSubscriberBroadcastBundleChange_NoReader_CoalescesWithoutBlocking(t *testing.T) {
+func TestSubscriberNotifyCertBundles_NoReader_CoalescesWithoutBlocking(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
-	ch, _ := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, _ := subscriber.SubscribeToCertBundles(context.Background(), subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
 	subscriberDo(t, func() {
 		for range 5 {
-			subscriber.BroadcastBundleChange()
+			subscriber.NotifyCertBundleChange(subscriberTestProviderArn)
 		}
 	})
 
-	g.Expect(subscriber.BroadcastCalls()).To(Equal(5))
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(5))
 	g.Expect(subscriber.Subscriptions()[0].Notified()).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(1))
 }
@@ -254,11 +385,14 @@ func TestSubscriberSubscribe_BufferSet_AcceptsThatManyPendingSignals(t *testing.
 			g := NewWithT(t)
 
 			subscriber := &Subscriber{Buffer: tc.buffer}
-			ch, _ := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+			ch, _ := subscriber.SubscribeToCertBundles(context.Background(), subscriberTestProviderArn)
+			// The prime occupies one slot of whatever buffer was asked for, so
+			// draining it leaves the buffer empty for the publishes below.
+			subscriberDrainPrimes(t, ch)
 
 			subscriberDo(t, func() {
 				for range 5 {
-					subscriber.BroadcastBundleChange()
+					subscriber.NotifyCertBundleChange(subscriberTestProviderArn)
 				}
 			})
 
@@ -268,17 +402,18 @@ func TestSubscriberSubscribe_BufferSet_AcceptsThatManyPendingSignals(t *testing.
 	}
 }
 
-func TestSubscriberCancel_CalledTwice_CountsOnceAndStopsDelivery(t *testing.T) {
+func TestSubscriberRelease_CalledTwice_CountsOnceAndStopsDelivery(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
-	ch, cancel := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, release := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(1))
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(1))
 
-	cancel()
-	cancel()
+	release()
+	release()
 
 	g.Expect(subscriber.CancelCalls()).To(Equal(1))
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(0))
@@ -286,54 +421,56 @@ func TestSubscriberCancel_CalledTwice_CountsOnceAndStopsDelivery(t *testing.T) {
 	sub := subscriber.Subscriptions()[0]
 	g.Expect(sub.Live()).To(BeFalse())
 
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
-	subscriberDo(t, subscriber.BroadcastBundleChange)
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
+	subscriberDo(t, func() { subscriber.NotifyCertBundleChange(subscriberTestProviderArn) })
 
 	g.Expect(sub.Notified()).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(0))
 }
 
-func TestSubscriberCancel_CloseOnCancelSet_ClosesChannel(t *testing.T) {
+func TestSubscriberRelease_CloseOnCancelSet_ClosesChannel(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{CloseOnCancel: true}
-	ch, cancel := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, release := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
 	select {
 	case <-ch:
-		t.Fatal("channel was signalled or closed before cancel")
+		t.Fatal("channel was signalled or closed before release")
 	default:
 	}
 
-	cancel()
-	cancel()
+	release()
+	release()
 
 	g.Expect(subscriber.CancelCalls()).To(Equal(1))
 	select {
 	case _, ok := <-ch:
 		g.Expect(ok).To(BeFalse())
 	default:
-		t.Fatal("channel was not closed by cancel")
+		t.Fatal("channel was not closed by release")
 	}
 
-	// Delivery to a closed channel would panic, so a broadcast after cancel has
-	// to stay a no-op.
-	subscriberDo(t, subscriber.BroadcastBundleChange)
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
+	// Delivery to a closed channel would panic, so a publish after release has to
+	// stay a no-op.
+	subscriberDo(t, func() { subscriber.NotifyCertBundleChange(subscriberTestProviderArn) })
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
 	g.Expect(subscriber.Subscriptions()[0].Notified()).To(Equal(0))
 }
 
-func TestSubscriberCancel_CloseOnCancelUnset_LeavesChannelOpen(t *testing.T) {
+func TestSubscriberRelease_CloseOnCancelUnset_LeavesChannelOpen(t *testing.T) {
 	g := NewWithT(t)
 
 	subscriber := &Subscriber{}
-	ch, cancel := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, release := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
-	cancel()
+	release()
 
 	select {
 	case <-ch:
-		t.Fatal("channel was signalled or closed by cancel")
+		t.Fatal("channel was signalled or closed by release")
 	default:
 	}
 	g.Expect(subscriber.CancelCalls()).To(Equal(1))
@@ -346,18 +483,18 @@ func TestSubscriberSubscribe_ContextAlreadyDone_SubscriptionIsNeverLive(t *testi
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	cancelCtx()
 
-	ch, cancel := subscriber.Subscribe(ctx, subscriberTestWorkload)
+	ch, release := subscriber.SubscribeToWorkloadMaterial(ctx, subscriberTestWorkload, subscriberTestProviderArn)
 
 	g.Expect(ch).To(Not(BeNil()))
-	g.Expect(cancel).To(Not(BeNil()))
+	g.Expect(release).To(Not(BeNil()))
 	g.Expect(subscriber.SubscribeCalls()).To(Equal(1))
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(0))
 
 	sub := subscriber.Subscriptions()[0]
 	g.Expect(sub.Live()).To(BeFalse())
 
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
-	subscriberDo(t, subscriber.BroadcastBundleChange)
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
+	subscriberDo(t, func() { subscriber.NotifyCertBundleChange(subscriberTestProviderArn) })
 
 	g.Expect(sub.Notified()).To(Equal(0))
 	g.Expect(subscriberSignals(ch)).To(Equal(0))
@@ -370,22 +507,23 @@ func TestSubscriberSubscribe_ContextCancelledAfterSubscribe_StopsReceiving(t *te
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	t.Cleanup(cancelCtx)
 
-	ch, _ := subscriber.Subscribe(ctx, subscriberTestWorkload)
+	ch, _ := subscriber.SubscribeToWorkloadMaterial(ctx, subscriberTestWorkload, subscriberTestProviderArn)
+	subscriberDrainPrimes(t, ch)
 
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(1))
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(1))
 
 	cancelCtx()
 
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(0))
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
-	subscriberDo(t, subscriber.BroadcastBundleChange)
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
+	subscriberDo(t, func() { subscriber.NotifyCertBundleChange(subscriberTestProviderArn) })
 
 	sub := subscriber.Subscriptions()[0]
 	g.Expect(sub.Live()).To(BeFalse())
 	g.Expect(sub.Notified()).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(0))
-	// The subscription's ctx being done does not count as a cancel.
+	// The subscription's ctx being done does not count as a release.
 	g.Expect(subscriber.CancelCalls()).To(Equal(0))
 }
 
@@ -400,8 +538,8 @@ func TestSubscriberSubscribe_GateBlocked_ReturnsUsableSubscriptionAfterRelease(t
 
 	done := make(chan subscriberSubscribeResult, 1)
 	go func() {
-		ch, cancelSub := subscriber.Subscribe(ctx, subscriberTestWorkload)
-		done <- subscriberSubscribeResult{ch: ch, cancel: cancelSub}
+		ch, releaseSub := subscriber.SubscribeToWorkloadMaterial(ctx, subscriberTestWorkload, subscriberTestProviderArn)
+		done <- subscriberSubscribeResult{ch: ch, cancel: releaseSub}
 	}()
 
 	g.Expect(subscriber.WaitForBlocked(ctx, 1)).To(Succeed())
@@ -416,7 +554,7 @@ func TestSubscriberSubscribe_GateBlocked_ReturnsUsableSubscriptionAfterRelease(t
 	select {
 	case got = <-done:
 	case <-ctx.Done():
-		t.Fatalf("Subscribe did not return after Release: %v", ctx.Err())
+		t.Fatalf("the subscribe did not return after Release: %v", ctx.Err())
 	}
 
 	g.Expect(got.ch).To(Not(BeNil()))
@@ -430,7 +568,8 @@ func TestSubscriberSubscribe_GateBlocked_ReturnsUsableSubscriptionAfterRelease(t
 	g.Expect(subs[0].Chan()).To(BeIdenticalTo(got.ch))
 	g.Expect(subs[0].Live()).To(BeTrue())
 
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(1))
+	subscriberDrainPrimes(t, got.ch)
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(1))
 	g.Expect(subscriberSignals(got.ch)).To(Equal(1))
 
 	got.cancel()
@@ -452,8 +591,8 @@ func TestSubscriberSubscribe_ParkedCallContextCancelled_ReturnsSubscriptionThatI
 
 	done := make(chan subscriberSubscribeResult, 1)
 	go func() {
-		ch, cancelSub := subscriber.Subscribe(callCtx, subscriberTestWorkload)
-		done <- subscriberSubscribeResult{ch: ch, cancel: cancelSub}
+		ch, releaseSub := subscriber.SubscribeToWorkloadMaterial(callCtx, subscriberTestWorkload, subscriberTestProviderArn)
+		done <- subscriberSubscribeResult{ch: ch, cancel: releaseSub}
 	}()
 
 	g.Expect(subscriber.WaitForBlocked(waitCtx, 1)).To(Succeed())
@@ -463,11 +602,11 @@ func TestSubscriberSubscribe_ParkedCallContextCancelled_ReturnsSubscriptionThatI
 	select {
 	case got = <-done:
 	case <-waitCtx.Done():
-		t.Fatalf("Subscribe did not return after its context was cancelled: %v", waitCtx.Err())
+		t.Fatalf("the subscribe did not return after its context was cancelled: %v", waitCtx.Err())
 	}
 
-	// Subscribe cannot report the gate error, so it still hands back a usable
-	// channel and cancel func, for a subscription that is never live.
+	// A subscribe cannot report the gate error, so it still hands back a usable
+	// channel and release func, for a subscription that is never live.
 	g.Expect(got.ch).To(Not(BeNil()))
 	g.Expect(got.cancel).To(Not(BeNil()))
 	g.Expect(subscriber.SubscribeCalls()).To(Equal(1))
@@ -476,7 +615,7 @@ func TestSubscriberSubscribe_ParkedCallContextCancelled_ReturnsSubscriptionThatI
 
 	sub := subscriber.Subscriptions()[0]
 	g.Expect(sub.Live()).To(BeFalse())
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
 	g.Expect(sub.Notified()).To(Equal(0))
 	g.Expect(subscriberSignals(got.ch)).To(Equal(0))
 }
@@ -485,65 +624,72 @@ func TestSubscriberSubscribe_FuncSet_ReturnsItsChannelAndRecordsNoSubscription(t
 	g := NewWithT(t)
 
 	canned := make(chan struct{}, 1)
-	cancels := 0
+	releases := 0
+	var gotKinds []SubscriptionKind
 	subscriber := &Subscriber{
-		Func: func(_ context.Context, _ *workloadidentity.Workload) (<-chan struct{}, func()) {
-			return canned, func() { cancels++ }
+		Func: func(_ context.Context, kind SubscriptionKind, _ *workloadidentity.Workload, _ string) (<-chan struct{}, func()) {
+			gotKinds = append(gotKinds, kind)
+			return canned, func() { releases++ }
 		},
 	}
 
-	ch, cancel := subscriber.Subscribe(context.Background(), subscriberTestWorkload)
+	ch, release := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberTestWorkload, subscriberTestProviderArn)
 
 	g.Expect(ch).To(BeIdenticalTo((<-chan struct{})(canned)))
 	g.Expect(subscriber.SubscribeCalls()).To(Equal(1))
 	g.Expect(subscriber.Subscriptions()).To(BeEmpty())
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(0))
 
-	// The cancel func is returned unwrapped, so it is neither counted nor made
+	// One Func serves all three methods and is told which one it is answering.
+	_, _ = subscriber.SubscribeToJWTBundles(context.Background(), subscriberTestProviderArn)
+	g.Expect(gotKinds).To(Equal([]SubscriptionKind{KindWorkloadMaterial, KindJWTBundles}))
+
+	// The release func is returned unwrapped, so it is neither counted nor made
 	// idempotent by the fake.
-	cancel()
-	cancel()
-	g.Expect(cancels).To(Equal(2))
+	release()
+	release()
+	g.Expect(releases).To(Equal(2))
 	g.Expect(subscriber.CancelCalls()).To(Equal(0))
 
-	// Nothing was recorded, so neither delivery path reaches the canned channel.
-	g.Expect(subscriber.Notify("pod-uid-1")).To(Equal(0))
-	subscriberDo(t, subscriber.BroadcastBundleChange)
-	g.Expect(subscriber.BroadcastCalls()).To(Equal(1))
+	// Nothing was recorded, so no delivery path reaches the canned channel.
+	g.Expect(subscriber.NotifyWorkload("pod-uid-1")).To(Equal(0))
+	subscriberDo(t, func() { subscriber.NotifyCertBundleChange(subscriberTestProviderArn) })
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(1))
 	g.Expect(subscriberSignals(ch)).To(Equal(0))
 }
 
-func TestSubscriberBroadcastBundleChange_ConcurrentWithCancel_DeliversWithoutRacing(t *testing.T) {
+func TestSubscriberNotify_ConcurrentWithRelease_DeliversWithoutRacing(t *testing.T) {
 	g := NewWithT(t)
 
 	const subscriptions = 5
 	subscriber := &Subscriber{CloseOnCancel: true}
 
-	cancels := make([]func(), 0, subscriptions)
+	releases := make([]func(), 0, subscriptions)
 	for range subscriptions {
-		_, cancel := subscriber.Subscribe(context.Background(), subscriberWorkload("pod-a"))
-		cancels = append(cancels, cancel)
+		_, release := subscriber.SubscribeToWorkloadMaterial(context.Background(), subscriberWorkload("pod-a"), subscriberTestProviderArn)
+		releases = append(releases, release)
 	}
 
 	var wg sync.WaitGroup
-	for _, cancel := range cancels {
+	for _, release := range releases {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			cancel()
-			cancel()
+			release()
+			release()
 		}()
 		go func() {
 			defer wg.Done()
-			subscriber.BroadcastBundleChange()
-			subscriber.Notify("pod-a")
+			subscriber.NotifyCertBundleChange(subscriberTestProviderArn)
+			subscriber.NotifyWorkloadChange("pod-a")
 		}()
 	}
 
 	subscriberDo(t, wg.Wait)
 
 	g.Expect(subscriber.SubscribeCalls()).To(Equal(subscriptions))
-	g.Expect(subscriber.BroadcastCalls()).To(Equal(subscriptions))
+	g.Expect(subscriber.CertBundleCalls()).To(Equal(subscriptions))
+	g.Expect(subscriber.WorkloadChanges()).To(HaveLen(subscriptions))
 	g.Expect(subscriber.CancelCalls()).To(Equal(subscriptions))
 	g.Expect(subscriber.LiveSubscriptions()).To(Equal(0))
 
@@ -552,10 +698,10 @@ func TestSubscriberBroadcastBundleChange_ConcurrentWithCancel_DeliversWithoutRac
 		g.Expect(sub.Notified()).To(BeNumerically("<=", 1))
 		select {
 		case _, ok := <-sub.Chan():
-			// Either the signal that landed before the cancel, or the close.
+			// Either the signal that landed before the release, or the close.
 			_ = ok
 		default:
-			t.Fatal("a cancelled subscription's channel was neither signalled nor closed")
+			t.Fatal("a released subscription's channel was neither signalled nor closed")
 		}
 	}
 }

@@ -13,29 +13,54 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // bundleSourceTestTimeout bounds every wait in this file, so a fake that never
 // releases a parked call fails the test instead of hanging the suite.
 const bundleSourceTestTimeout = 2 * time.Second
 
-// bundleSourceProvider and bundleSourceOtherProvider are the workload identity
-// provider ARNs the calls in this file name. The canned values answer both alike;
-// only the funcs and ProviderRequests can tell them apart.
-const (
-	bundleSourceProvider      = "arn:aws:iam::111122223333:workload-identity-provider/example"
-	bundleSourceOtherProvider = "arn:aws:iam::111122223333:workload-identity-provider/other"
+// bundleSourceWorkload and bundleSourceOtherWorkload are the attested workloads
+// the calls in this file pass. The canned values answer both alike; only the
+// funcs and WorkloadRequests can tell them apart. Nothing may mutate them.
+var (
+	bundleSourceWorkload      = bundleSourceNamedWorkload("example")
+	bundleSourceOtherWorkload = bundleSourceNamedWorkload("other")
 )
+
+// bundleSourceNamedWorkload builds a fresh workload whose fields all carry name,
+// so two built from different names never compare equal.
+func bundleSourceNamedWorkload(name string) *workloadidentity.Workload {
+	return &workloadidentity.Workload{
+		PodUID:         "uid-" + name,
+		PodName:        "pod-" + name,
+		Namespace:      "ns-" + name,
+		ServiceAccount: "sa-" + name,
+		NodeName:       "node-1",
+	}
+}
 
 // bundleSourceCtxKey tags the ctx a test passes in, so a func can report whether
 // the fake handed it the caller's ctx.
 type bundleSourceCtxKey struct{}
 
-// bundleSourceOwnKey and bundleSourceFederatedKey are deterministic verification
-// keys for the JWTAuthority lookup table.
+// bundleSourceOwnDomain and bundleSourceFederatedDomain are the trust domains
+// the canned JWT sources in this file cover.
 var (
-	bundleSourceOwnKey       = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public()
+	bundleSourceOwnDomain       = spiffeid.RequireTrustDomainFromString("example.org")
+	bundleSourceFederatedDomain = spiffeid.RequireTrustDomainFromString("other.org")
+)
+
+// bundleSourceOwnKey, bundleSourceFederatedKey and bundleSourceRotatedKey are
+// deterministic JWT authorities. The fake never verifies with them, so the
+// algorithm does not matter.
+var (
+	bundleSourceOwnKey       = ed25519.NewKeyFromSeed(bundleSourceSeed(0x01)).Public()
 	bundleSourceFederatedKey = ed25519.NewKeyFromSeed(bundleSourceSeed(0x02)).Public()
+	bundleSourceRotatedKey   = ed25519.NewKeyFromSeed(bundleSourceSeed(0x03)).Public()
 )
 
 // bundleSourceSeed builds a distinct ed25519 seed so two test keys differ.
@@ -47,38 +72,114 @@ func bundleSourceSeed(b byte) []byte {
 	return seed
 }
 
-// bundleSourceX509Result is what an X509Bundles call running in another goroutine
-// hands back to the test.
-type bundleSourceX509Result struct {
-	bundles map[string][][]byte
-	err     error
+// bundleSourceOwnBundle builds a fresh own-domain bundle holding own-kid.
+func bundleSourceOwnBundle() *jwtbundle.Bundle {
+	return jwtbundle.FromJWTAuthorities(bundleSourceOwnDomain, map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey})
 }
 
-// bundleSourceJWTResult is what a JWTBundles call running in another goroutine
-// hands back to the test.
-type bundleSourceJWTResult struct {
-	bundles map[string][]byte
-	err     error
+// bundleSourceSet builds a fresh set of the own bundle and a federated bundle
+// holding federated-kid.
+func bundleSourceSet() *jwtbundle.Set {
+	return jwtbundle.NewSet(
+		bundleSourceOwnBundle(),
+		jwtbundle.FromJWTAuthorities(bundleSourceFederatedDomain, map[string]crypto.PublicKey{"federated-kid": bundleSourceFederatedKey}),
+	)
+}
+
+// bundleSourceAuthorities reads td's authorities out of source the way
+// jwtsvid.ParseAndValidate does, returning nil when source has no bundle for td.
+func bundleSourceAuthorities(source jwtbundle.Source, td spiffeid.TrustDomain) map[string]crypto.PublicKey {
+	bundle, err := source.GetJWTBundleForTrustDomain(td)
+	if err != nil {
+		return nil
+	}
+	return bundle.JWTAuthorities()
+}
+
+// bundleSourceOpaqueSource is a jwtbundle.Source the fake has no way to copy.
+type bundleSourceOpaqueSource struct{}
+
+func (*bundleSourceOpaqueSource) GetJWTBundleForTrustDomain(td spiffeid.TrustDomain) (*jwtbundle.Bundle, error) {
+	return jwtbundle.New(td), nil
 }
 
 // bundleSourceFuncCall is what one of the fake's canned funcs saw when the fake
 // called it.
 type bundleSourceFuncCall struct {
-	// ctxValue is what the func's ctx carries under bundleSourceCtxKey, and nil
-	// for AuthorityFunc, which takes no ctx.
-	ctxValue    any
-	providerArn string
-	trustDomain string
-	keyID       string
-	// providerRequests is ProviderRequests as read from inside the func.
-	providerRequests []string
+	// ctxValue is what the func's ctx carries under bundleSourceCtxKey.
+	ctxValue any
+	workload *workloadidentity.Workload
+	// workloadRequests is WorkloadRequests as read from inside the func.
+	workloadRequests []*workloadidentity.Workload
 }
 
-func TestBundleSourceOwnTrustDomain_Called_ReturnsTrustDomainForAnyProviderAndRecordsIt(t *testing.T) {
+// bundleSourceGatedMethod is one of the four methods that pass the Gate, called
+// in a way that hands back whatever it returned as an any.
+type bundleSourceGatedMethod struct {
+	name  string
+	call  func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error)
+	calls func(s *BundleSource) int
+}
+
+// bundleSourceGatedMethods lists the four methods that pass the Gate.
+var bundleSourceGatedMethods = []bundleSourceGatedMethod{
+	{
+		name: "OwnTrustDomain",
+		call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+			return s.OwnTrustDomain(ctx, w)
+		},
+		calls: func(s *BundleSource) int { return s.OwnTrustDomainCalls() },
+	},
+	{
+		name: "X509Bundles",
+		call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+			return s.X509Bundles(ctx, w)
+		},
+		calls: func(s *BundleSource) int { return s.X509BundlesCalls() },
+	},
+	{
+		name: "JWTBundles",
+		call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+			return s.JWTBundles(ctx, w)
+		},
+		calls: func(s *BundleSource) int { return s.JWTBundlesCalls() },
+	},
+	{
+		name: "JWTSource",
+		call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+			return s.JWTSource(ctx, w)
+		},
+		calls: func(s *BundleSource) int { return s.JWTSourceCalls() },
+	},
+}
+
+// bundleSourceExpectOnlyCalls asserts that the named method was counted calls
+// times and that no other method was counted at all.
+func bundleSourceExpectOnlyCalls(g *WithT, s *BundleSource, method string, calls int) {
+	counters := map[string]int{
+		"OwnTrustDomain": s.OwnTrustDomainCalls(),
+		"X509Bundles":    s.X509BundlesCalls(),
+		"JWTBundles":     s.JWTBundlesCalls(),
+		"JWTSource":      s.JWTSourceCalls(),
+		"Lease":          s.LeaseCalls(),
+	}
+	for name, got := range counters {
+		expected := 0
+		if name == method {
+			expected = calls
+		}
+		g.Expect(got).To(Equal(expected), "%s calls", name)
+	}
+}
+
+func TestBundleSourceOwnTrustDomain_CannedBehaviour_ReturnsThatBehaviourForAnyWorkload(t *testing.T) {
+	cannedErr := errors.New("bundle unavailable")
+
 	testCases := []struct {
-		name     string
-		source   *BundleSource
-		expected string
+		name        string
+		source      *BundleSource
+		expected    string
+		expectedErr error
 	}{
 		{
 			name:     "zero value returns the empty trust domain",
@@ -90,22 +191,30 @@ func TestBundleSourceOwnTrustDomain_Called_ReturnsTrustDomainForAnyProviderAndRe
 			source:   &BundleSource{TrustDomain: "example.org"},
 			expected: "example.org",
 		},
+		{
+			name:        "canned error wins over the canned trust domain",
+			source:      &BundleSource{TrustDomain: "example.org", OwnTrustDomainErr: cannedErr},
+			expectedErr: cannedErr,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			g.Expect(tc.source.OwnTrustDomainCalls()).To(Equal(0))
-			g.Expect(tc.source.ProviderRequests()).To(BeEmpty())
-			g.Expect(tc.source.OwnTrustDomain(bundleSourceProvider)).To(Equal(tc.expected))
-			g.Expect(tc.source.OwnTrustDomain(bundleSourceOtherProvider)).To(Equal(tc.expected))
-			g.Expect(tc.source.OwnTrustDomainCalls()).To(Equal(2))
-			g.Expect(tc.source.ProviderRequests()).To(Equal([]string{bundleSourceProvider, bundleSourceOtherProvider}))
-			g.Expect(tc.source.X509BundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTBundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTAuthorityCalls()).To(Equal(0))
-			g.Expect(tc.source.LeaseCalls()).To(Equal(0))
+			g.Expect(tc.source.WorkloadRequests()).To(BeEmpty())
+			for _, w := range []*workloadidentity.Workload{bundleSourceWorkload, bundleSourceOtherWorkload} {
+				got, err := tc.source.OwnTrustDomain(context.Background(), w)
+				if tc.expectedErr != nil {
+					g.Expect(err).To(MatchError(tc.expectedErr))
+				} else {
+					g.Expect(err).To(Not(HaveOccurred()))
+				}
+				g.Expect(got).To(Equal(tc.expected))
+			}
+			bundleSourceExpectOnlyCalls(g, tc.source, "OwnTrustDomain", 2)
+			g.Expect(tc.source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload, bundleSourceOtherWorkload}))
+			g.Expect(tc.source.Blocked()).To(Equal(0))
 		})
 	}
 }
@@ -148,7 +257,7 @@ func TestBundleSourceX509Bundles_CannedBehaviour_ReturnsThatBehaviour(t *testing
 			source: &BundleSource{
 				X509:    canned,
 				X509Err: cannedErr,
-				X509Func: func(_ context.Context, _ string) (map[string][][]byte, error) {
+				X509Func: func(_ context.Context, _ *workloadidentity.Workload) (map[string][][]byte, error) {
 					return map[string][][]byte{"func.org": {[]byte("func-der")}}, nil
 				},
 			},
@@ -160,7 +269,7 @@ func TestBundleSourceX509Bundles_CannedBehaviour_ReturnsThatBehaviour(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			got, err := tc.source.X509Bundles(context.Background(), bundleSourceProvider)
+			got, err := tc.source.X509Bundles(context.Background(), bundleSourceWorkload)
 
 			if tc.expectedErr != nil {
 				g.Expect(err).To(MatchError(tc.expectedErr))
@@ -173,12 +282,8 @@ func TestBundleSourceX509Bundles_CannedBehaviour_ReturnsThatBehaviour(t *testing
 					g.Expect(got).To(Equal(tc.expected))
 				}
 			}
-			g.Expect(tc.source.X509BundlesCalls()).To(Equal(1))
-			g.Expect(tc.source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
-			g.Expect(tc.source.JWTBundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.OwnTrustDomainCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTAuthorityCalls()).To(Equal(0))
-			g.Expect(tc.source.LeaseCalls()).To(Equal(0))
+			bundleSourceExpectOnlyCalls(g, tc.source, "X509Bundles", 1)
+			g.Expect(tc.source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload}))
 			g.Expect(tc.source.Blocked()).To(Equal(0))
 		})
 	}
@@ -222,7 +327,7 @@ func TestBundleSourceJWTBundles_CannedBehaviour_ReturnsThatBehaviour(t *testing.
 			source: &BundleSource{
 				JWT:    canned,
 				JWTErr: cannedErr,
-				JWTFunc: func(_ context.Context, _ string) (map[string][]byte, error) {
+				JWTFunc: func(_ context.Context, _ *workloadidentity.Workload) (map[string][]byte, error) {
 					return map[string][]byte{"func.org": []byte(`{"keys":[]}`)}, nil
 				},
 			},
@@ -234,7 +339,7 @@ func TestBundleSourceJWTBundles_CannedBehaviour_ReturnsThatBehaviour(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			got, err := tc.source.JWTBundles(context.Background(), bundleSourceProvider)
+			got, err := tc.source.JWTBundles(context.Background(), bundleSourceWorkload)
 
 			if tc.expectedErr != nil {
 				g.Expect(err).To(MatchError(tc.expectedErr))
@@ -247,87 +352,77 @@ func TestBundleSourceJWTBundles_CannedBehaviour_ReturnsThatBehaviour(t *testing.
 					g.Expect(got).To(Equal(tc.expected))
 				}
 			}
-			g.Expect(tc.source.JWTBundlesCalls()).To(Equal(1))
-			g.Expect(tc.source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
-			g.Expect(tc.source.X509BundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.OwnTrustDomainCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTAuthorityCalls()).To(Equal(0))
-			g.Expect(tc.source.LeaseCalls()).To(Equal(0))
+			bundleSourceExpectOnlyCalls(g, tc.source, "JWTBundles", 1)
+			g.Expect(tc.source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload}))
 			g.Expect(tc.source.Blocked()).To(Equal(0))
 		})
 	}
 }
 
-func TestBundleSourceJWTAuthority_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
-	cannedErr := errors.New("authority unavailable")
-	funcKey := ed25519.NewKeyFromSeed(bundleSourceSeed(0x03)).Public()
-	authorities := map[AuthorityKey]crypto.PublicKey{
-		{TrustDomain: "example.org", KeyID: "own-kid"}:     bundleSourceOwnKey,
-		{TrustDomain: "other.org", KeyID: "federated-kid"}: bundleSourceFederatedKey,
-	}
+func TestBundleSourceJWTSource_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
+	cannedErr := errors.New("bundle unavailable")
+	opaque := &bundleSourceOpaqueSource{}
+	funcSource := jwtbundle.FromJWTAuthorities(bundleSourceOwnDomain, map[string]crypto.PublicKey{"func-kid": bundleSourceRotatedKey})
+	var nilSet *jwtbundle.Set
 
 	testCases := []struct {
 		name        string
 		source      *BundleSource
-		trustDomain string
-		keyID       string
-		expected    crypto.PublicKey
 		expectedErr error
+		// check asserts on the source that came back without error.
+		check func(g *WithT, got jwtbundle.Source)
 	}{
 		{
-			name:        "zero value reports the key as not found",
-			source:      &BundleSource{},
-			trustDomain: "example.org",
-			keyID:       "own-kid",
-			expectedErr: ErrAuthorityNotFound,
+			name:   "zero value returns a nil source and no error",
+			source: &BundleSource{},
+			check:  func(g *WithT, got jwtbundle.Source) { g.Expect(got).To(BeNil()) },
 		},
 		{
-			name:        "known key resolves to its authority",
-			source:      &BundleSource{Authorities: authorities},
-			trustDomain: "example.org",
-			keyID:       "own-kid",
-			expected:    bundleSourceOwnKey,
+			name:   "canned set comes back as an equal set",
+			source: &BundleSource{JWTSourceResult: bundleSourceSet()},
+			check: func(g *WithT, got jwtbundle.Source) {
+				g.Expect(got).To(BeAssignableToTypeOf(&jwtbundle.Set{}))
+				g.Expect(bundleSourceAuthorities(got, bundleSourceOwnDomain)).To(Equal(map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey}))
+				g.Expect(bundleSourceAuthorities(got, bundleSourceFederatedDomain)).To(Equal(map[string]crypto.PublicKey{"federated-kid": bundleSourceFederatedKey}))
+				g.Expect(bundleSourceAuthorities(got, spiffeid.RequireTrustDomainFromString("unknown.org"))).To(BeNil())
+			},
 		},
 		{
-			name:        "known key in a federated domain resolves to its authority",
-			source:      &BundleSource{Authorities: authorities},
-			trustDomain: "other.org",
-			keyID:       "federated-kid",
-			expected:    bundleSourceFederatedKey,
+			name:   "canned bundle comes back as an equal bundle",
+			source: &BundleSource{JWTSourceResult: bundleSourceOwnBundle()},
+			check: func(g *WithT, got jwtbundle.Source) {
+				g.Expect(got).To(BeAssignableToTypeOf(&jwtbundle.Bundle{}))
+				g.Expect(got.(*jwtbundle.Bundle).Equal(bundleSourceOwnBundle())).To(BeTrue())
+			},
 		},
 		{
-			name:        "key id missing from a known trust domain is not found",
-			source:      &BundleSource{Authorities: authorities},
-			trustDomain: "example.org",
-			keyID:       "unknown-kid",
-			expectedErr: ErrAuthorityNotFound,
+			name:   "a source the fake cannot copy comes back as is",
+			source: &BundleSource{JWTSourceResult: opaque},
+			check:  func(g *WithT, got jwtbundle.Source) { g.Expect(got).To(BeIdenticalTo(opaque)) },
 		},
 		{
-			name:        "trust domain missing altogether is not found",
-			source:      &BundleSource{Authorities: authorities},
-			trustDomain: "unknown.org",
-			keyID:       "own-kid",
-			expectedErr: ErrAuthorityNotFound,
+			name:   "a typed nil set comes back as is",
+			source: &BundleSource{JWTSourceResult: nilSet},
+			check: func(g *WithT, got jwtbundle.Source) {
+				g.Expect(got).To(BeAssignableToTypeOf(&jwtbundle.Set{}))
+				g.Expect(got.(*jwtbundle.Set)).To(BeNil())
+			},
 		},
 		{
-			name:        "canned error wins over the lookup table",
-			source:      &BundleSource{Authorities: authorities, AuthorityErr: cannedErr},
-			trustDomain: "example.org",
-			keyID:       "own-kid",
+			name:        "canned error wins over the canned source",
+			source:      &BundleSource{JWTSourceResult: bundleSourceSet(), JWTSourceErr: cannedErr},
 			expectedErr: cannedErr,
 		},
 		{
-			name: "func wins over the lookup table and the canned error",
+			name: "func wins over the canned source and canned error, uncopied",
 			source: &BundleSource{
-				Authorities:  authorities,
-				AuthorityErr: cannedErr,
-				AuthorityFunc: func(_, _, _ string) (crypto.PublicKey, error) {
-					return funcKey, nil
+				JWTSourceResult: bundleSourceSet(),
+				JWTSourceErr:    cannedErr,
+				JWTSourceFunc: func(_ context.Context, _ *workloadidentity.Workload) (jwtbundle.Source, error) {
+					return funcSource, nil
 				},
 			},
-			trustDomain: "example.org",
-			keyID:       "own-kid",
-			expected:    funcKey,
+			check: func(g *WithT, got jwtbundle.Source) { g.Expect(got).To(BeIdenticalTo(funcSource)) },
 		},
 	}
 
@@ -335,71 +430,78 @@ func TestBundleSourceJWTAuthority_CannedBehaviour_ReturnsThatBehaviour(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			got, err := tc.source.JWTAuthority(bundleSourceProvider, tc.trustDomain, tc.keyID)
+			got, err := tc.source.JWTSource(context.Background(), bundleSourceWorkload)
 
 			if tc.expectedErr != nil {
 				g.Expect(err).To(MatchError(tc.expectedErr))
 				g.Expect(got).To(BeNil())
 			} else {
 				g.Expect(err).To(Not(HaveOccurred()))
-				g.Expect(got).To(Equal(tc.expected))
+				tc.check(g, got)
 			}
-			// The request is recorded and counted on every path, misses included.
-			g.Expect(tc.source.JWTAuthorityCalls()).To(Equal(1))
-			g.Expect(tc.source.AuthorityRequests()).To(Equal([]AuthorityKey{{
-				TrustDomain: tc.trustDomain,
-				KeyID:       tc.keyID,
-			}}))
-			g.Expect(tc.source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
-			g.Expect(tc.source.OwnTrustDomainCalls()).To(Equal(0))
-			g.Expect(tc.source.X509BundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTBundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.LeaseCalls()).To(Equal(0))
+			bundleSourceExpectOnlyCalls(g, tc.source, "JWTSource", 1)
+			g.Expect(tc.source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload}))
+			g.Expect(tc.source.Blocked()).To(Equal(0))
 		})
 	}
 }
 
-func TestBundleSourceJWTAuthority_CalledRepeatedly_CountsCallsAndRecordsKeysAndProvidersInOrder(t *testing.T) {
-	g := NewWithT(t)
+func TestBundleSourceJWTSource_CannedSourceChangedEitherSide_ReturnedSourceStaysPointInTime(t *testing.T) {
+	testCases := []struct {
+		name string
+		// canned is a fresh canned source; ownBundle finds the own-domain bundle
+		// inside a source of the same type, so the test can rotate it in place.
+		canned    func() jwtbundle.Source
+		ownBundle func(jwtbundle.Source) *jwtbundle.Bundle
+	}{
+		{
+			name:   "set",
+			canned: func() jwtbundle.Source { return bundleSourceSet() },
+			ownBundle: func(s jwtbundle.Source) *jwtbundle.Bundle {
+				own, _ := s.(*jwtbundle.Set).Get(bundleSourceOwnDomain)
+				return own
+			},
+		},
+		{
+			name:      "bundle",
+			canned:    func() jwtbundle.Source { return bundleSourceOwnBundle() },
+			ownBundle: func(s jwtbundle.Source) *jwtbundle.Bundle { return s.(*jwtbundle.Bundle) },
+		},
+	}
 
-	source := &BundleSource{Authorities: map[AuthorityKey]crypto.PublicKey{
-		{TrustDomain: "example.org", KeyID: "own-kid"}: bundleSourceOwnKey,
-	}}
+	own := map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey}
+	rotated := map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey, "rotated-kid": bundleSourceRotatedKey}
 
-	g.Expect(source.JWTAuthorityCalls()).To(Equal(0))
-	g.Expect(source.AuthorityRequests()).To(BeEmpty())
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
 
-	got, err := source.JWTAuthority(bundleSourceProvider, "example.org", "own-kid")
-	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(got).To(Equal(bundleSourceOwnKey))
+			canned := tc.canned()
+			source := &BundleSource{JWTSourceResult: canned}
+			rotate := func(s jwtbundle.Source) {
+				g.Expect(tc.ownBundle(s).AddJWTAuthority("rotated-kid", bundleSourceRotatedKey)).To(Succeed())
+			}
 
-	got, err = source.JWTAuthority(bundleSourceOtherProvider, "other.org", "missing-kid")
-	g.Expect(err).To(MatchError(ErrAuthorityNotFound))
-	g.Expect(got).To(BeNil())
+			// Rotating the returned copy leaves the canned source alone.
+			first, err := source.JWTSource(context.Background(), bundleSourceWorkload)
+			g.Expect(err).To(Not(HaveOccurred()))
+			rotate(first)
+			g.Expect(bundleSourceAuthorities(first, bundleSourceOwnDomain)).To(Equal(rotated))
+			g.Expect(bundleSourceAuthorities(canned, bundleSourceOwnDomain)).To(Equal(own))
 
-	// The table is keyed without the provider, so a different provider resolves
-	// the same key.
-	got, err = source.JWTAuthority(bundleSourceOtherProvider, "example.org", "own-kid")
-	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(got).To(Equal(bundleSourceOwnKey))
+			// Rotating the canned source reaches the next call but not a copy
+			// already handed out.
+			second, err := source.JWTSource(context.Background(), bundleSourceWorkload)
+			g.Expect(err).To(Not(HaveOccurred()))
+			rotate(canned)
+			g.Expect(bundleSourceAuthorities(second, bundleSourceOwnDomain)).To(Equal(own))
 
-	g.Expect(source.JWTAuthorityCalls()).To(Equal(3))
-	g.Expect(source.AuthorityRequests()).To(Equal([]AuthorityKey{
-		{TrustDomain: "example.org", KeyID: "own-kid"},
-		{TrustDomain: "other.org", KeyID: "missing-kid"},
-		{TrustDomain: "example.org", KeyID: "own-kid"},
-	}))
-	g.Expect(source.ProviderRequests()).To(Equal([]string{
-		bundleSourceProvider,
-		bundleSourceOtherProvider,
-		bundleSourceOtherProvider,
-	}))
-
-	// AuthorityRequests hands back a copy, so a test mutating it cannot rewrite
-	// the record.
-	recorded := source.AuthorityRequests()
-	recorded[0] = AuthorityKey{}
-	g.Expect(source.AuthorityRequests()[0]).To(Equal(AuthorityKey{TrustDomain: "example.org", KeyID: "own-kid"}))
+			third, err := source.JWTSource(context.Background(), bundleSourceWorkload)
+			g.Expect(err).To(Not(HaveOccurred()))
+			g.Expect(bundleSourceAuthorities(third, bundleSourceOwnDomain)).To(Equal(rotated))
+			g.Expect(source.JWTSourceCalls()).To(Equal(3))
+		})
+	}
 }
 
 func TestBundleSourceX509Bundles_ReturnedMapMutated_NextCallIsUnaffected(t *testing.T) {
@@ -409,7 +511,7 @@ func TestBundleSourceX509Bundles_ReturnedMapMutated_NextCallIsUnaffected(t *test
 	source := &BundleSource{X509: map[string][][]byte{"example.org": {der}}}
 	expected := map[string][][]byte{"example.org": {[]byte("own-authority-der")}}
 
-	got, err := source.X509Bundles(context.Background(), bundleSourceProvider)
+	got, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(Equal(expected))
 
@@ -419,7 +521,7 @@ func TestBundleSourceX509Bundles_ReturnedMapMutated_NextCallIsUnaffected(t *test
 	got["example.org"] = append(got["example.org"], []byte("appended-der"))
 	got["example.org"][0][0] = 'X'
 
-	again, err := source.X509Bundles(context.Background(), bundleSourceProvider)
+	again, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(again).To(Equal(expected))
 	g.Expect(source.X509).To(Equal(expected))
@@ -438,7 +540,7 @@ func TestBundleSourceX509Bundles_DomainWithNilAuthorities_KeepsNilApartFromEmpty
 		"empty.example.org": {},
 	}}
 
-	got, err := source.X509Bundles(context.Background(), bundleSourceProvider)
+	got, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(HaveLen(2))
 	g.Expect(got).To(HaveKey("nil.example.org"))
@@ -455,14 +557,14 @@ func TestBundleSourceJWTBundles_ReturnedMapMutated_NextCallIsUnaffected(t *testi
 	source := &BundleSource{JWT: map[string][]byte{"example.org": jwks}}
 	expected := map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)}
 
-	got, err := source.JWTBundles(context.Background(), bundleSourceProvider)
+	got, err := source.JWTBundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(Equal(expected))
 
 	got["injected.org"] = []byte(`{"keys":[]}`)
 	got["example.org"][0] = 'X'
 
-	again, err := source.JWTBundles(context.Background(), bundleSourceProvider)
+	again, err := source.JWTBundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(again).To(Equal(expected))
 	g.Expect(source.JWT).To(Equal(expected))
@@ -477,31 +579,31 @@ func TestBundleSourceSetters_CalledWhileLive_ReplaceCannedBehaviour(t *testing.T
 	jwtErr := errors.New("jwt bundle unavailable")
 	source := &BundleSource{}
 
-	x509Bundles, err := source.X509Bundles(context.Background(), bundleSourceProvider)
+	x509Bundles, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(x509Bundles).To(BeNil())
 
 	source.SetX509Bundles(map[string][][]byte{"example.org": {[]byte("own-authority-der")}}, nil)
-	x509Bundles, err = source.X509Bundles(context.Background(), bundleSourceProvider)
+	x509Bundles, err = source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(x509Bundles).To(Equal(map[string][][]byte{"example.org": {[]byte("own-authority-der")}}))
 
 	source.SetX509Bundles(nil, x509Err)
-	x509Bundles, err = source.X509Bundles(context.Background(), bundleSourceProvider)
+	x509Bundles, err = source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(MatchError(x509Err))
 	g.Expect(x509Bundles).To(BeNil())
 
-	jwtBundles, err := source.JWTBundles(context.Background(), bundleSourceProvider)
+	jwtBundles, err := source.JWTBundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(jwtBundles).To(BeNil())
 
 	source.SetJWTBundles(map[string][]byte{"example.org": []byte(`{"keys":[]}`)}, nil)
-	jwtBundles, err = source.JWTBundles(context.Background(), bundleSourceProvider)
+	jwtBundles, err = source.JWTBundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(jwtBundles).To(Equal(map[string][]byte{"example.org": []byte(`{"keys":[]}`)}))
 
 	source.SetJWTBundles(nil, jwtErr)
-	jwtBundles, err = source.JWTBundles(context.Background(), bundleSourceProvider)
+	jwtBundles, err = source.JWTBundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(MatchError(jwtErr))
 	g.Expect(jwtBundles).To(BeNil())
 
@@ -512,59 +614,60 @@ func TestBundleSourceSetters_CalledWhileLive_ReplaceCannedBehaviour(t *testing.T
 func TestBundleSourceSetTrustDomain_CalledWhileLive_ChangesTheNextOwnTrustDomain(t *testing.T) {
 	g := NewWithT(t)
 
+	cannedErr := errors.New("bundle unavailable")
 	source := &BundleSource{TrustDomain: "example.org"}
-	g.Expect(source.OwnTrustDomain(bundleSourceProvider)).To(Equal("example.org"))
+	ownTrustDomain := func() (string, error) {
+		return source.OwnTrustDomain(context.Background(), bundleSourceWorkload)
+	}
 
-	source.SetTrustDomain("rotated.org")
-	g.Expect(source.OwnTrustDomain(bundleSourceProvider)).To(Equal("rotated.org"))
+	g.Expect(ownTrustDomain()).To(Equal("example.org"))
 
-	// An empty domain is what a real implementation answers for a provider it
-	// has not read yet.
-	source.SetTrustDomain("")
-	g.Expect(source.OwnTrustDomain(bundleSourceProvider)).To(BeEmpty())
+	source.SetTrustDomain("rotated.org", nil)
+	g.Expect(ownTrustDomain()).To(Equal("rotated.org"))
 
-	g.Expect(source.OwnTrustDomainCalls()).To(Equal(3))
+	// A canned error set alongside a domain wins over that domain.
+	source.SetTrustDomain("rotated.org", cannedErr)
+	domain, err := ownTrustDomain()
+	g.Expect(err).To(MatchError(cannedErr))
+	g.Expect(domain).To(BeEmpty())
+
+	// Clearing the error puts the domain back in charge.
+	source.SetTrustDomain("rotated.org", nil)
+	g.Expect(ownTrustDomain()).To(Equal("rotated.org"))
+
+	g.Expect(source.OwnTrustDomainCalls()).To(Equal(4))
 }
 
-func TestBundleSourceSetAuthorities_CalledWhileLive_ReplacesLookupTableAndError(t *testing.T) {
+func TestBundleSourceSetJWTSource_CalledWhileLive_ReplacesSourceAndError(t *testing.T) {
 	g := NewWithT(t)
 
-	cannedErr := errors.New("authority unavailable")
-	own := AuthorityKey{TrustDomain: "example.org", KeyID: "own-kid"}
-	// rotated stands in for a key id that only appears after a bundle refresh.
-	rotated := AuthorityKey{TrustDomain: "example.org", KeyID: "rotated-kid"}
-	source := &BundleSource{Authorities: map[AuthorityKey]crypto.PublicKey{own: bundleSourceOwnKey}}
+	cannedErr := errors.New("bundle unavailable")
+	// rotated stands in for the bundle a refresh brings in once own-kid retires.
+	rotated := jwtbundle.FromJWTAuthorities(bundleSourceOwnDomain, map[string]crypto.PublicKey{"rotated-kid": bundleSourceRotatedKey})
+	source := &BundleSource{JWTSourceResult: bundleSourceOwnBundle()}
 
-	got, err := source.JWTAuthority(bundleSourceProvider, rotated.TrustDomain, rotated.KeyID)
-	g.Expect(err).To(MatchError(ErrAuthorityNotFound))
-	g.Expect(got).To(BeNil())
-
-	source.SetAuthorities(map[AuthorityKey]crypto.PublicKey{rotated: bundleSourceFederatedKey}, nil)
-
-	got, err = source.JWTAuthority(bundleSourceProvider, rotated.TrustDomain, rotated.KeyID)
+	before, err := source.JWTSource(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(got).To(Equal(bundleSourceFederatedKey))
 
-	// The table is replaced rather than merged, so the key the old one held is
-	// gone with it.
-	got, err = source.JWTAuthority(bundleSourceProvider, own.TrustDomain, own.KeyID)
-	g.Expect(err).To(MatchError(ErrAuthorityNotFound))
-	g.Expect(got).To(BeNil())
+	source.SetJWTSource(rotated, nil)
+	after, err := source.JWTSource(context.Background(), bundleSourceWorkload)
+	g.Expect(err).To(Not(HaveOccurred()))
+	g.Expect(bundleSourceAuthorities(after, bundleSourceOwnDomain)).To(Equal(map[string]crypto.PublicKey{"rotated-kid": bundleSourceRotatedKey}))
 
-	// A canned error set alongside a table wins over that table.
-	source.SetAuthorities(map[AuthorityKey]crypto.PublicKey{rotated: bundleSourceFederatedKey}, cannedErr)
-	got, err = source.JWTAuthority(bundleSourceProvider, rotated.TrustDomain, rotated.KeyID)
+	// The source handed out before the swap still holds what it held.
+	g.Expect(bundleSourceAuthorities(before, bundleSourceOwnDomain)).To(Equal(map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey}))
+
+	source.SetJWTSource(rotated, cannedErr)
+	got, err := source.JWTSource(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(MatchError(cannedErr))
 	g.Expect(got).To(BeNil())
 
-	// Clearing the canned error puts the table back in charge.
-	source.SetAuthorities(map[AuthorityKey]crypto.PublicKey{rotated: bundleSourceFederatedKey}, nil)
-	got, err = source.JWTAuthority(bundleSourceProvider, rotated.TrustDomain, rotated.KeyID)
+	source.SetJWTSource(nil, nil)
+	got, err = source.JWTSource(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(got).To(Equal(bundleSourceFederatedKey))
+	g.Expect(got).To(BeNil())
 
-	g.Expect(source.JWTAuthorityCalls()).To(Equal(5))
-	g.Expect(source.AuthorityRequests()).To(Equal([]AuthorityKey{rotated, rotated, own, rotated, rotated}))
+	g.Expect(source.JWTSourceCalls()).To(Equal(4))
 }
 
 func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t *testing.T) {
@@ -587,12 +690,15 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 		{
 			name: "SetTrustDomain against OwnTrustDomain",
 			set: func(s *BundleSource, i int) {
-				s.SetTrustDomain(fmt.Sprintf("domain-%d.org", i))
+				s.SetTrustDomain(fmt.Sprintf("domain-%d.org", i), nil)
 			},
 			read: func(s *BundleSource) error {
 				// Every value the writers set, and the value the fake started
 				// with, is one a reader may legitimately see.
-				switch domain := s.OwnTrustDomain(bundleSourceProvider); {
+				domain, err := s.OwnTrustDomain(context.Background(), bundleSourceWorkload)
+				switch {
+				case err != nil:
+					return err
 				case domain == "example.org", strings.HasPrefix(domain, "domain-"):
 					return nil
 				default:
@@ -602,26 +708,27 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 			calls: func(s *BundleSource) int { return s.OwnTrustDomainCalls() },
 		},
 		{
-			name: "SetAuthorities against JWTAuthority",
+			name: "SetJWTSource against JWTSource",
 			set: func(s *BundleSource, i int) {
-				// Every table the writers set keeps own-kid, so the reader below
-				// must resolve it whichever table it lands on.
-				s.SetAuthorities(map[AuthorityKey]crypto.PublicKey{
-					{TrustDomain: "example.org", KeyID: fmt.Sprintf("kid-%d", i)}: bundleSourceFederatedKey,
-					{TrustDomain: "example.org", KeyID: "own-kid"}:                bundleSourceOwnKey,
-				}, nil)
+				// Every set the writers install keeps own-kid, so the reader below
+				// must resolve it whichever set it lands on.
+				s.SetJWTSource(jwtbundle.NewSet(jwtbundle.FromJWTAuthorities(bundleSourceOwnDomain, map[string]crypto.PublicKey{
+					fmt.Sprintf("kid-%d", i): bundleSourceFederatedKey,
+					"own-kid":                bundleSourceOwnKey,
+				})), nil)
 			},
 			read: func(s *BundleSource) error {
-				authority, err := s.JWTAuthority(bundleSourceProvider, "example.org", "own-kid")
+				source, err := s.JWTSource(context.Background(), bundleSourceWorkload)
 				if err != nil {
 					return err
 				}
+				authority := bundleSourceAuthorities(source, bundleSourceOwnDomain)["own-kid"]
 				if got, ok := authority.(ed25519.PublicKey); !ok || !got.Equal(bundleSourceOwnKey) {
-					return fmt.Errorf("JWTAuthority returned %v, want the own key", authority)
+					return fmt.Errorf("JWTSource resolved own-kid to %v, want the own key", authority)
 				}
 				return nil
 			},
-			calls: func(s *BundleSource) int { return s.JWTAuthorityCalls() },
+			calls: func(s *BundleSource) int { return s.JWTSourceCalls() },
 		},
 		{
 			name: "SetLease against Lease",
@@ -634,7 +741,7 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 			},
 			read: func(s *BundleSource) error {
 				// A reader sees either a lease or the canned error, never a mix.
-				release, err := s.Lease(context.Background(), bundleSourceProvider)
+				release, err := s.Lease(context.Background(), bundleSourceWorkload)
 				switch {
 				case err == nil && release != nil:
 					release()
@@ -654,10 +761,8 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 			g := NewWithT(t)
 
 			source := &BundleSource{
-				TrustDomain: "example.org",
-				Authorities: map[AuthorityKey]crypto.PublicKey{
-					{TrustDomain: "example.org", KeyID: "own-kid"}: bundleSourceOwnKey,
-				},
+				TrustDomain:     "example.org",
+				JWTSourceResult: bundleSourceSet(),
 			}
 
 			// Each reader owns one slot, so collecting results needs no lock of
@@ -690,119 +795,83 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 				g.Expect(err).To(Not(HaveOccurred()))
 			}
 			g.Expect(tc.calls(source)).To(Equal(readers * iterations))
-			g.Expect(source.ProviderRequests()).To(HaveLen(readers * iterations))
+			g.Expect(source.WorkloadRequests()).To(HaveLen(readers * iterations))
 			g.Expect(source.LiveLeases()).To(Equal(0))
 		})
 	}
 }
 
-func TestBundleSourceX509Bundles_GateBlocked_ReturnsCannedBundlesAfterRelease(t *testing.T) {
-	g := NewWithT(t)
-
-	expected := map[string][][]byte{"example.org": {[]byte("own-authority-der")}}
-	source := &BundleSource{X509: map[string][][]byte{"example.org": {[]byte("own-authority-der")}}}
-	source.Block()
-
-	ctx, cancel := context.WithTimeout(context.Background(), bundleSourceTestTimeout)
-	t.Cleanup(cancel)
-
-	done := make(chan bundleSourceX509Result, 1)
-	go func() {
-		bundles, err := source.X509Bundles(ctx, bundleSourceProvider)
-		done <- bundleSourceX509Result{bundles: bundles, err: err}
-	}()
-
-	g.Expect(source.WaitForBlocked(ctx, 1)).To(Succeed())
-	g.Expect(source.Blocked()).To(Equal(1))
-	g.Expect(done).To(Not(Receive()))
-	g.Expect(source.X509BundlesCalls()).To(Equal(0))
-	g.Expect(source.ProviderRequests()).To(BeEmpty())
-
-	source.Release()
-
-	var got bundleSourceX509Result
-	select {
-	case got = <-done:
-	case <-ctx.Done():
-		t.Fatalf("X509Bundles did not return after Release: %v", ctx.Err())
+func TestBundleSourceGatedMethods_GateBlocked_ParkUntilReleasedThenAnswer(t *testing.T) {
+	expected := map[string]any{
+		"OwnTrustDomain": "example.org",
+		"X509Bundles":    map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		"JWTBundles":     map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
 	}
 
-	g.Expect(got.err).To(Not(HaveOccurred()))
-	g.Expect(got.bundles).To(Equal(expected))
-	g.Expect(source.X509BundlesCalls()).To(Equal(1))
-	g.Expect(source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
-	g.Expect(source.Blocked()).To(Equal(0))
-}
-
-func TestBundleSourceJWTBundles_GateBlocked_ReturnsCannedBundlesAfterRelease(t *testing.T) {
-	g := NewWithT(t)
-
-	expected := map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)}
-	source := &BundleSource{JWT: map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)}}
-	source.Block()
-
-	ctx, cancel := context.WithTimeout(context.Background(), bundleSourceTestTimeout)
-	t.Cleanup(cancel)
-
-	done := make(chan bundleSourceJWTResult, 1)
-	go func() {
-		bundles, err := source.JWTBundles(ctx, bundleSourceProvider)
-		done <- bundleSourceJWTResult{bundles: bundles, err: err}
-	}()
-
-	g.Expect(source.WaitForBlocked(ctx, 1)).To(Succeed())
-	g.Expect(source.Blocked()).To(Equal(1))
-	g.Expect(done).To(Not(Receive()))
-	g.Expect(source.JWTBundlesCalls()).To(Equal(0))
-	g.Expect(source.ProviderRequests()).To(BeEmpty())
-
-	source.Release()
-
-	var got bundleSourceJWTResult
-	select {
-	case got = <-done:
-	case <-ctx.Done():
-		t.Fatalf("JWTBundles did not return after Release: %v", ctx.Err())
-	}
-
-	g.Expect(got.err).To(Not(HaveOccurred()))
-	g.Expect(got.bundles).To(Equal(expected))
-	g.Expect(source.JWTBundlesCalls()).To(Equal(1))
-	g.Expect(source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
-	g.Expect(source.Blocked()).To(Equal(0))
-}
-
-func TestBundleSourceBundles_ParkedCallContextCancelled_ReturnsContextError(t *testing.T) {
-	testCases := []struct {
-		name  string
-		call  func(ctx context.Context, s *BundleSource) (bool, error)
-		calls func(s *BundleSource) int
-	}{
-		{
-			name: "x509 bundles",
-			call: func(ctx context.Context, s *BundleSource) (bool, error) {
-				bundles, err := s.X509Bundles(ctx, bundleSourceProvider)
-				return bundles == nil, err
-			},
-			calls: func(s *BundleSource) int { return s.X509BundlesCalls() },
-		},
-		{
-			name: "jwt bundles",
-			call: func(ctx context.Context, s *BundleSource) (bool, error) {
-				bundles, err := s.JWTBundles(ctx, bundleSourceProvider)
-				return bundles == nil, err
-			},
-			calls: func(s *BundleSource) int { return s.JWTBundlesCalls() },
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, method := range bundleSourceGatedMethods {
+		t.Run(method.name, func(t *testing.T) {
 			g := NewWithT(t)
 
 			source := &BundleSource{
-				X509: map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
-				JWT:  map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
+				TrustDomain:     "example.org",
+				X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+				JWT:             map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
+				JWTSourceResult: bundleSourceOwnBundle(),
+			}
+			source.Block()
+
+			ctx, cancel := context.WithTimeout(context.Background(), bundleSourceTestTimeout)
+			t.Cleanup(cancel)
+
+			type result struct {
+				value any
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				value, err := method.call(ctx, source, bundleSourceWorkload)
+				done <- result{value: value, err: err}
+			}()
+
+			g.Expect(source.WaitForBlocked(ctx, 1)).To(Succeed())
+			g.Expect(source.Blocked()).To(Equal(1))
+			g.Expect(done).To(Not(Receive()))
+			g.Expect(method.calls(source)).To(Equal(0))
+			g.Expect(source.WorkloadRequests()).To(BeEmpty())
+
+			source.Release()
+
+			var got result
+			select {
+			case got = <-done:
+			case <-ctx.Done():
+				t.Fatalf("%s did not return after Release: %v", method.name, ctx.Err())
+			}
+
+			g.Expect(got.err).To(Not(HaveOccurred()))
+			if want, ok := expected[method.name]; ok {
+				g.Expect(got.value).To(Equal(want))
+			} else {
+				g.Expect(bundleSourceAuthorities(got.value.(jwtbundle.Source), bundleSourceOwnDomain)).
+					To(Equal(map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey}))
+			}
+			bundleSourceExpectOnlyCalls(g, source, method.name, 1)
+			g.Expect(source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload}))
+			g.Expect(source.Blocked()).To(Equal(0))
+		})
+	}
+}
+
+func TestBundleSourceGatedMethods_ParkedCallContextCancelled_ReturnContextError(t *testing.T) {
+	for _, method := range bundleSourceGatedMethods {
+		t.Run(method.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			source := &BundleSource{
+				TrustDomain:     "example.org",
+				X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+				JWT:             map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
+				JWTSourceResult: bundleSourceOwnBundle(),
 			}
 			source.Block()
 
@@ -812,13 +881,13 @@ func TestBundleSourceBundles_ParkedCallContextCancelled_ReturnsContextError(t *t
 			t.Cleanup(cancelCall)
 
 			type result struct {
-				nilBundles bool
-				err        error
+				value any
+				err   error
 			}
 			done := make(chan result, 1)
 			go func() {
-				nilBundles, err := tc.call(callCtx, source)
-				done <- result{nilBundles: nilBundles, err: err}
+				value, err := method.call(callCtx, source, bundleSourceWorkload)
+				done <- result{value: value, err: err}
 			}()
 
 			g.Expect(source.WaitForBlocked(waitCtx, 1)).To(Succeed())
@@ -828,216 +897,167 @@ func TestBundleSourceBundles_ParkedCallContextCancelled_ReturnsContextError(t *t
 			select {
 			case got = <-done:
 			case <-waitCtx.Done():
-				t.Fatalf("the call did not return after its context was cancelled: %v", waitCtx.Err())
+				t.Fatalf("%s did not return after its context was cancelled: %v", method.name, waitCtx.Err())
 			}
 
 			g.Expect(got.err).To(MatchError(context.Canceled))
-			g.Expect(got.nilBundles).To(BeTrue())
-			g.Expect(tc.calls(source)).To(Equal(0))
-			g.Expect(source.ProviderRequests()).To(BeEmpty())
+			g.Expect(got.value).To(BeZero())
+			g.Expect(method.calls(source)).To(Equal(0))
+			g.Expect(source.WorkloadRequests()).To(BeEmpty())
 			g.Expect(source.Blocked()).To(Equal(0))
 		})
 	}
 }
 
-func TestBundleSourceGateBlocked_MethodsWithoutContext_DoNotPark(t *testing.T) {
+func TestBundleSourceGatedMethods_ContextAlreadyDone_ReturnContextErrorWithoutParking(t *testing.T) {
 	g := NewWithT(t)
 
 	source := &BundleSource{
-		TrustDomain: "example.org",
-		Authorities: map[AuthorityKey]crypto.PublicKey{
-			{TrustDomain: "example.org", KeyID: "own-kid"}: bundleSourceOwnKey,
-		},
+		TrustDomain:     "example.org",
+		X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		JWT:             map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
+		JWTSourceResult: bundleSourceOwnBundle(),
 	}
 	source.Block()
 	t.Cleanup(source.Release)
 
-	type result struct {
-		trustDomain string
-		authority   crypto.PublicKey
-		err         error
-	}
-	done := make(chan result, 1)
-	go func() {
-		trustDomain := source.OwnTrustDomain(bundleSourceProvider)
-		authority, err := source.JWTAuthority(bundleSourceOtherProvider, "example.org", "own-kid")
-		done <- result{trustDomain: trustDomain, authority: authority, err: err}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), bundleSourceTestTimeout)
-	t.Cleanup(cancel)
-
-	var got result
-	select {
-	case got = <-done:
-	case <-ctx.Done():
-		t.Fatalf("OwnTrustDomain or JWTAuthority parked at a closed gate: %v", ctx.Err())
-	}
-
-	g.Expect(got.err).To(Not(HaveOccurred()))
-	g.Expect(got.trustDomain).To(Equal("example.org"))
-	g.Expect(got.authority).To(Equal(bundleSourceOwnKey))
-	g.Expect(source.Blocked()).To(Equal(0))
-	g.Expect(source.OwnTrustDomainCalls()).To(Equal(1))
-	g.Expect(source.JWTAuthorityCalls()).To(Equal(1))
-	g.Expect(source.AuthorityRequests()).To(Equal([]AuthorityKey{{TrustDomain: "example.org", KeyID: "own-kid"}}))
-	g.Expect(source.ProviderRequests()).To(Equal([]string{bundleSourceProvider, bundleSourceOtherProvider}))
-}
-
-func TestBundleSourceBundles_ContextAlreadyDone_ReturnContextErrorWithoutParking(t *testing.T) {
-	g := NewWithT(t)
-
-	source := &BundleSource{
-		X509: map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
-		JWT:  map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
-	}
-	source.Block()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	x509Bundles, err := source.X509Bundles(ctx, bundleSourceProvider)
-	g.Expect(err).To(MatchError(context.Canceled))
-	g.Expect(x509Bundles).To(BeNil())
-
-	jwtBundles, err := source.JWTBundles(ctx, bundleSourceProvider)
-	g.Expect(err).To(MatchError(context.Canceled))
-	g.Expect(jwtBundles).To(BeNil())
-
-	g.Expect(source.X509BundlesCalls()).To(Equal(0))
-	g.Expect(source.JWTBundlesCalls()).To(Equal(0))
-	g.Expect(source.ProviderRequests()).To(BeEmpty())
+	for _, method := range bundleSourceGatedMethods {
+		value, err := method.call(ctx, source, bundleSourceWorkload)
+		g.Expect(err).To(MatchError(context.Canceled), method.name)
+		g.Expect(value).To(BeZero(), method.name)
+		g.Expect(method.calls(source)).To(Equal(0), method.name)
+	}
+	g.Expect(source.WorkloadRequests()).To(BeEmpty())
 	g.Expect(source.Blocked()).To(Equal(0))
 }
 
-func TestBundleSourceCannedValues_DifferentProviders_AllGetTheSameAnswer(t *testing.T) {
+func TestBundleSourceCannedValues_DifferentWorkloads_AllGetTheSameAnswer(t *testing.T) {
 	g := NewWithT(t)
 
 	source := &BundleSource{
-		TrustDomain: "example.org",
-		X509:        map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
-		JWT:         map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
-		Authorities: map[AuthorityKey]crypto.PublicKey{
-			{TrustDomain: "example.org", KeyID: "own-kid"}: bundleSourceOwnKey,
-		},
+		TrustDomain:     "example.org",
+		X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		JWT:             map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
+		JWTSourceResult: bundleSourceSet(),
 	}
 
-	// The empty ARN is answered like any other. The fake does not model the
-	// ErrNotEnrolled a real implementation returns for it; a test that needs that
-	// error sets LeaseErr or a func.
-	providers := []string{bundleSourceProvider, bundleSourceOtherProvider, ""}
-	var expectedRequests []string
-	for _, providerArn := range providers {
-		g.Expect(source.OwnTrustDomain(providerArn)).To(Equal("example.org"), "provider %q", providerArn)
+	// A nil workload is answered like any other. The fake does not model the
+	// ErrUnattestable or ErrNotEnrolled a real implementation returns; a test
+	// that needs either sets a canned error or a func.
+	workloads := []*workloadidentity.Workload{bundleSourceWorkload, bundleSourceOtherWorkload, nil}
+	var expectedRequests []*workloadidentity.Workload
+	for _, w := range workloads {
+		domain, err := source.OwnTrustDomain(context.Background(), w)
+		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
+		g.Expect(domain).To(Equal("example.org"), "workload %v", w)
 
-		x509Bundles, err := source.X509Bundles(context.Background(), providerArn)
-		g.Expect(err).To(Not(HaveOccurred()), "provider %q", providerArn)
-		g.Expect(x509Bundles).To(Equal(source.X509), "provider %q", providerArn)
+		x509Bundles, err := source.X509Bundles(context.Background(), w)
+		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
+		g.Expect(x509Bundles).To(Equal(source.X509), "workload %v", w)
 
-		jwtBundles, err := source.JWTBundles(context.Background(), providerArn)
-		g.Expect(err).To(Not(HaveOccurred()), "provider %q", providerArn)
-		g.Expect(jwtBundles).To(Equal(source.JWT), "provider %q", providerArn)
+		jwtBundles, err := source.JWTBundles(context.Background(), w)
+		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
+		g.Expect(jwtBundles).To(Equal(source.JWT), "workload %v", w)
 
-		authority, err := source.JWTAuthority(providerArn, "example.org", "own-kid")
-		g.Expect(err).To(Not(HaveOccurred()), "provider %q", providerArn)
-		g.Expect(authority).To(Equal(bundleSourceOwnKey), "provider %q", providerArn)
+		jwtSource, err := source.JWTSource(context.Background(), w)
+		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
+		g.Expect(bundleSourceAuthorities(jwtSource, bundleSourceOwnDomain)).
+			To(Equal(map[string]crypto.PublicKey{"own-kid": bundleSourceOwnKey}), "workload %v", w)
 
-		release, err := source.Lease(context.Background(), providerArn)
-		g.Expect(err).To(Not(HaveOccurred()), "provider %q", providerArn)
-		g.Expect(release).To(Not(BeNil()), "provider %q", providerArn)
+		release, err := source.Lease(context.Background(), w)
+		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
+		g.Expect(release).To(Not(BeNil()), "workload %v", w)
 		release()
 
-		expectedRequests = append(expectedRequests, providerArn, providerArn, providerArn, providerArn, providerArn)
+		expectedRequests = append(expectedRequests, w, w, w, w, w)
 	}
 
-	g.Expect(source.ProviderRequests()).To(Equal(expectedRequests))
-	g.Expect(source.LeaseCalls()).To(Equal(len(providers)))
-	g.Expect(source.Released()).To(Equal(len(providers)))
+	g.Expect(source.WorkloadRequests()).To(Equal(expectedRequests))
+	g.Expect(source.LeaseCalls()).To(Equal(len(workloads)))
+	g.Expect(source.Released()).To(Equal(len(workloads)))
 	g.Expect(source.LiveLeases()).To(Equal(0))
 }
 
-func TestBundleSourceFuncs_Set_ReceiveTheProviderEachCallNames(t *testing.T) {
-	// keysByProvider gives AuthorityFunc an answer only the named provider gets.
-	keysByProvider := map[string]crypto.PublicKey{
-		bundleSourceProvider:      bundleSourceOwnKey,
-		bundleSourceOtherProvider: bundleSourceFederatedKey,
+func TestBundleSourceFuncs_Set_ReceiveTheCallersCtxAndWorkload(t *testing.T) {
+	// sourceFor gives JWTSourceFunc an answer only the named workload gets.
+	sourceFor := func(w *workloadidentity.Workload) jwtbundle.Source {
+		return jwtbundle.FromJWTAuthorities(bundleSourceOwnDomain, map[string]crypto.PublicKey{w.PodUID: bundleSourceOwnKey})
 	}
 
 	testCases := []struct {
 		name string
 		// install sets the func under test on s. The func reports what it saw
-		// through record, reading ProviderRequests from inside itself, and
-		// answers with something only the provider it was handed gets.
+		// through record, reading WorkloadRequests from inside itself, and
+		// answers with something only the workload it was handed gets.
 		install func(s *BundleSource, record func(bundleSourceFuncCall))
-		// call makes one call naming providerArn.
-		call func(ctx context.Context, s *BundleSource, providerArn string) (any, error)
-		// expected is the answer install's func gives providerArn.
-		expected func(providerArn string) any
-		// ctxValue, trustDomain and keyID are what the func must have seen
-		// besides the provider.
-		ctxValue    any
-		trustDomain string
-		keyID       string
+		// call makes one call passing w.
+		call func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error)
+		// expected is the answer install's func gives w.
+		expected func(w *workloadidentity.Workload) any
 	}{
 		{
 			name: "X509Func",
 			install: func(s *BundleSource, record func(bundleSourceFuncCall)) {
-				s.X509Func = func(ctx context.Context, providerArn string) (map[string][][]byte, error) {
+				s.X509Func = func(ctx context.Context, w *workloadidentity.Workload) (map[string][][]byte, error) {
 					record(bundleSourceFuncCall{
 						ctxValue:         ctx.Value(bundleSourceCtxKey{}),
-						providerArn:      providerArn,
-						providerRequests: s.ProviderRequests(),
+						workload:         w,
+						workloadRequests: s.WorkloadRequests(),
 					})
-					return map[string][][]byte{"example.org": {[]byte(providerArn)}}, nil
+					return map[string][][]byte{"example.org": {[]byte(w.PodUID)}}, nil
 				}
 			},
-			call: func(ctx context.Context, s *BundleSource, providerArn string) (any, error) {
-				return s.X509Bundles(ctx, providerArn)
+			call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+				return s.X509Bundles(ctx, w)
 			},
-			expected: func(providerArn string) any {
-				return map[string][][]byte{"example.org": {[]byte(providerArn)}}
+			expected: func(w *workloadidentity.Workload) any {
+				return map[string][][]byte{"example.org": {[]byte(w.PodUID)}}
 			},
-			ctxValue: "the caller's ctx",
 		},
 		{
 			name: "JWTFunc",
 			install: func(s *BundleSource, record func(bundleSourceFuncCall)) {
-				s.JWTFunc = func(ctx context.Context, providerArn string) (map[string][]byte, error) {
+				s.JWTFunc = func(ctx context.Context, w *workloadidentity.Workload) (map[string][]byte, error) {
 					record(bundleSourceFuncCall{
 						ctxValue:         ctx.Value(bundleSourceCtxKey{}),
-						providerArn:      providerArn,
-						providerRequests: s.ProviderRequests(),
+						workload:         w,
+						workloadRequests: s.WorkloadRequests(),
 					})
-					return map[string][]byte{"example.org": []byte(providerArn)}, nil
+					return map[string][]byte{"example.org": []byte(w.PodUID)}, nil
 				}
 			},
-			call: func(ctx context.Context, s *BundleSource, providerArn string) (any, error) {
-				return s.JWTBundles(ctx, providerArn)
+			call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+				return s.JWTBundles(ctx, w)
 			},
-			expected: func(providerArn string) any {
-				return map[string][]byte{"example.org": []byte(providerArn)}
+			expected: func(w *workloadidentity.Workload) any {
+				return map[string][]byte{"example.org": []byte(w.PodUID)}
 			},
-			ctxValue: "the caller's ctx",
 		},
 		{
-			name: "AuthorityFunc",
+			name: "JWTSourceFunc",
 			install: func(s *BundleSource, record func(bundleSourceFuncCall)) {
-				s.AuthorityFunc = func(providerArn, trustDomain, keyID string) (crypto.PublicKey, error) {
+				s.JWTSourceFunc = func(ctx context.Context, w *workloadidentity.Workload) (jwtbundle.Source, error) {
 					record(bundleSourceFuncCall{
-						providerArn:      providerArn,
-						trustDomain:      trustDomain,
-						keyID:            keyID,
-						providerRequests: s.ProviderRequests(),
+						ctxValue:         ctx.Value(bundleSourceCtxKey{}),
+						workload:         w,
+						workloadRequests: s.WorkloadRequests(),
 					})
-					return keysByProvider[providerArn], nil
+					return sourceFor(w), nil
 				}
 			},
-			call: func(_ context.Context, s *BundleSource, providerArn string) (any, error) {
-				return s.JWTAuthority(providerArn, "example.org", "own-kid")
+			call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
+				source, err := s.JWTSource(ctx, w)
+				if err != nil {
+					return nil, err
+				}
+				return bundleSourceAuthorities(source, bundleSourceOwnDomain), nil
 			},
-			expected:    func(providerArn string) any { return keysByProvider[providerArn] },
-			trustDomain: "example.org",
-			keyID:       "own-kid",
+			expected: func(w *workloadidentity.Workload) any {
+				return bundleSourceAuthorities(sourceFor(w), bundleSourceOwnDomain)
+			},
 		},
 	}
 
@@ -1050,141 +1070,134 @@ func TestBundleSourceFuncs_Set_ReceiveTheProviderEachCallNames(t *testing.T) {
 			var seen []bundleSourceFuncCall
 			tc.install(source, func(c bundleSourceFuncCall) { seen = append(seen, c) })
 
-			first, err := tc.call(ctx, source, bundleSourceProvider)
+			first, err := tc.call(ctx, source, bundleSourceWorkload)
 			g.Expect(err).To(Not(HaveOccurred()))
-			g.Expect(first).To(Equal(tc.expected(bundleSourceProvider)))
+			g.Expect(first).To(Equal(tc.expected(bundleSourceWorkload)))
 
-			second, err := tc.call(ctx, source, bundleSourceOtherProvider)
+			second, err := tc.call(ctx, source, bundleSourceOtherWorkload)
 			g.Expect(err).To(Not(HaveOccurred()))
-			g.Expect(second).To(Equal(tc.expected(bundleSourceOtherProvider)))
+			g.Expect(second).To(Equal(tc.expected(bundleSourceOtherWorkload)))
 
-			// Each call's provider is recorded before its func runs, and reading
+			// Each call's workload is recorded before its func runs, and reading
 			// the record from inside the func does not deadlock because the fake
 			// does not hold its lock across the callback.
 			g.Expect(seen).To(Equal([]bundleSourceFuncCall{
 				{
-					ctxValue:         tc.ctxValue,
-					providerArn:      bundleSourceProvider,
-					trustDomain:      tc.trustDomain,
-					keyID:            tc.keyID,
-					providerRequests: []string{bundleSourceProvider},
+					ctxValue:         "the caller's ctx",
+					workload:         bundleSourceWorkload,
+					workloadRequests: []*workloadidentity.Workload{bundleSourceWorkload},
 				},
 				{
-					ctxValue:         tc.ctxValue,
-					providerArn:      bundleSourceOtherProvider,
-					trustDomain:      tc.trustDomain,
-					keyID:            tc.keyID,
-					providerRequests: []string{bundleSourceProvider, bundleSourceOtherProvider},
+					ctxValue:         "the caller's ctx",
+					workload:         bundleSourceOtherWorkload,
+					workloadRequests: []*workloadidentity.Workload{bundleSourceWorkload, bundleSourceOtherWorkload},
 				},
 			}))
-			g.Expect(source.ProviderRequests()).To(Equal([]string{bundleSourceProvider, bundleSourceOtherProvider}))
+			g.Expect(seen[0].workload).To(BeIdenticalTo(bundleSourceWorkload))
+			g.Expect(seen[1].workload).To(BeIdenticalTo(bundleSourceOtherWorkload))
 		})
 	}
 }
 
-func TestBundleSourceProviderRequests_CallsAcrossMethods_RecordsEveryCountedCallInOrder(t *testing.T) {
+func TestBundleSourceWorkloadRequests_CallsAcrossMethods_RecordsEveryCountedCallInOrder(t *testing.T) {
 	g := NewWithT(t)
 
-	// provider names each call distinctly, so the record shows which call landed
-	// where.
-	provider := func(name string) string {
-		return "arn:aws:iam::111122223333:workload-identity-provider/" + name
-	}
+	// Each call passes a workload of its own, so the record shows which call
+	// landed where.
+	a, b, c, d, e, f, h := bundleSourceNamedWorkload("a"), bundleSourceNamedWorkload("b"),
+		bundleSourceNamedWorkload("c"), bundleSourceNamedWorkload("d"), bundleSourceNamedWorkload("e"),
+		bundleSourceNamedWorkload("f"), bundleSourceNamedWorkload("h")
+	turnedAway := bundleSourceNamedWorkload("turned-away")
 	x509Err := errors.New("x509 bundle unavailable")
+	jwtSourceErr := errors.New("jwt source unavailable")
 	leaseErr := errors.New("lease refused")
 	source := &BundleSource{
-		TrustDomain: "example.org",
-		X509Err:     x509Err,
-		JWT:         map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
-		Authorities: map[AuthorityKey]crypto.PublicKey{
-			{TrustDomain: "example.org", KeyID: "own-kid"}: bundleSourceOwnKey,
-		},
+		TrustDomain:  "example.org",
+		X509Err:      x509Err,
+		JWT:          map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
+		JWTSourceErr: jwtSourceErr,
 	}
 	doneCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	g.Expect(source.OwnTrustDomain(provider("a"))).To(Equal("example.org"))
+	_, err := source.OwnTrustDomain(context.Background(), a)
+	g.Expect(err).To(Not(HaveOccurred()))
 
-	// A canned error is still a counted call, so its provider is recorded.
-	_, err := source.X509Bundles(context.Background(), provider("b"))
+	// A canned error is still a counted call, so its workload is recorded.
+	_, err = source.X509Bundles(context.Background(), b)
 	g.Expect(err).To(MatchError(x509Err))
+	_, err = source.JWTSource(context.Background(), c)
+	g.Expect(err).To(MatchError(jwtSourceErr))
 
-	// So is a lookup miss.
-	_, err = source.JWTAuthority(provider("c"), "unknown.org", "missing-kid")
-	g.Expect(err).To(MatchError(ErrAuthorityNotFound))
-
-	_, err = source.JWTBundles(context.Background(), provider("d"))
+	_, err = source.JWTBundles(context.Background(), d)
 	g.Expect(err).To(Not(HaveOccurred()))
 
 	// A lease is recorded when it is taken; releasing it records nothing.
-	release, err := source.Lease(context.Background(), provider("e"))
+	release, err := source.Lease(context.Background(), e)
 	g.Expect(err).To(Not(HaveOccurred()))
 
-	// The empty ARN is recorded as it was passed, so a handler test can catch a
-	// session whose provider was never filled in.
-	g.Expect(source.OwnTrustDomain("")).To(Equal("example.org"))
+	// A nil workload is recorded as passed, so a handler test can catch a call
+	// made before attestation finished.
+	_, err = source.OwnTrustDomain(context.Background(), nil)
+	g.Expect(err).To(Not(HaveOccurred()))
 
 	// Calls turned away by their ctx are not counted, so they are not recorded.
-	_, err = source.X509Bundles(doneCtx, provider("turned-away-x509"))
-	g.Expect(err).To(MatchError(context.Canceled))
-	_, err = source.JWTBundles(doneCtx, provider("turned-away-jwt"))
-	g.Expect(err).To(MatchError(context.Canceled))
+	for _, method := range bundleSourceGatedMethods {
+		_, err = method.call(doneCtx, source, turnedAway)
+		g.Expect(err).To(MatchError(context.Canceled), method.name)
+	}
 
 	// Lease does not go through the Gate, so a done ctx does not turn it away.
-	_, err = source.Lease(doneCtx, provider("f"))
+	_, err = source.Lease(doneCtx, f)
 	g.Expect(err).To(Not(HaveOccurred()))
 
 	// A canned lease error is still a counted call.
 	source.SetLease(leaseErr)
-	_, err = source.Lease(context.Background(), provider("g"))
+	_, err = source.Lease(context.Background(), h)
 	g.Expect(err).To(MatchError(leaseErr))
 	release()
 
-	// A provider named again is recorded again.
-	_, err = source.JWTAuthority(provider("a"), "example.org", "own-kid")
+	// A workload passed again is recorded again.
+	_, err = source.JWTBundles(context.Background(), a)
 	g.Expect(err).To(Not(HaveOccurred()))
 
-	g.Expect(source.ProviderRequests()).To(Equal([]string{
-		provider("a"),
-		provider("b"),
-		provider("c"),
-		provider("d"),
-		provider("e"),
-		"",
-		provider("f"),
-		provider("g"),
-		provider("a"),
-	}))
+	expected := []*workloadidentity.Workload{a, b, c, d, e, nil, f, h, a}
+	recorded := source.WorkloadRequests()
+	g.Expect(recorded).To(Equal(expected))
+	// The record holds the pointers as passed, not copies of them.
+	for i := range expected {
+		g.Expect(recorded[i]).To(BeIdenticalTo(expected[i]), "request %d", i)
+	}
 	g.Expect(source.OwnTrustDomainCalls()).To(Equal(2))
 	g.Expect(source.X509BundlesCalls()).To(Equal(1))
-	g.Expect(source.JWTBundlesCalls()).To(Equal(1))
-	g.Expect(source.JWTAuthorityCalls()).To(Equal(2))
+	g.Expect(source.JWTBundlesCalls()).To(Equal(2))
+	g.Expect(source.JWTSourceCalls()).To(Equal(1))
 	g.Expect(source.LeaseCalls()).To(Equal(3))
 }
 
-func TestBundleSourceProviderRequests_ReturnedSliceMutated_RecordIsUnaffected(t *testing.T) {
+func TestBundleSourceWorkloadRequests_ReturnedSliceMutated_RecordIsUnaffected(t *testing.T) {
 	g := NewWithT(t)
 
 	source := &BundleSource{}
-	source.OwnTrustDomain(bundleSourceProvider)
-	source.OwnTrustDomain(bundleSourceOtherProvider)
+	_, _ = source.OwnTrustDomain(context.Background(), bundleSourceWorkload)
+	_, _ = source.OwnTrustDomain(context.Background(), bundleSourceOtherWorkload)
 
-	recorded := source.ProviderRequests()
-	recorded[0] = "rewritten"
-	g.Expect(source.ProviderRequests()).To(Equal([]string{bundleSourceProvider, bundleSourceOtherProvider}))
+	recorded := source.WorkloadRequests()
+	recorded[0] = nil
+	g.Expect(source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload, bundleSourceOtherWorkload}))
 
 	// A copy taken before a later call does not grow with the record.
-	snapshot := source.ProviderRequests()
-	source.OwnTrustDomain(bundleSourceProvider)
-	g.Expect(snapshot).To(Equal([]string{bundleSourceProvider, bundleSourceOtherProvider}))
-	g.Expect(source.ProviderRequests()).To(Equal([]string{
-		bundleSourceProvider,
-		bundleSourceOtherProvider,
-		bundleSourceProvider,
+	snapshot := source.WorkloadRequests()
+	_, _ = source.OwnTrustDomain(context.Background(), bundleSourceWorkload)
+	g.Expect(snapshot).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload, bundleSourceOtherWorkload}))
+	g.Expect(source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{
+		bundleSourceWorkload,
+		bundleSourceOtherWorkload,
+		bundleSourceWorkload,
 	}))
 }
 
-func TestBundleSourceProviderRequests_ConcurrentCallersAndReaders_RecordEveryCallInEachCallersOrder(t *testing.T) {
+func TestBundleSourceWorkloadRequests_ConcurrentCallersAndReaders_RecordEveryCallInEachCallersOrder(t *testing.T) {
 	g := NewWithT(t)
 
 	const (
@@ -1195,27 +1208,26 @@ func TestBundleSourceProviderRequests_ConcurrentCallersAndReaders_RecordEveryCal
 	)
 
 	source := &BundleSource{
-		TrustDomain: "example.org",
-		X509:        map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
-		JWT:         map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
-		Authorities: map[AuthorityKey]crypto.PublicKey{
-			{TrustDomain: "example.org", KeyID: "own-kid"}: bundleSourceOwnKey,
-		},
+		TrustDomain:     "example.org",
+		X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		JWT:             map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
+		JWTSourceResult: bundleSourceSet(),
 	}
 
-	// Every call names a provider no other call names, so the final record
+	// Every call passes a workload no other call passes, so the final record
 	// shows both that each call landed exactly once and where.
-	provider := func(caller, iteration int, method string) string {
-		return fmt.Sprintf("arn:aws:iam::111122223333:workload-identity-provider/caller-%d-%d-%s", caller, iteration, method)
-	}
-	methods := []string{"own", "x509", "jwt", "authority", "lease"}
-	expectedPerCaller := make([][]string, callers)
-	callerOf := make(map[string]int, callers*iterations*len(methods))
+	methods := []string{"own", "x509", "jwt", "source", "lease"}
+	workloads := make([][][]*workloadidentity.Workload, callers)
+	expectedPerCaller := make([][]*workloadidentity.Workload, callers)
+	callerOf := make(map[*workloadidentity.Workload]int, callers*iterations*len(methods))
 	for c := 0; c < callers; c++ {
+		workloads[c] = make([][]*workloadidentity.Workload, iterations)
 		for i := 0; i < iterations; i++ {
 			for _, method := range methods {
-				expectedPerCaller[c] = append(expectedPerCaller[c], provider(c, i, method))
-				callerOf[provider(c, i, method)] = c
+				w := bundleSourceNamedWorkload(fmt.Sprintf("caller-%d-%d-%s", c, i, method))
+				workloads[c][i] = append(workloads[c][i], w)
+				expectedPerCaller[c] = append(expectedPerCaller[c], w)
+				callerOf[w] = c
 			}
 		}
 	}
@@ -1223,27 +1235,32 @@ func TestBundleSourceProviderRequests_ConcurrentCallersAndReaders_RecordEveryCal
 	// Each goroutine owns one slot, so collecting results needs no lock of its
 	// own and cannot mask a race inside the fake.
 	callErrs := make([]error, callers)
-	snapshots := make([][][]string, readers)
+	snapshots := make([][][]*workloadidentity.Workload, readers)
 	var wg sync.WaitGroup
 	for c := 0; c < callers; c++ {
 		wg.Add(1)
 		go func(c int) {
 			defer wg.Done()
+			ctx := context.Background()
 			for i := 0; i < iterations; i++ {
-				source.OwnTrustDomain(provider(c, i, "own"))
-				if _, err := source.X509Bundles(context.Background(), provider(c, i, "x509")); err != nil {
+				ws := workloads[c][i]
+				if _, err := source.OwnTrustDomain(ctx, ws[0]); err != nil {
 					callErrs[c] = err
 					return
 				}
-				if _, err := source.JWTBundles(context.Background(), provider(c, i, "jwt")); err != nil {
+				if _, err := source.X509Bundles(ctx, ws[1]); err != nil {
 					callErrs[c] = err
 					return
 				}
-				if _, err := source.JWTAuthority(provider(c, i, "authority"), "example.org", "own-kid"); err != nil {
+				if _, err := source.JWTBundles(ctx, ws[2]); err != nil {
 					callErrs[c] = err
 					return
 				}
-				release, err := source.Lease(context.Background(), provider(c, i, "lease"))
+				if _, err := source.JWTSource(ctx, ws[3]); err != nil {
+					callErrs[c] = err
+					return
+				}
+				release, err := source.Lease(ctx, ws[4])
 				if err != nil {
 					callErrs[c] = err
 					return
@@ -1257,7 +1274,7 @@ func TestBundleSourceProviderRequests_ConcurrentCallersAndReaders_RecordEveryCal
 		go func(r int) {
 			defer wg.Done()
 			for i := 0; i < reads; i++ {
-				snapshots[r] = append(snapshots[r], source.ProviderRequests())
+				snapshots[r] = append(snapshots[r], source.WorkloadRequests())
 			}
 		}(r)
 	}
@@ -1267,7 +1284,7 @@ func TestBundleSourceProviderRequests_ConcurrentCallersAndReaders_RecordEveryCal
 		g.Expect(err).To(Not(HaveOccurred()))
 	}
 
-	recorded := source.ProviderRequests()
+	recorded := source.WorkloadRequests()
 	g.Expect(recorded).To(HaveLen(callers * iterations * len(methods)))
 
 	// The record only grows at its end, so every copy a reader took mid-run is a
@@ -1283,21 +1300,24 @@ func TestBundleSourceProviderRequests_ConcurrentCallersAndReaders_RecordEveryCal
 	}
 
 	// Whatever the interleaving across callers, each caller's own calls appear
-	// in the order it made them.
-	gotPerCaller := make([][]string, callers)
-	for _, providerArn := range recorded {
-		c, ok := callerOf[providerArn]
-		if !g.Expect(ok).To(BeTrue(), "recorded provider %q was never passed", providerArn) {
+	// in the order it made them. callerOf is keyed by pointer, so this also
+	// shows the record holds the pointers as passed.
+	gotPerCaller := make([][]*workloadidentity.Workload, callers)
+	for _, w := range recorded {
+		c, ok := callerOf[w]
+		if !g.Expect(ok).To(BeTrue(), "recorded workload %v was never passed", w) {
 			continue
 		}
-		gotPerCaller[c] = append(gotPerCaller[c], providerArn)
+		gotPerCaller[c] = append(gotPerCaller[c], w)
 	}
-	g.Expect(gotPerCaller).To(Equal(expectedPerCaller))
+	for c := range gotPerCaller {
+		g.Expect(slices.Equal(gotPerCaller[c], expectedPerCaller[c])).To(BeTrue(), "caller %d's calls are out of order", c)
+	}
 
 	g.Expect(source.OwnTrustDomainCalls()).To(Equal(callers * iterations))
 	g.Expect(source.X509BundlesCalls()).To(Equal(callers * iterations))
 	g.Expect(source.JWTBundlesCalls()).To(Equal(callers * iterations))
-	g.Expect(source.JWTAuthorityCalls()).To(Equal(callers * iterations))
+	g.Expect(source.JWTSourceCalls()).To(Equal(callers * iterations))
 	g.Expect(source.LeaseCalls()).To(Equal(callers * iterations))
 	g.Expect(source.LiveLeases()).To(Equal(0))
 }
@@ -1315,6 +1335,7 @@ func bundleSourceBookedLeases(s *BundleSource) func() int {
 
 func TestBundleSourceLease_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 	cannedErr := errors.New("lease refused")
+	funcLease := func(_ context.Context, _ *workloadidentity.Workload) (func(), error) { return func() {}, nil }
 
 	testCases := []struct {
 		name        string
@@ -1335,14 +1356,11 @@ func TestBundleSourceLease_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 		},
 		{
 			name:   "func alone is returned as is and its lease goes untracked",
-			source: &BundleSource{LeaseFunc: func(_ context.Context, _ string) (func(), error) { return func() {}, nil }},
+			source: &BundleSource{LeaseFunc: funcLease},
 		},
 		{
-			name: "func wins over the canned error and its lease goes untracked",
-			source: &BundleSource{
-				LeaseErr:  cannedErr,
-				LeaseFunc: func(_ context.Context, _ string) (func(), error) { return func() {}, nil },
-			},
+			name:   "func wins over the canned error and its lease goes untracked",
+			source: &BundleSource{LeaseErr: cannedErr, LeaseFunc: funcLease},
 		},
 	}
 
@@ -1350,7 +1368,7 @@ func TestBundleSourceLease_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			release, err := tc.source.Lease(context.Background(), bundleSourceProvider)
+			release, err := tc.source.Lease(context.Background(), bundleSourceWorkload)
 
 			if tc.expectedErr != nil {
 				g.Expect(err).To(MatchError(tc.expectedErr))
@@ -1359,15 +1377,11 @@ func TestBundleSourceLease_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 				g.Expect(err).To(Not(HaveOccurred()))
 				g.Expect(release).To(Not(BeNil()))
 			}
-			g.Expect(tc.source.LeaseCalls()).To(Equal(1))
+			bundleSourceExpectOnlyCalls(g, tc.source, "Lease", 1)
 			g.Expect(tc.source.LiveLeases()).To(Equal(tc.expectedLive))
 			g.Expect(tc.source.Released()).To(Equal(0))
 			g.Expect(tc.source.ReleaseCalls()).To(Equal(0))
-			g.Expect(tc.source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
-			g.Expect(tc.source.OwnTrustDomainCalls()).To(Equal(0))
-			g.Expect(tc.source.X509BundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTBundlesCalls()).To(Equal(0))
-			g.Expect(tc.source.JWTAuthorityCalls()).To(Equal(0))
+			g.Expect(tc.source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload}))
 			g.Expect(tc.source.Blocked()).To(Equal(0))
 		})
 	}
@@ -1376,36 +1390,36 @@ func TestBundleSourceLease_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 func TestBundleSourceLease_FuncSet_SeesItsCallCountedAndIsReturnedAsIs(t *testing.T) {
 	g := NewWithT(t)
 
-	// notEnrolled stands in for the ErrNotEnrolled a real implementation returns
-	// for the empty ARN, which is how a test that needs it sets it up.
-	notEnrolled := errors.New("not enrolled")
+	// unattestable stands in for the ErrUnattestable a real implementation
+	// returns for a nil workload, which is how a test that needs it sets it up.
+	unattestable := errors.New("unattestable")
 	type funcCall struct {
 		ctxValue         any
-		providerArn      string
+		workload         *workloadidentity.Workload
 		leaseCalls       int
-		providerRequests []string
+		workloadRequests []*workloadidentity.Workload
 	}
 	var seen []funcCall
 	funcReleases := 0
 
 	source := &BundleSource{LeaseErr: errors.New("canned lease error")}
-	source.LeaseFunc = func(ctx context.Context, providerArn string) (func(), error) {
+	source.LeaseFunc = func(ctx context.Context, w *workloadidentity.Workload) (func(), error) {
 		// Reading the fake from inside the func does not deadlock, because the
 		// fake does not hold its lock across the callback.
 		seen = append(seen, funcCall{
 			ctxValue:         ctx.Value(bundleSourceCtxKey{}),
-			providerArn:      providerArn,
+			workload:         w,
 			leaseCalls:       source.LeaseCalls(),
-			providerRequests: source.ProviderRequests(),
+			workloadRequests: source.WorkloadRequests(),
 		})
-		if providerArn == "" {
-			return nil, notEnrolled
+		if w == nil {
+			return nil, unattestable
 		}
 		return func() { funcReleases++ }, nil
 	}
 	ctx := context.WithValue(context.Background(), bundleSourceCtxKey{}, "the caller's ctx")
 
-	release, err := source.Lease(ctx, bundleSourceProvider)
+	release, err := source.Lease(ctx, bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(release).To(Not(BeNil()))
 
@@ -1415,24 +1429,25 @@ func TestBundleSourceLease_FuncSet_SeesItsCallCountedAndIsReturnedAsIs(t *testin
 	release()
 	g.Expect(funcReleases).To(Equal(2))
 
-	release, err = source.Lease(ctx, "")
-	g.Expect(err).To(MatchError(notEnrolled))
+	release, err = source.Lease(ctx, nil)
+	g.Expect(err).To(MatchError(unattestable))
 	g.Expect(release).To(BeNil())
 
 	g.Expect(seen).To(Equal([]funcCall{
 		{
 			ctxValue:         "the caller's ctx",
-			providerArn:      bundleSourceProvider,
+			workload:         bundleSourceWorkload,
 			leaseCalls:       1,
-			providerRequests: []string{bundleSourceProvider},
+			workloadRequests: []*workloadidentity.Workload{bundleSourceWorkload},
 		},
 		{
 			ctxValue:         "the caller's ctx",
-			providerArn:      "",
+			workload:         nil,
 			leaseCalls:       2,
-			providerRequests: []string{bundleSourceProvider, ""},
+			workloadRequests: []*workloadidentity.Workload{bundleSourceWorkload, nil},
 		},
 	}))
+	g.Expect(seen[0].workload).To(BeIdenticalTo(bundleSourceWorkload))
 	g.Expect(source.LeaseCalls()).To(Equal(2))
 	g.Expect(source.LiveLeases()).To(Equal(0))
 	g.Expect(source.Released()).To(Equal(0))
@@ -1513,9 +1528,9 @@ func TestBundleSourceLease_ReleasedByFuncOrCtx_ReleasesOnceByWhicheverComesFirst
 			source := &BundleSource{}
 			// bystander is a second lease that nothing below ends, so ending one
 			// lease is shown not to end the other.
-			bystander, err := source.Lease(context.Background(), bundleSourceOtherProvider)
+			bystander, err := source.Lease(context.Background(), bundleSourceOtherWorkload)
 			g.Expect(err).To(Not(HaveOccurred()))
-			release, err := source.Lease(ctx, bundleSourceProvider)
+			release, err := source.Lease(ctx, bundleSourceWorkload)
 			g.Expect(err).To(Not(HaveOccurred()))
 			g.Expect(source.LiveLeases()).To(Equal(2))
 			g.Expect(source.Released()).To(Equal(0))
@@ -1556,11 +1571,11 @@ func TestBundleSourceLease_CtxAlreadyDone_HandsOutALeaseThatIsNeverLive(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	release, err := source.Lease(ctx, bundleSourceProvider)
+	release, err := source.Lease(ctx, bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(release).To(Not(BeNil()))
 	g.Expect(source.LeaseCalls()).To(Equal(1))
-	g.Expect(source.ProviderRequests()).To(Equal([]string{bundleSourceProvider}))
+	g.Expect(source.WorkloadRequests()).To(Equal([]*workloadidentity.Workload{bundleSourceWorkload}))
 	g.Expect(source.LiveLeases()).To(Equal(0))
 	g.Expect(source.Released()).To(Equal(1))
 
@@ -1588,7 +1603,7 @@ func TestBundleSourceLease_GateBlocked_DoesNotPark(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		release, err := source.Lease(ctx, bundleSourceProvider)
+		release, err := source.Lease(ctx, bundleSourceWorkload)
 		done <- result{release: release, err: err}
 	}()
 
@@ -1615,11 +1630,11 @@ func TestBundleSourceSetLease_CalledWhileLive_ChangesLaterLeasesOnly(t *testing.
 	cannedErr := errors.New("lease refused")
 	source := &BundleSource{}
 
-	first, err := source.Lease(context.Background(), bundleSourceProvider)
+	first, err := source.Lease(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 
 	source.SetLease(cannedErr)
-	refused, err := source.Lease(context.Background(), bundleSourceProvider)
+	refused, err := source.Lease(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(MatchError(cannedErr))
 	g.Expect(refused).To(BeNil())
 
@@ -1630,7 +1645,7 @@ func TestBundleSourceSetLease_CalledWhileLive_ChangesLaterLeasesOnly(t *testing.
 
 	// Clearing the error puts canned leases back.
 	source.SetLease(nil)
-	third, err := source.Lease(context.Background(), bundleSourceProvider)
+	third, err := source.Lease(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(source.LiveLeases()).To(Equal(1))
 	third()
@@ -1672,7 +1687,7 @@ func TestBundleSourceLease_ConcurrentLeasesAndReleases_CountEveryLeaseOnce(t *te
 			defer wg.Done()
 			for i := 0; i < perHolder; i++ {
 				ctx, cancel := context.WithCancel(context.Background())
-				release, err := source.Lease(ctx, bundleSourceProvider)
+				release, err := source.Lease(ctx, bundleSourceWorkload)
 				if err != nil {
 					cancel()
 					leaseErrs[h] = err
@@ -1749,7 +1764,7 @@ func TestBundleSourceLease_ConcurrentLeasesAndReleases_CountEveryLeaseOnce(t *te
 	g.Expect(source.ReleaseCalls()).To(BeNumerically(">=", byFunc))
 	g.Expect(source.ReleaseCalls()).To(BeNumerically("<=", byFunc+byBoth))
 	g.Eventually(bundleSourceBookedLeases(source), bundleSourceTestTimeout).Should(BeZero())
-	g.Expect(source.ProviderRequests()).To(HaveLen(total))
+	g.Expect(source.WorkloadRequests()).To(HaveLen(total))
 
 	for h := range heldBy {
 		for _, lease := range heldBy[h] {
@@ -1760,10 +1775,12 @@ func TestBundleSourceLease_ConcurrentLeasesAndReleases_CountEveryLeaseOnce(t *te
 
 func TestBundleSourceLease_FuncLease_EndingNeverCountsAsARelease(t *testing.T) {
 	g := NewWithT(t)
-	source := &BundleSource{LeaseFunc: func(_ context.Context, _ string) (func(), error) { return func() {}, nil }}
+	source := &BundleSource{LeaseFunc: func(_ context.Context, _ *workloadidentity.Workload) (func(), error) {
+		return func() {}, nil
+	}}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	release, err := source.Lease(ctx, bundleSourceProvider)
+	release, err := source.Lease(ctx, bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	cancel()
 	release()

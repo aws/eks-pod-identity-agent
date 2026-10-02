@@ -2,15 +2,18 @@ package bundle
 
 import (
 	"context"
+	"crypto"
 	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/smithy-go"
 	. "github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
@@ -25,6 +28,13 @@ func newTestSource(t *testing.T, fetcher Fetcher) (*providerSource, *fake.Subscr
 	t.Helper()
 	notifier := &fake.Subscriber{}
 	return newProviderSource(testProviderArn, Opts{Fetcher: fetcher, Notifier: notifier}), notifier
+}
+
+// notifications is how many times each authority set's change was published.
+type notifications struct{ x509, jwt int }
+
+func notified(n *fake.Subscriber) notifications {
+	return notifications{x509: n.CertBundleCalls(), jwt: n.JWTBundleCalls()}
 }
 
 // served decodes what JWTBundles returned for one domain.
@@ -49,9 +59,9 @@ func TestSource_Fetch_ReturnsAuthoritiesKeyedByTrustDomain(t *testing.T) {
 	)}
 	source, _ := newTestSource(t, fetcher)
 
-	x509Bundles, err := source.X509Bundles(context.Background())
+	x509Bundles, err := source.X509Bundles(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
-	jwtBundles, err := source.JWTBundles(context.Background())
+	jwtBundles, err := source.JWTBundles(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	// every entry passes through under its own domain, and neither domain's
@@ -60,9 +70,37 @@ func TestSource_Fetch_ReturnsAuthoritiesKeyedByTrustDomain(t *testing.T) {
 	g.Expect(jwtBundles).To(HaveLen(2))
 	g.Expect(served(t, jwtBundles[testDomain])).To(ConsistOf(HaveKeyWithValue("kid", "own-1")))
 	g.Expect(served(t, jwtBundles[peerDomain])).To(ConsistOf(HaveKeyWithValue("kid", "peer-1")))
-	g.Expect(source.OwnTrustDomain()).To(Equal(testDomain), "the first entry is the provider's own domain")
-	_, err = source.JWTAuthority(peerDomain, "own-1")
-	g.Expect(err).To(MatchError(wierrors.ErrUnknownKeyID))
+	g.Expect(ownDomain(t, source)).To(Equal(testDomain), "the first entry is the provider's own domain")
+	g.Expect(jwtAuthority(t, source, peerDomain, "own-1")).To(BeNil(), "neither domain's keys answer for the other")
+}
+
+// ownDomain reads the source's own trust domain, failing the test on an error.
+func ownDomain(t *testing.T, source *providerSource) string {
+	t.Helper()
+	domain, err := source.OwnTrustDomain(context.Background(), signTest)
+	if err != nil {
+		t.Fatalf("OwnTrustDomain: %v", err)
+	}
+	return domain
+}
+
+// jwtAuthority looks a key up through the source's JWTSource, nil when the domain
+// or the key is unknown.
+func jwtAuthority(t *testing.T, source *providerSource, trustDomain, keyID string) crypto.PublicKey {
+	t.Helper()
+	jwt, err := source.JWTSource(context.Background(), signTest)
+	if err != nil {
+		t.Fatalf("JWTSource: %v", err)
+	}
+	bundle, err := jwt.GetJWTBundleForTrustDomain(spiffeid.RequireTrustDomainFromString(trustDomain))
+	if err != nil {
+		return nil
+	}
+	key, ok := bundle.FindJWTAuthority(keyID)
+	if !ok {
+		return nil
+	}
+	return key
 }
 
 func TestSource_OneFetch_BacksAllFourMethods(t *testing.T) {
@@ -75,28 +113,15 @@ func TestSource_OneFetch_BacksAllFourMethods(t *testing.T) {
 	source, _ := newTestSource(t, fetcher)
 	ctx := context.Background()
 
-	_, x509Err := source.X509Bundles(ctx)
-	_, jwtErr := source.JWTBundles(ctx)
-	_, authorityErr := source.JWTAuthority(testDomain, "k1")
-	own := source.OwnTrustDomain()
+	_, x509Err := source.X509Bundles(ctx, signTest)
+	_, jwtErr := source.JWTBundles(ctx, signTest)
+	_, sourceErr := source.JWTSource(ctx, signTest)
+	own, ownErr := source.OwnTrustDomain(ctx, signTest)
 
-	g.Expect(x509Err).ToNot(HaveOccurred())
-	g.Expect(jwtErr).ToNot(HaveOccurred())
-	g.Expect(authorityErr).ToNot(HaveOccurred())
+	g.Expect([]error{x509Err, jwtErr, sourceErr, ownErr}).To(HaveEach(BeNil()))
 	g.Expect(own).To(Equal(testDomain))
 	g.Expect(fetcher.Calls()).To(Equal(1))
-}
-
-func TestSource_ContextFreeMethods_NeverFetch(t *testing.T) {
-	g := NewWithT(t)
-	fetcher := &fakeFetcher{respond: fixed()}
-	source, _ := newTestSource(t, fetcher)
-
-	g.Expect(source.OwnTrustDomain()).To(BeEmpty())
-	_, err := source.JWTAuthority(testDomain, "k1")
-
-	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
-	g.Expect(fetcher.Calls()).To(BeZero())
+	g.Expect(fetcher.creds).To(Equal([]aws.Credentials{testCreds}), "the fetch is signed with the reader's credentials")
 }
 
 func TestSource_DocumentWithBothKinds_RoutesEachKeyByUse(t *testing.T) {
@@ -109,11 +134,11 @@ func TestSource_DocumentWithBothKinds_RoutesEachKeyByUse(t *testing.T) {
 	source, _ := newTestSource(t, &fakeFetcher{respond: fixed(sts.TrustBundle{TrustDomain: testDomain, Bundle: doc})})
 	ctx := context.Background()
 
-	x509Bundles, err := source.X509Bundles(ctx)
+	x509Bundles, err := source.X509Bundles(ctx, signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(x509Bundles[testDomain]).To(Equal([][]byte{ca.der}), "the x509-svid key's x5c, decoded to DER")
 
-	jwtBundles, err := source.JWTBundles(ctx)
+	jwtBundles, err := source.JWTBundles(ctx, signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 	keys := served(t, jwtBundles[testDomain])
 	g.Expect(keys).To(HaveLen(2), "only jwt-svid keys are served as JWT authorities")
@@ -125,52 +150,30 @@ func TestSource_DocumentWithBothKinds_RoutesEachKeyByUse(t *testing.T) {
 	}
 	g.Expect(string(jwtBundles[testDomain])).ToNot(ContainSubstring("spiffe_refresh_hint"))
 
-	ecAuthority, err := source.JWTAuthority(testDomain, "ec-1")
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(ecKey.PublicKey.Equal(ecAuthority)).To(BeTrue())
-	rsaAuthority, err := source.JWTAuthority(testDomain, "rsa-1")
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(rsaKey.PublicKey.Equal(rsaAuthority)).To(BeTrue())
-	_, err = source.JWTAuthority(testDomain, "wit-1")
-	g.Expect(err).To(MatchError(wierrors.ErrUnknownKeyID), "a key with an unknown use is ignored")
+	g.Expect(ecKey.PublicKey.Equal(jwtAuthority(t, source, testDomain, "ec-1"))).To(BeTrue())
+	g.Expect(rsaKey.PublicKey.Equal(jwtAuthority(t, source, testDomain, "rsa-1"))).To(BeTrue())
+	g.Expect(jwtAuthority(t, source, testDomain, "wit-1")).To(BeNil(), "a key with an unknown use is ignored")
 
 	// the hint is kept for the refresh loop and is not on the interface
 	g.Expect(source.current.Load().refreshHint).To(Equal(300 * time.Second))
 	g.Expect(source.refreshInterval()).To(Equal(300 * time.Second))
 }
 
-func TestSource_JWTAuthority_UnknownDomainAndUnknownKeyID_AreDistinguishable(t *testing.T) {
-	g := NewWithT(t)
-	source, _ := newTestSource(t, &fakeFetcher{respond: fixed(sts.TrustBundle{
-		TrustDomain: testDomain,
-		Bundle:      bundleDoc(t, 0, jwtECKey(t, "k1", newECKey(t))),
-	})})
-	_, err := source.JWTBundles(context.Background())
-	g.Expect(err).ToNot(HaveOccurred())
-
-	_, unknownDomain := source.JWTAuthority("other.example.org", "k1")
-	_, unknownKey := source.JWTAuthority(testDomain, "k2")
-
-	g.Expect(unknownDomain).To(MatchError(wierrors.ErrUnknownTrustDomain))
-	g.Expect(errors.Is(unknownDomain, wierrors.ErrUnknownKeyID)).To(BeFalse())
-	g.Expect(unknownKey).To(MatchError(wierrors.ErrUnknownKeyID))
-	g.Expect(errors.Is(unknownKey, wierrors.ErrUnknownTrustDomain)).To(BeFalse())
-	g.Expect(wierrors.MetricLabel(unknownDomain)).ToNot(Equal(wierrors.MetricLabel(unknownKey)))
-}
-
-func TestSource_JWTAuthority_DomainWithOnlyX509Authorities_IsAnUnknownJWTDomain(t *testing.T) {
+func TestSource_JWTSource_DomainWithOnlyX509Authorities_IsUnknownToIt(t *testing.T) {
 	g := NewWithT(t)
 	source, _ := newTestSource(t, &fakeFetcher{respond: fixed(
 		sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, jwtECKey(t, "k1", newECKey(t)))},
 		sts.TrustBundle{TrustDomain: peerDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "peer")))},
 	)})
-	jwtBundles, err := source.JWTBundles(context.Background())
+	jwtBundles, err := source.JWTBundles(context.Background(), signTest)
+	g.Expect(err).ToNot(HaveOccurred())
+	jwt, err := source.JWTSource(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 
-	_, err = source.JWTAuthority(peerDomain, "k1")
+	_, err = jwt.GetJWTBundleForTrustDomain(spiffeid.RequireTrustDomainFromString(peerDomain))
 
 	g.Expect(jwtBundles).ToNot(HaveKey(peerDomain))
-	g.Expect(err).To(MatchError(wierrors.ErrUnknownTrustDomain), "JWTAuthority and JWTBundles agree on which JWT domains exist")
+	g.Expect(err).To(HaveOccurred(), "JWTSource and JWTBundles agree on which JWT domains exist")
 }
 
 func TestSource_Refresh_ReorderedOrReformattedAuthorities_DoNotSignal(t *testing.T) {
@@ -186,46 +189,50 @@ func TestSource_Refresh_ReorderedOrReformattedAuthorities_DoNotSignal(t *testing
 	changesBefore := testutil.ToFloat64(promBundleChangeTotal)
 
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
-	servedBefore, _ := source.JWTBundles(ctx)
-	x509Before, _ := source.X509Bundles(ctx)
+	servedBefore, _ := source.JWTBundles(ctx, signTest)
+	x509Before, _ := source.X509Bundles(ctx, signTest)
 	g.Expect(x509Before[testDomain]).To(Equal(sortedDER(caA.der, caB.der)), "every authority is served, not only the newest")
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
-	x509After, _ := source.X509Bundles(ctx)
+	x509After, _ := source.X509Bundles(ctx, signTest)
 	g.Expect(x509After[testDomain]).To(Equal(x509Before[testDomain]), "an unchanged set keeps serving the bytes it already served")
 
 	g.Expect(fetcher.Calls()).To(Equal(3))
-	g.Expect(notifier.BroadcastCalls()).To(BeZero())
+	g.Expect(notified(notifier)).To(Equal(notifications{}))
 	g.Expect(testutil.ToFloat64(promBundleChangeTotal)).To(Equal(changesBefore))
-	servedAfter, _ := source.JWTBundles(ctx)
+	servedAfter, _ := source.JWTBundles(ctx, signTest)
 	g.Expect(servedAfter).To(Equal(servedBefore), "the JWT set is unchanged")
 	g.Expect(source.refreshInterval()).To(Equal(120*time.Second), "the hint still follows the latest document")
 }
 
-func TestSource_Refresh_ChangedAuthorities_SignalExactlyOnce(t *testing.T) {
+func TestSource_Refresh_ChangedAuthorities_NotifyEachChangedSetOnce(t *testing.T) {
 	ca := newAuthority(t, "ca")
 	k1 := jwtECKey(t, "k1", newECKey(t))
 	base := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), k1)}
 
-	for name, changed := range map[string]sts.TrustBundle{
-		"a jwt-svid key added":   {TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), k1, jwtECKey(t, "k2", newECKey(t)))},
-		"a jwt-svid key rotated": {TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), jwtECKey(t, "k1", newECKey(t)))},
-		"an x509-svid key added": {TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), x509Key(t, newAuthority(t, "next")), k1)},
-		"an x509-svid key gone":  {TrustDomain: testDomain, Bundle: bundleDoc(t, 0, k1)},
+	for name, tc := range map[string]struct {
+		changed sts.TrustBundle
+		want    notifications
+	}{
+		"a jwt-svid key added":   {sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), k1, jwtECKey(t, "k2", newECKey(t)))}, notifications{jwt: 1}},
+		"a jwt-svid key rotated": {sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), jwtECKey(t, "k1", newECKey(t)))}, notifications{jwt: 1}},
+		"an x509-svid key added": {sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca), x509Key(t, newAuthority(t, "next")), k1)}, notifications{x509: 1}},
+		"an x509-svid key gone":  {sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, k1)}, notifications{x509: 1}},
+		"both sets rotated":      {sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "next")), jwtECKey(t, "k2", newECKey(t)))}, notifications{x509: 1, jwt: 1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
-			fetcher := &fakeFetcher{respond: sequence(ok(base), ok(changed), ok(changed))}
+			fetcher := &fakeFetcher{respond: sequence(ok(base), ok(tc.changed), ok(tc.changed))}
 			source, notifier := newTestSource(t, fetcher)
 			ctx := context.Background()
 			changesBefore := testutil.ToFloat64(promBundleChangeTotal)
 
 			g.Expect(refreshOnce(source, ctx)).To(Succeed())
-			g.Expect(notifier.BroadcastCalls()).To(BeZero(), "the first bundle is not a change")
+			g.Expect(notified(notifier)).To(Equal(notifications{}), "the first bundle is not a change")
 			g.Expect(refreshOnce(source, ctx)).To(Succeed())
 			g.Expect(refreshOnce(source, ctx)).To(Succeed())
 
-			g.Expect(notifier.BroadcastCalls()).To(Equal(1))
+			g.Expect(notified(notifier)).To(Equal(tc.want))
 			g.Expect(testutil.ToFloat64(promBundleChangeTotal)).To(Equal(changesBefore + 1))
 		})
 	}
@@ -242,13 +249,13 @@ func TestSource_Refresh_ChangedDomainSet_Signals(t *testing.T) {
 
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
-	g.Expect(notifier.BroadcastCalls()).To(Equal(1), "a new trust domain is a change")
+	g.Expect(notified(notifier)).To(Equal(notifications{jwt: 1}), "a new trust domain with only jwt-svid keys is a JWT change")
 
 	// the same authorities with the other domain first changes which one is the
-	// workload's own, and the handlers split on that
+	// workload's own, which only the X.509 streams split on
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
-	g.Expect(notifier.BroadcastCalls()).To(Equal(2))
-	g.Expect(source.OwnTrustDomain()).To(Equal(peerDomain))
+	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}))
+	g.Expect(ownDomain(t, source)).To(Equal(peerDomain))
 }
 
 func TestSource_FailedRefresh_KeepsServingTheLastGoodBundle(t *testing.T) {
@@ -277,14 +284,12 @@ func TestSource_FailedRefresh_KeepsServingTheLastGoodBundle(t *testing.T) {
 			g.Expect(wierrors.IsRetryable(err)).To(BeTrue())
 			g.Expect(testutil.ToFloat64(promBundleFetchTotal.WithLabelValues(workloadidentity.OutcomeFailure, "bundle_unavailable"))).
 				To(Equal(failuresBefore + 1))
-			x509Bundles, err := source.X509Bundles(ctx)
+			x509Bundles, err := source.X509Bundles(ctx, signTest)
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(x509Bundles).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
-			authority, err := source.JWTAuthority(testDomain, "k1")
-			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(key.PublicKey.Equal(authority)).To(BeTrue())
-			g.Expect(source.OwnTrustDomain()).To(Equal(testDomain))
-			g.Expect(notifier.BroadcastCalls()).To(BeZero())
+			g.Expect(key.PublicKey.Equal(jwtAuthority(t, source, testDomain, "k1"))).To(BeTrue())
+			g.Expect(ownDomain(t, source)).To(Equal(testDomain))
+			g.Expect(notified(notifier)).To(Equal(notifications{}))
 			g.Expect(fetcher.Calls()).To(Equal(2), "the served value came from the cache, not a new fetch")
 		})
 	}
@@ -309,21 +314,22 @@ func TestSource_FirstReadFailure_IsAnErrorNotAnEmptyBundle(t *testing.T) {
 			clock := time.Now()
 			source.now = func() time.Time { return clock }
 
-			bundles, err := source.X509Bundles(context.Background())
+			bundles, err := source.X509Bundles(context.Background(), signTest)
 			g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
 			g.Expect(err).To(MatchError(ContainSubstring(tc.reason)))
 			g.Expect(bundles).To(BeNil())
-			g.Expect(source.OwnTrustDomain()).To(BeEmpty())
+			_, err = source.OwnTrustDomain(context.Background(), signTest)
+			g.Expect(err).To(MatchError(ContainSubstring(tc.reason)))
 
 			// inside the backoff a read gets the same failure without calling STS
-			_, err = source.JWTBundles(context.Background())
+			_, err = source.JWTBundles(context.Background(), signTest)
 			g.Expect(err).To(MatchError(ContainSubstring(tc.reason)))
 			g.Expect(fetcher.Calls()).To(Equal(1))
 
 			// nothing was cached, so once the backoff has passed a read fetches
 			// again and succeeds
 			clock = clock.Add(retryMaxDelay)
-			bundles, err = source.X509Bundles(context.Background())
+			bundles, err = source.X509Bundles(context.Background(), signTest)
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(bundles).To(HaveKey(testDomain))
 			g.Expect(fetcher.Calls()).To(Equal(2))
@@ -346,12 +352,12 @@ func TestSource_FirstReadBackoff_FollowsConsecutiveFailures(t *testing.T) {
 		160 * time.Second, 320 * time.Second, 10 * time.Minute, 10 * time.Minute,
 	} {
 		calls := fetcher.Calls()
-		_, err := source.X509Bundles(ctx)
+		_, err := source.X509Bundles(ctx, signTest)
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(fetcher.Calls()).To(Equal(calls + 1))
 
 		clock = clock.Add(wait - time.Millisecond)
-		_, err = source.X509Bundles(ctx)
+		_, err = source.X509Bundles(ctx, signTest)
 		g.Expect(err).To(HaveOccurred())
 		g.Expect(fetcher.Calls()).To(Equal(calls+1), "still inside the %s backoff", wait)
 		clock = clock.Add(time.Millisecond)
@@ -366,7 +372,7 @@ func TestSource_RefreshLoopFailure_AlsoHoldsOffFirstReads(t *testing.T) {
 	source.now = func() time.Time { return clock }
 
 	g.Expect(refreshOnce(source, context.Background())).ToNot(Succeed())
-	_, err := source.X509Bundles(context.Background())
+	_, err := source.X509Bundles(context.Background(), signTest)
 
 	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
 	g.Expect(fetcher.Calls()).To(Equal(1), "a first read inside the loop's backoff does not call STS")
@@ -388,7 +394,7 @@ func TestSource_ConcurrentFailingFirstReads_ShareOneFetch(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := source.X509Bundles(context.Background())
+			_, err := source.X509Bundles(context.Background(), signTest)
 			errs <- err
 		}()
 	}
@@ -417,13 +423,13 @@ func TestSource_SharedFirstFetch_SurvivesTheReaderThatStartedIt(t *testing.T) {
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := source.X509Bundles(firstCtx)
+		_, err := source.X509Bundles(firstCtx, signTest)
 		firstDone <- err
 	}()
 	<-fetcher.entered
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := source.JWTBundles(context.Background())
+		_, err := source.JWTBundles(context.Background(), signTest)
 		secondDone <- err
 	}()
 
@@ -445,7 +451,7 @@ func TestSource_ReaderWhoseContextIsDone_NeverFetches(t *testing.T) {
 	cancel()
 
 	for range 100 {
-		_, err := source.X509Bundles(ctx)
+		_, err := source.X509Bundles(ctx, signTest)
 		g.Expect(err).To(MatchError(context.Canceled))
 	}
 
@@ -498,7 +504,7 @@ func TestSource_ConcurrentFirstReads_ShareOneFetch(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := source.X509Bundles(context.Background())
+			_, err := source.X509Bundles(context.Background(), signTest)
 			errs <- err
 		}()
 	}
@@ -521,12 +527,12 @@ func TestSource_ReaderWaitingOnAFetch_GivesUpWithItsContext(t *testing.T) {
 		entered: make(chan struct{}, 1),
 	}
 	source, _ := newTestSource(t, fetcher)
-	go func() { _, _ = source.X509Bundles(context.Background()) }()
+	go func() { _, _ = source.X509Bundles(context.Background(), signTest) }()
 	<-fetcher.entered
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := source.JWTBundles(ctx)
+	_, err := source.JWTBundles(ctx, signTest)
 
 	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
 	g.Expect(err).To(MatchError(context.Canceled))
@@ -542,15 +548,15 @@ func TestSource_ReturnedValues_AreCopies(t *testing.T) {
 	})})
 	ctx := context.Background()
 
-	x509Bundles, _ := source.X509Bundles(ctx)
+	x509Bundles, _ := source.X509Bundles(ctx, signTest)
 	x509Bundles[testDomain][0][0] ^= 0xff
 	x509Bundles[peerDomain] = nil
-	jwtBundles, _ := source.JWTBundles(ctx)
+	jwtBundles, _ := source.JWTBundles(ctx, signTest)
 	jwtBundles[testDomain][0] = 'X'
 
-	again, _ := source.X509Bundles(ctx)
+	again, _ := source.X509Bundles(ctx, signTest)
 	g.Expect(again).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
-	jwtAgain, _ := source.JWTBundles(ctx)
+	jwtAgain, _ := source.JWTBundles(ctx, signTest)
 	g.Expect(served(t, jwtAgain[testDomain])).To(HaveLen(1))
 }
 
@@ -574,19 +580,15 @@ func TestSource_Fetch_RecordsOutcomeMetrics(t *testing.T) {
 		"one latency series per outcome")
 }
 
-func TestSource_RefreshInterval_FollowsHintWithinBoundsUnlessOverridden(t *testing.T) {
+func TestSource_RefreshInterval_FollowsTheHintWithinBounds(t *testing.T) {
 	for name, tc := range map[string]struct {
 		hintSeconds int
-		override    time.Duration
 		expected    time.Duration
 	}{
-		"hint":                       {hintSeconds: 300, expected: 300 * time.Second},
-		"no hint":                    {expected: defaultRefreshInterval},
-		"hint below the floor":       {hintSeconds: 1, expected: minRefreshInterval},
-		"hint above the ceiling":     {hintSeconds: 7 * 24 * 3600, expected: maxRefreshInterval},
-		"override wins over hint":    {hintSeconds: 300, override: 10 * time.Minute, expected: 10 * time.Minute},
-		"override below the floor":   {hintSeconds: 300, override: time.Second, expected: minRefreshInterval},
-		"override above the ceiling": {hintSeconds: 300, override: 3 * time.Hour, expected: 3 * time.Hour},
+		"hint":                   {hintSeconds: 300, expected: 300 * time.Second},
+		"no hint":                {expected: defaultRefreshInterval},
+		"hint below the floor":   {hintSeconds: 1, expected: minRefreshInterval},
+		"hint above the ceiling": {hintSeconds: 7 * 24 * 3600, expected: maxRefreshInterval},
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
@@ -595,8 +597,7 @@ func TestSource_RefreshInterval_FollowsHintWithinBoundsUnlessOverridden(t *testi
 					TrustDomain: testDomain,
 					Bundle:      bundleDoc(t, tc.hintSeconds, x509Key(t, newAuthority(t, "ca"))),
 				})},
-				Notifier:        &fake.Subscriber{},
-				RefreshInterval: tc.override,
+				Notifier: &fake.Subscriber{},
 			})
 			g.Expect(refreshOnce(source, context.Background())).To(Succeed())
 
@@ -618,15 +619,21 @@ func TestSource_RefreshInterval_TakesTheShortestHintAcrossDomains(t *testing.T) 
 }
 
 func TestSource_RefreshInterval_ADomainWithoutAHint_DoesNotShortenIt(t *testing.T) {
-	g := NewWithT(t)
-	source, _ := newTestSource(t, &fakeFetcher{respond: fixed(
-		sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "a")))},
-		sts.TrustBundle{TrustDomain: peerDomain, Bundle: bundleDoc(t, 900, x509Key(t, newAuthority(t, "b")))},
-	)})
+	hinted := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 900, x509Key(t, newAuthority(t, "a")))}
+	hintless := sts.TrustBundle{TrustDomain: peerDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "b")))}
+	for name, entries := range map[string][]sts.TrustBundle{
+		"hintless first": {hintless, hinted},
+		"hintless last":  {hinted, hintless},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			source, _ := newTestSource(t, &fakeFetcher{respond: fixed(entries...)})
 
-	g.Expect(refreshOnce(source, context.Background())).To(Succeed())
+			g.Expect(refreshOnce(source, context.Background())).To(Succeed())
 
-	g.Expect(source.refreshInterval()).To(Equal(900 * time.Second))
+			g.Expect(source.refreshInterval()).To(Equal(900 * time.Second))
+		})
+	}
 }
 
 func TestSource_Delays_AreJitteredShorterAndBackOff(t *testing.T) {
@@ -651,153 +658,13 @@ func TestSource_Delays_AreJitteredShorterAndBackOff(t *testing.T) {
 	g.Expect(source.refreshDelay()).To(BeNumerically(">=", time.Duration(float64(defaultRefreshInterval)*(1-refreshJitter))))
 }
 
-// runHarness drives Run with a fake clock: each wait the loop asks for is
-// recorded, and the test releases it, advancing the clock by that wait.
-type runHarness struct {
-	waits  chan time.Duration
-	fire   chan time.Time
-	clock  time.Time
-	mu     sync.Mutex
-	done   chan struct{}
-	cancel context.CancelFunc
-}
-
-func startRun(t *testing.T, source *providerSource) *runHarness {
-	t.Helper()
-	h := &runHarness{waits: make(chan time.Duration, 16), fire: make(chan time.Time), clock: time.Now(), done: make(chan struct{})}
-	source.jitter = func() float64 { return 0 }
-	source.now = h.now
-	source.after = func(d time.Duration) <-chan time.Time {
-		h.waits <- d
-		return h.fire
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	h.cancel = cancel
-	go func() {
-		defer close(h.done)
-		source.Run(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-h.done
-	})
-	return h
-}
-
-func (h *runHarness) now() time.Time {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.clock
-}
-
-func (h *runHarness) advance(d time.Duration) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.clock = h.clock.Add(d)
-}
-
-// release lets the loop's current wait elapse.
-func (h *runHarness) release(wait time.Duration) {
-	h.advance(wait)
-	h.fire <- h.now()
-}
-
-func TestSource_Run_FetchesAtOnceThenBacksOffAndRefreshes(t *testing.T) {
-	g := NewWithT(t)
-	ca := newAuthority(t, "ca")
-	next := newAuthority(t, "next")
-	fetcher := &fakeFetcher{respond: sequence(
-		fail(errors.New("unavailable")),
-		fail(errors.New("unavailable")),
-		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 120, x509Key(t, ca))}),
-		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 120, x509Key(t, ca), x509Key(t, next))}),
-	)}
-	source, notifier := newTestSource(t, fetcher)
-	h := startRun(t, source)
-
-	wait := <-h.waits
-	g.Expect(wait).To(BeZero(), "the first fetch is immediate")
-	h.release(wait)
-	wait = <-h.waits
-	g.Expect(wait).To(Equal(retryBaseDelay), "a failure retries on the backoff")
-	h.release(wait)
-	wait = <-h.waits
-	g.Expect(wait).To(Equal(2*retryBaseDelay), "consecutive failures back off further")
-	h.release(wait)
-	wait = <-h.waits
-	g.Expect(wait).To(Equal(120*time.Second), "a success waits for the hint")
-	g.Expect(source.OwnTrustDomain()).To(Equal(testDomain))
-	h.release(wait)
-	wait = <-h.waits
-	g.Expect(wait).To(Equal(120 * time.Second))
-	g.Expect(notifier.BroadcastCalls()).To(Equal(1))
-	x509Bundles, err := source.X509Bundles(context.Background())
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(x509Bundles[testDomain]).To(ConsistOf(ca.der, next.der), "the published authority is served beside the signing one")
-
-	h.cancel()
-	g.Eventually(h.done).Should(BeClosed())
-	g.Expect(fetcher.Calls()).To(Equal(4))
-}
-
-func TestSource_Run_WakingInsideAFirstReadsBackoff_WaitsOutTheRest(t *testing.T) {
-	g := NewWithT(t)
-	fetcher := &fakeFetcher{respond: fixed()}
-	source, _ := newTestSource(t, fetcher)
-	h := startRun(t, source)
-
-	h.release(<-h.waits)
-	g.Expect(<-h.waits).To(Equal(retryBaseDelay))
-	g.Expect(fetcher.Calls()).To(Equal(1))
-
-	// a first read fetches as soon as the loop's backoff ends, fails, and moves
-	// the schedule on before the loop's own timer fires
-	h.advance(retryBaseDelay)
-	_, err := source.X509Bundles(context.Background())
-	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
-	g.Expect(fetcher.Calls()).To(Equal(2))
-
-	// the loop wakes inside the backoff that read started, and waits out the
-	// rest of it rather than making a second call back to back
-	h.fire <- h.now()
-	g.Expect(<-h.waits).To(Equal(2 * retryBaseDelay))
-	g.Expect(fetcher.Calls()).To(Equal(2))
-}
-
-func TestSource_Run_ItsOwnCancellation_IsNotServedToALiveReader(t *testing.T) {
-	g := NewWithT(t)
-	fetcher := &fakeFetcher{
-		respond: sequence(
-			fail(errors.New("unreachable")),
-			ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}),
-		),
-		gate:    make(chan struct{}),
-		entered: make(chan struct{}, 2),
-	}
-	source, _ := newTestSource(t, fetcher)
-	h := startRun(t, source)
-	h.release(<-h.waits)
-	<-fetcher.entered
-
-	// the loop stops while its first fetch is in flight
-	h.cancel()
-	g.Eventually(h.done).Should(BeClosed())
-	close(fetcher.gate)
-
-	bundles, err := source.X509Bundles(context.Background())
-
-	g.Expect(err).ToNot(HaveOccurred(), "a live reader fetches for itself rather than being handed the loop's cancellation")
-	g.Expect(bundles).To(HaveKey(testDomain))
-	g.Expect(fetcher.Calls()).To(Equal(2))
-}
-
 func TestSource_Fetch_IsBoundedByTheFetchTimeout(t *testing.T) {
 	g := NewWithT(t)
 	fetcher := &fakeFetcher{respond: fixed(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))})}
 	source, _ := newTestSource(t, fetcher)
 
 	before := time.Now()
-	_, err := source.X509Bundles(context.Background())
+	_, err := source.X509Bundles(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(refreshOnce(source, context.Background())).To(Succeed())
 
@@ -819,13 +686,13 @@ func TestSource_ReaderCancelledWhileWaiting_GivesUp(t *testing.T) {
 		entered: make(chan struct{}, 1),
 	}
 	source, _ := newTestSource(t, fetcher)
-	go func() { _, _ = source.X509Bundles(context.Background()) }()
+	go func() { _, _ = source.X509Bundles(context.Background(), signTest) }()
 	<-fetcher.entered
 
 	ctx, cancel := context.WithCancel(context.Background())
 	waiting := make(chan error, 1)
 	go func() {
-		_, err := source.JWTBundles(ctx)
+		_, err := source.JWTBundles(ctx, signTest)
 		waiting <- err
 	}()
 	g.Consistently(waiting, 50*time.Millisecond).ShouldNot(Receive(), "the reader is queued behind the fetch in flight")
@@ -842,9 +709,9 @@ func TestSource_X509Bundles_OmitsADomainWithNoX509Authority(t *testing.T) {
 		sts.TrustBundle{TrustDomain: peerDomain, Bundle: bundleDoc(t, 0, jwtECKey(t, "k1", newECKey(t)))},
 	)})
 
-	x509Bundles, err := source.X509Bundles(context.Background())
+	x509Bundles, err := source.X509Bundles(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
-	jwtBundles, err := source.JWTBundles(context.Background())
+	jwtBundles, err := source.JWTBundles(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(x509Bundles).To(HaveKey(testDomain))
@@ -853,15 +720,147 @@ func TestSource_X509Bundles_OmitsADomainWithNoX509Authority(t *testing.T) {
 	g.Expect(jwtBundles).ToNot(HaveKey(testDomain))
 }
 
-func TestSource_Run_WaitsTheJitteredInterval(t *testing.T) {
+func TestSource_DueAt_FollowsTheIntervalAfterASuccessAndTheBackoffAfterAFailure(t *testing.T) {
 	g := NewWithT(t)
-	source, _ := newTestSource(t, &fakeFetcher{respond: fixed(sts.TrustBundle{
-		TrustDomain: testDomain, Bundle: bundleDoc(t, 300, x509Key(t, newAuthority(t, "ca"))),
-	})})
-	h := startRun(t, source)
-	source.jitter = func() float64 { return 0.5 }
+	fetcher := &fakeFetcher{respond: sequence(
+		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 120, x509Key(t, newAuthority(t, "ca")))}),
+		fail(errors.New("unavailable")),
+		fail(errors.New("unavailable")),
+		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 120, x509Key(t, newAuthority(t, "ca")))}),
+		fail(errors.New("unavailable")),
+	)}
+	source, _ := newTestSource(t, fetcher)
+	clock := time.Now()
+	source.now = func() time.Time { return clock }
+	source.jitter = func() float64 { return 0 }
+	ctx := context.Background()
 
-	h.release(<-h.waits)
+	g.Expect(source.dueAt().After(clock)).To(BeFalse(), "a source nothing has fetched for is due at once")
+	g.Expect(refreshOnce(source, ctx)).To(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(120*time.Second)), "a success waits for the hint")
 
-	g.Expect(<-h.waits).To(Equal(shorten(300*time.Second, 0.5)))
+	clock = clock.Add(120 * time.Second)
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(retryBaseDelay)), "a failure retries on the backoff")
+	clock = clock.Add(retryBaseDelay)
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(2*retryBaseDelay)), "consecutive failures back off further")
+
+	clock = clock.Add(2 * retryBaseDelay)
+	g.Expect(refreshOnce(source, ctx)).To(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(120*time.Second)))
+
+	clock = clock.Add(120 * time.Second)
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(retryBaseDelay)), "a success resets the backoff")
+}
+
+func TestSource_ReaderThatCannotSign_GetsItsOwnErrorAndStartsNoBackoff(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := &fakeFetcher{respond: fixed(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))})}
+	source, _ := newTestSource(t, fetcher)
+	ctx := context.Background()
+	cannotSign := func(context.Context) (aws.Credentials, error) {
+		return aws.Credentials{}, wierrors.ErrSessionUnavailable
+	}
+
+	_, err := source.X509Bundles(ctx, cannotSign)
+	g.Expect(err).To(MatchError(wierrors.ErrSessionUnavailable))
+	g.Expect(fetcher.Calls()).To(BeZero())
+
+	_, err = source.X509Bundles(ctx, signTest)
+	g.Expect(err).ToNot(HaveOccurred(), "the next reader is not held off")
+	g.Expect(fetcher.Calls()).To(Equal(1))
+}
+
+func TestSource_RefreshAndRecordFailure_OvertakenByAnotherFetch_DoNothing(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := &fakeFetcher{respond: fixed(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))})}
+	source, _ := newTestSource(t, fetcher)
+	ctx := context.Background()
+	// the refresher sees the new source due, and a first read fetches before it runs
+	seen := source.dueAt()
+	_, err := source.X509Bundles(ctx, signTest)
+	g.Expect(err).ToNot(HaveOccurred())
+	scheduled := source.dueAt()
+
+	g.Expect(source.refresh(ctx, testCreds, seen)).To(Succeed())
+	source.recordFailure(ctx, errors.New("no session to sign with"), seen)
+
+	g.Expect(fetcher.Calls()).To(Equal(1), "learning a provider costs one call")
+	g.Expect(source.dueAt()).To(BeTemporally("==", scheduled), "a stale failure does not pull the schedule in")
+	_, err = source.X509Bundles(ctx, signTest)
+	g.Expect(err).ToNot(HaveOccurred())
+}
+
+// notifyFunc is a BundleNotifier that runs a function on either change.
+type notifyFunc func()
+
+func (f notifyFunc) NotifyCertBundleChange(string) { f() }
+func (f notifyFunc) NotifyJWTBundleChange(string)  { f() }
+
+func TestSource_Broadcast_ComesAfterTheNewBundleIsServed(t *testing.T) {
+	g := NewWithT(t)
+	k1 := jwtECKey(t, "k1", newECKey(t))
+	fetcher := &fakeFetcher{respond: sequence(
+		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, k1)}),
+		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, k1, jwtECKey(t, "k2", newECKey(t)))}),
+	)}
+	source, _ := newTestSource(t, fetcher)
+	var keysOnWake []int
+	// a stream woken by the signal reads the bundle again
+	source.notifier = notifyFunc(func() {
+		jwks, err := source.JWTBundles(context.Background(), signTest)
+		g.Expect(err).ToNot(HaveOccurred())
+		keysOnWake = append(keysOnWake, len(served(t, jwks[testDomain])))
+	})
+	ctx := context.Background()
+
+	g.Expect(refreshOnce(source, ctx)).To(Succeed())
+	g.Expect(refreshOnce(source, ctx)).To(Succeed())
+
+	g.Expect(keysOnWake).To(Equal([]int{2}), "the woken stream reads the new set, not the one it replaced")
+}
+
+func TestSource_Refresh_InsideAReadsBackoff_DoesNotFetch(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := &fakeFetcher{respond: fixed()}
+	source, _ := newTestSource(t, fetcher)
+	clock := time.Now()
+	source.now = func() time.Time { return clock }
+	_, err := source.JWTBundles(context.Background(), signTest)
+	g.Expect(err).To(HaveOccurred())
+
+	err = refreshOnce(source, context.Background())
+
+	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
+	g.Expect(fetcher.Calls()).To(Equal(1), "the refresher and reads share one backoff")
+}
+
+func TestSource_Refresh_ItsOwnCancellation_IsNotServedToALiveReader(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := &fakeFetcher{
+		respond: sequence(
+			fail(errors.New("unreachable")),
+			ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}),
+		),
+		gate:    make(chan struct{}),
+		entered: make(chan struct{}, 2),
+	}
+	source, _ := newTestSource(t, fetcher)
+	refreshCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- source.refresh(refreshCtx, testCreds, source.dueAt()) }()
+	<-fetcher.entered
+
+	// the refresher stops while its fetch is in flight
+	cancel()
+	g.Eventually(done).Should(Receive(HaveOccurred()))
+	close(fetcher.gate)
+
+	bundles, err := source.X509Bundles(context.Background(), signTest)
+
+	g.Expect(err).ToNot(HaveOccurred(), "a live reader fetches for itself rather than being handed the cancellation")
+	g.Expect(bundles).To(HaveKey(testDomain))
+	g.Expect(fetcher.Calls()).To(Equal(2))
 }

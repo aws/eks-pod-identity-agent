@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/go-jose/go-jose/v4"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
@@ -168,16 +169,20 @@ type fakeFetcher struct {
 	calls     int
 	arns      []string
 	deadlines []time.Time
+	creds     []aws.Credentials
 }
 
-func (f *fakeFetcher) GetTrustBundles(ctx context.Context, providerArn string) ([]sts.TrustBundle, error) {
-	f.mu.Lock()
-	f.calls++
-	call := f.calls
-	f.arns = append(f.arns, providerArn)
-	deadline, _ := ctx.Deadline()
-	f.deadlines = append(f.deadlines, deadline)
-	f.mu.Unlock()
+func (f *fakeFetcher) GetTrustBundles(ctx context.Context, creds aws.Credentials, providerArn string) ([]sts.TrustBundle, error) {
+	call := func() int {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.calls++
+		f.arns = append(f.arns, providerArn)
+		f.creds = append(f.creds, creds)
+		deadline, _ := ctx.Deadline()
+		f.deadlines = append(f.deadlines, deadline)
+		return f.calls
+	}()
 
 	if f.gate != nil {
 		f.entered <- struct{}{}
@@ -219,9 +224,13 @@ func fail(err error) func() ([]sts.TrustBundle, error) {
 	return func() ([]sts.TrustBundle, error) { return nil, err }
 }
 
-// refreshOnce runs one refresh and keeps only its error, for tests that drive the
-// refresh path directly rather than through Run.
+// testCreds stand in for the workload session's credentials a source fetches with.
+var testCreds = aws.Credentials{AccessKeyID: "AKIDSESSION", SecretAccessKey: "session-secret", SessionToken: "session-token"}
+
+// signTest signs a read's fetch with testCreds.
+func signTest(context.Context) (aws.Credentials, error) { return testCreds, nil }
+
+// refreshOnce runs one refresh with testCreds, whenever it is due.
 func refreshOnce(s *providerSource, ctx context.Context) error {
-	_, err := s.refresh(ctx)
-	return err
+	return s.refresh(ctx, testCreds, s.dueAt())
 }

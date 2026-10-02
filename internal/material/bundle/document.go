@@ -22,12 +22,12 @@ import (
 // serves them. It is immutable once built, which is what lets a snapshot be read
 // without a lock.
 type domainBundle struct {
-	// x509 holds the x509-svid authorities as DER, sorted and without duplicates,
+	// x509Authorities holds the x509-svid authorities as DER, sorted and without duplicates,
 	// so the same set always serves the same bytes and two sets compare as
 	// slices. Order means nothing to a verifier.
-	x509 [][]byte
-	// jwt holds the jwt-svid authorities by key ID.
-	jwt *jwtbundle.Bundle
+	x509Authorities [][]byte
+	// jwtAuthorities holds the jwt-svid authorities by key ID.
+	jwtAuthorities *jwtbundle.Bundle
 	// jwks is the standard JWK Set FetchJWTBundles serves; see jwtSet.
 	jwks []byte
 	// refreshHint is the document's spiffe_refresh_hint, zero when absent or
@@ -61,11 +61,11 @@ func parseDocument(trustDomain spiffeid.TrustDomain, document string) (*domainBu
 	if err != nil {
 		return nil, err
 	}
-	out := &domainBundle{jwt: jwt, jwks: jwks}
+	out := &domainBundle{jwtAuthorities: jwt, jwks: jwks}
 	for _, certificate := range certificates {
-		out.x509 = append(out.x509, certificate.Raw)
+		out.x509Authorities = append(out.x509Authorities, certificate.Raw)
 	}
-	slices.SortFunc(out.x509, bytes.Compare)
+	slices.SortFunc(out.x509Authorities, bytes.Compare)
 	if hint, ok := parsed.RefreshHint(); ok && hint > 0 {
 		out.refreshHint = hint
 	}
@@ -82,10 +82,10 @@ func isPublicKey(key crypto.PublicKey) bool {
 	return false
 }
 
-// jwtSet builds the JWK Set FetchJWTBundles serves: the jwt-svid authorities
-// rebuilt from the parsed keys, ordered by key ID, with no use member. Serving
-// the document itself would break go-spiffe's jwtbundle.Parse, which treats
-// every key as a JWT authority, so an x509-svid key without a kid fails it.
+// jwtSet builds the JWK Set FetchJWTBundles serves: only the jwt-svid keys, with
+// no use member, because go-spiffe's jwtbundle.Parse reads every key in a set as
+// a JWT authority. Keys are ordered by key ID so the same set always encodes to
+// the same bytes, which lets a stream skip resending an unchanged bundle.
 func jwtSet(authorities map[string]crypto.PublicKey) ([]byte, error) {
 	set := jose.JSONWebKeySet{Keys: make([]jose.JSONWebKey, 0, len(authorities))}
 	for keyID, authority := range authorities {
@@ -99,10 +99,29 @@ func jwtSet(authorities map[string]crypto.PublicKey) ([]byte, error) {
 	return out, nil
 }
 
-// sameAuthorities reports whether two parsed domains hold the same authority set,
-// ignoring key order, whitespace and the refresh hint. go-spiffe compares JWT
-// authorities as a set, and the X.509 ones are sorted at parse time, so both
-// comparisons are set comparisons.
-func (d *domainBundle) sameAuthorities(other *domainBundle) bool {
-	return d.jwt.Equal(other.jwt) && slices.EqualFunc(d.x509, other.x509, bytes.Equal)
+// sameX509Authorities reports whether two parsed domains hold the same x509-svid
+// authorities. They are sorted at parse time, so this is a set comparison. A nil
+// domain holds none.
+func (d *domainBundle) sameX509Authorities(other *domainBundle) bool {
+	return slices.EqualFunc(d.x509(), other.x509(), bytes.Equal)
+}
+
+// sameJWTAuthorities reports whether two parsed domains hold the same jwt-svid
+// authorities, which go-spiffe compares as a set. A nil domain holds none.
+func (d *domainBundle) sameJWTAuthorities(other *domainBundle) bool {
+	if d.noJWT() || other.noJWT() {
+		return d.noJWT() == other.noJWT()
+	}
+	return d.jwtAuthorities.Equal(other.jwtAuthorities)
+}
+
+func (d *domainBundle) x509() [][]byte {
+	if d == nil {
+		return nil
+	}
+	return d.x509Authorities
+}
+
+func (d *domainBundle) noJWT() bool {
+	return d == nil || d.jwtAuthorities.Empty()
 }

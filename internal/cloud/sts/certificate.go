@@ -2,30 +2,26 @@ package sts
 
 // The call that asks STS to sign a certificate for a workload.
 //
-// Written by hand, on the same plumbing as GetTrustBundles, because the released AWS
-// SDK does not have this operation yet.
-//
-// Differs from GetTrustBundles: it takes a creds parameter. Those are the workload's
-// credentials, where GetTrustBundles uses the node's. STS takes the identity for the
-// certificate from whoever signed the call, and the request names no identity, so the
-// credentials decide whose certificate comes back.
+// Differs from GetTrustBundles only in what the credentials mean. GetTrustBundles
+// names its provider in the request and the node role signs it. This call names no
+// identity: STS takes the identity for the certificate from whoever signed, so the
+// credentials have to be the workload's own and they decide whose certificate comes
+// back.
 
 import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/protocol/query"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 )
 
-// operationGetWorkloadIdentityCertificate is the operation name, used as the
-// awsQuery Action and in errors.
+// operationGetWorkloadIdentityCertificate is the operation's awsQuery Action.
 const operationGetWorkloadIdentityCertificate = "GetWorkloadIdentityCertificate"
 
 // CertificateRequest is what we send.
@@ -36,9 +32,9 @@ type CertificateRequest struct {
 	// whoever signed the call. Required.
 	CertificateSigningRequestPEM string
 
-	// MaxDuration is how long a certificate we would like. An upper limit: STS can issue
-	// less, and sets the start a few minutes in the past, so the real dates come off the
-	// response. Zero means no preference, and we take what STS returns.
+	// MaxDuration is how long a certificate we would like. An upper limit: STS can
+	// issue less, and sets the start a few minutes in the past, so the real dates come
+	// off the response. Zero means no preference, and we take what STS returns.
 	//
 	// It is not limited by how long our own credentials have left. The comment on
 	// workloadIdentityCertificateMaxDurationSecondsType in IAMTokenServiceModel says it
@@ -59,7 +55,7 @@ type IssuedCertificate struct {
 	CertificateChainPEM string
 
 	// NotBefore and NotAfter are the dates the certificate is actually valid between.
-	// The replacement schedule is worked out from these, not from MaxDuration.
+	// The renewal schedule is worked out from these, not from MaxDuration.
 	NotBefore time.Time
 	NotAfter  time.Time
 
@@ -69,27 +65,18 @@ type IssuedCertificate struct {
 	Subject string
 }
 
-// GetWorkloadIdentityCertificate mints an X.509-SVID for the workload identity
-// that creds already carries.
 func (s *service) GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req CertificateRequest) (*IssuedCertificate, error) {
-	form := url.Values{
-		"Action":                    {operationGetWorkloadIdentityCertificate},
-		"Version":                   {apiVersion},
-		"CertificateSigningRequest": {req.CertificateSigningRequestPEM},
-	}
-	// Omitted rather than sent as zero, so the service default applies instead of
-	// a value the model would reject.
-	if req.MaxDuration > 0 {
-		form.Set("MaxDurationSeconds", strconv.FormatInt(int64(req.MaxDuration/time.Second), 10))
-	}
-
 	var decoded getWorkloadIdentityCertificateResponse
-	if err := s.call(ctx, &creds, form.Encode(), &decoded); err != nil {
-		return nil, &smithy.OperationError{
-			ServiceID:     awssts.ServiceID,
-			OperationName: operationGetWorkloadIdentityCertificate,
-			Err:           err,
+	err := s.invoke(ctx, creds, operationGetWorkloadIdentityCertificate, func(input *query.Object) {
+		input.Key("CertificateSigningRequest").String(req.CertificateSigningRequestPEM)
+		// Omitted rather than sent as zero, so the service default applies instead of a
+		// value the model would reject.
+		if req.MaxDuration > 0 {
+			input.Key("MaxDurationSeconds").Integer(int32(req.MaxDuration / time.Second))
 		}
+	}, &decoded)
+	if err != nil {
+		return nil, err
 	}
 
 	issued, err := decoded.Result.toIssuedCertificate()
@@ -103,24 +90,24 @@ func (s *service) GetWorkloadIdentityCertificate(ctx context.Context, creds aws.
 	return issued, nil
 }
 
-// getWorkloadIdentityCertificateResponse is the awsQuery response shape. The
-// output structure sits under the operation's Result element.
+// getWorkloadIdentityCertificateResponse is the awsQuery response shape. The output
+// structure sits under the operation's Result element.
 type getWorkloadIdentityCertificateResponse struct {
 	XMLName xml.Name                    `xml:"GetWorkloadIdentityCertificateResponse"`
 	Result  workloadIdentityCertificate `xml:"GetWorkloadIdentityCertificateResult"`
 }
 
-// workloadIdentityCertificate is the response as it arrives on the wire. The dates
-// are read as plain strings and parsed afterwards, because Go's XML support has no
-// notion of a timestamp.
+// workloadIdentityCertificate is the response as it arrives on the wire. The dates are
+// read as plain strings and parsed afterwards, because Go's XML support has no notion
+// of a timestamp.
 //
 // CertificateChain accepts more shapes than it strictly needs to, because the two
 // descriptions of this response disagree about it. The API model says it is a single
 // block of PEM text; the Java sample in the onboarding guide loops over it as a list.
 //
-// Read as one string, several certificates would leave only the last, silently
-// dropping the intermediates a workload needs to prove its chain. Accepting either
-// shape costs nothing.
+// Read as one string, several certificates would leave only the last, silently dropping
+// the intermediates a workload needs to prove its chain. Accepting either shape costs
+// nothing.
 //
 // Subject has the same disagreement, the model's name for it against the sample's
 // spiffeId. Nothing depends on it: the identity we use comes out of the certificate,
@@ -151,8 +138,8 @@ func (c certificateList) pem() []string {
 	return []string{c.Value}
 }
 
-// toIssuedCertificate checks the response has the parts we cannot do without, and
-// turns the dates into real timestamps.
+// toIssuedCertificate checks the response has the parts we cannot do without, and turns
+// the dates into real timestamps.
 //
 // Missing parts are an error rather than zero values, because a zero date reads as long
 // expired and would have us replacing the certificate in a loop.
@@ -171,6 +158,7 @@ func (c workloadIdentityCertificate) toIssuedCertificate() (*IssuedCertificate, 
 	if !notAfter.After(notBefore) {
 		return nil, fmt.Errorf("the response's validity window ends at or before it starts: NotBefore %s, NotAfter %s", notBefore, notAfter)
 	}
+
 	// Joined into one piece of text rather than kept as a list. PEM certificates can be
 	// written one after another, and the caller reads certificates out of the text
 	// rather than counting fields.
@@ -195,8 +183,8 @@ func (c workloadIdentityCertificate) toIssuedCertificate() (*IssuedCertificate, 
 	}, nil
 }
 
-// parseTimestamp reads one awsQuery ISO 8601 timestamp. Both the fractional and
-// whole second forms are accepted, since the model bounds neither and the two are
+// parseTimestamp reads one awsQuery ISO 8601 timestamp. Both the fractional and whole
+// second forms are accepted, since the model bounds neither and the two are
 // interchangeable on the wire.
 func parseTimestamp(field, value string) (time.Time, error) {
 	if value == "" {

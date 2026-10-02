@@ -1,208 +1,82 @@
 package sts
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/aws/protocol/query"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
+	smithyauth "github.com/aws/smithy-go/auth"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	. "github.com/onsi/gomega"
-
-	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 )
 
-const (
-	testProviderArn = "arn:aws:iam::111122223333:workload-identity-provider/example"
-	nodeAccessKeyID = "AKIDNODEROLE"
-	nodeToken       = "node-session-token"
-)
+// testOperation is a made-up operation, so the transport is tested apart from any
+// real one.
+const testOperation = "TestOperation"
 
-// fakeSTS is an httptest STS endpoint that records every request it is sent and
-// answers with a canned status and body.
-type fakeSTS struct {
-	server *httptest.Server
-	status int
-	body   string
-
-	mu       sync.Mutex
-	requests []recordedRequest
+type testOperationResponse struct {
+	XMLName xml.Name `xml:"TestOperationResponse"`
+	Result  struct {
+		Value string `xml:"Value"`
+	} `xml:"TestOperationResult"`
 }
 
-type recordedRequest struct {
-	method string
-	path   string
-	host   string
-	header http.Header
-	body   []byte
-	form   url.Values
+const testOperationOK = `<TestOperationResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <TestOperationResult><Value>ok</Value></TestOperationResult>
+  <ResponseMetadata><RequestId>req-200</RequestId></ResponseMetadata>
+</TestOperationResponse>`
+
+func invokeTest(svc *service, creds aws.Credentials, params func(*query.Object)) (testOperationResponse, error) {
+	var out testOperationResponse
+	err := svc.invoke(context.Background(), creds, testOperation, params, &out)
+	return out, err
 }
 
-func newFakeSTS(t *testing.T, status int, body string) *fakeSTS {
-	t.Helper()
-	f := &fakeSTS{status: status, body: body}
-	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		form, _ := url.ParseQuery(string(raw))
-		f.mu.Lock()
-		f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, host: r.Host, header: r.Header.Clone(), body: raw, form: form})
-		f.mu.Unlock()
-		w.Header().Set("Content-Type", "text/xml")
-		w.WriteHeader(f.status)
-		_, _ = io.WriteString(w, f.body)
-	}))
-	t.Cleanup(f.server.Close)
-	return f
-}
-
-func (f *fakeSTS) only(t *testing.T) recordedRequest {
-	t.Helper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.requests) != 1 {
-		t.Fatalf("fake STS received %d requests, expected 1", len(f.requests))
-	}
-	return f.requests[0]
-}
-
-// nodeConfig is the agent's own AWS configuration: the node's credentials,
-// pointed at the fake.
-func nodeConfig(endpoint string) aws.Config {
-	return aws.Config{
-		Region:       "us-west-2",
-		Credentials:  credentials.NewStaticCredentialsProvider(nodeAccessKeyID, "node-secret", nodeToken),
-		BaseEndpoint: aws.String(endpoint),
-	}
-}
-
-const twoBundlesResponse = `<GetTrustBundlesResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <GetTrustBundlesResult>
-    <TrustBundles>
-      <member>
-        <TrustDomain>example.org</TrustDomain>
-        <Bundle>{"keys":[{"use":"jwt-svid","kid":"k1"}],"spiffe_refresh_hint":300}</Bundle>
-      </member>
-      <member>
-        <TrustDomain>peer.example.org</TrustDomain>
-        <Bundle>{"keys":[]}</Bundle>
-      </member>
-    </TrustBundles>
-  </GetTrustBundlesResult>
-  <ResponseMetadata>
-    <RequestId>c6104cbe-af31-11e0-8154-cbc7ccf896c7</RequestId>
-  </ResponseMetadata>
-</GetTrustBundlesResponse>`
-
-func TestGetTrustBundles_SendsAnAwsQueryRequestSignedWithTheNodeCredentials(t *testing.T) {
+func TestInvoke_SendsASignedAwsQueryRequestAndDecodesTheResult(t *testing.T) {
 	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, twoBundlesResponse)
+	fake := newFakeSTS(t, http.StatusOK, testOperationOK)
 
-	_, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	out, err := invokeTest(pinnedService(fake), sessionCreds, func(input *query.Object) {
+		input.Key("Name").String("a b&c=d")
+		items := input.Key("Items").Array("member")
+		items.Value().String("x")
+		items.Value().String("y")
+	})
+
 	g.Expect(err).ToNot(HaveOccurred())
-
+	g.Expect(out.Result.Value).To(Equal("ok"))
 	req := fake.only(t)
-	g.Expect(req.method).To(Equal(http.MethodPost))
-	g.Expect(req.header.Get("Content-Type")).To(HavePrefix("application/x-www-form-urlencoded"))
-	g.Expect(req.form).To(Equal(url.Values{
-		"Action":      {"GetTrustBundles"},
-		"Version":     {"2011-06-15"},
-		"ProviderArn": {testProviderArn},
-	}))
-
-	// SigV4 over the node's credentials, scoped to STS in the client's region
-	authorization := req.header.Get("Authorization")
-	g.Expect(authorization).To(HavePrefix("AWS4-HMAC-SHA256 "))
-	g.Expect(authorization).To(MatchRegexp(`Credential=` + nodeAccessKeyID + `/\d{8}/us-west-2/sts/aws4_request`))
-	g.Expect(authorization).To(ContainSubstring("SignedHeaders="))
-	g.Expect(req.header.Get("X-Amz-Security-Token")).To(Equal(nodeToken))
-	g.Expect(req.header.Get("X-Amz-Date")).ToNot(BeEmpty())
-	g.Expect(req.header.Get("X-Amz-Content-Sha256")).To(BeEmpty(), "STS signs the payload hash without sending it")
-	g.Expect(verifySignature(req, aws.Credentials{AccessKeyID: nodeAccessKeyID, SecretAccessKey: "node-secret", SessionToken: nodeToken}, "us-west-2")).To(Succeed())
-	g.Expect(verifySignature(req, aws.Credentials{AccessKeyID: nodeAccessKeyID, SecretAccessKey: "another-secret", SessionToken: nodeToken}, "us-west-2")).ToNot(Succeed(),
+	expectSignedQuery(g, req, testOperation, url.Values{"Name": {"a b&c=d"}, "Items.member.1": {"x"}, "Items.member.2": {"y"}})
+	g.Expect(verifySignature(req, aws.Credentials{AccessKeyID: sessionAccessKeyID, SecretAccessKey: "another-secret", SessionToken: sessionToken}, "us-west-2")).ToNot(Succeed(),
 		"the check can tell a wrong secret apart")
 }
 
-// verifySignature recomputes the SigV4 signature the way STS does: it re-signs
-// the headers the Authorization header lists with creds at the request's own
-// X-Amz-Date and compares. Unlike a shape check, that catches a wrong payload
-// hash, signing time, scope or secret.
-func verifySignature(req recordedRequest, creds aws.Credentials, region string) error {
-	authorization := req.header.Get("Authorization")
-	_, signedPart, found := strings.Cut(authorization, "SignedHeaders=")
-	if !found {
-		return errors.New("no SignedHeaders in the Authorization header")
-	}
-	signedHeaders, _, _ := strings.Cut(signedPart, ",")
-	signingTime, err := time.Parse("20060102T150405Z", req.header.Get("X-Amz-Date"))
-	if err != nil {
-		return err
-	}
-
-	rebuilt, err := http.NewRequest(req.method, "http://"+req.host+req.path, bytes.NewReader(req.body))
-	if err != nil {
-		return err
-	}
-	rebuilt.Header = http.Header{}
-	for _, name := range strings.Split(signedHeaders, ";") {
-		if name == "host" || name == "x-amz-date" || name == "x-amz-security-token" {
-			continue
-		}
-		if name == "content-length" {
-			continue
-		}
-		rebuilt.Header.Set(name, req.header.Get(name))
-	}
-	if !strings.Contains(";"+signedHeaders+";", ";content-length;") {
-		rebuilt.ContentLength = 0
-	}
-	hash := sha256.Sum256(req.body)
-	if err := v4.NewSigner().SignHTTP(context.Background(), creds, rebuilt, hex.EncodeToString(hash[:]), "sts", region, signingTime); err != nil {
-		return err
-	}
-	if expected := rebuilt.Header.Get("Authorization"); expected != authorization {
-		return fmt.Errorf("signature mismatch:\n got  %s\n want %s", authorization, expected)
-	}
-	return nil
-}
-
-func TestGetTrustBundles_DecodesEveryEntryInResponseOrder(t *testing.T) {
+func TestInvoke_ParamsCannotOverrideActionOrVersion(t *testing.T) {
 	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, twoBundlesResponse)
+	fake := newFakeSTS(t, http.StatusOK, testOperationOK)
 
-	entries, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(pinnedService(fake), sessionCreds, func(input *query.Object) {
+		input.Key("Action").String("AssumeRole")
+		input.Key("Version").String("1999-01-01")
+	})
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(entries).To(Equal([]TrustBundle{
-		{TrustDomain: "example.org", Bundle: `{"keys":[{"use":"jwt-svid","kid":"k1"}],"spiffe_refresh_hint":300}`},
-		{TrustDomain: "peer.example.org", Bundle: `{"keys":[]}`},
-	}))
+	g.Expect(fake.only(t).form).To(Equal(url.Values{"Action": {testOperation}, "Version": {"2011-06-15"}}))
 }
 
-func TestGetTrustBundles_EmptyList_DecodesToNoEntries(t *testing.T) {
-	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, `<GetTrustBundlesResponse><GetTrustBundlesResult><TrustBundles/></GetTrustBundlesResult></GetTrustBundlesResponse>`)
-
-	entries, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
-
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(entries).To(BeEmpty())
-}
-
-func TestGetTrustBundles_ErrorResponse_DecodesToTheSDKErrorChain(t *testing.T) {
+func TestInvoke_ErrorResponse_DecodesToTheSDKErrorChain(t *testing.T) {
 	g := NewWithT(t)
 	fake := newFakeSTS(t, http.StatusNotFound, `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
   <Error>
@@ -213,12 +87,12 @@ func TestGetTrustBundles_ErrorResponse_DecodesToTheSDKErrorChain(t *testing.T) {
   <RequestId>req-404</RequestId>
 </ErrorResponse>`)
 
-	_, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(pinnedService(fake), sessionCreds, nil)
 
 	var operationErr *smithy.OperationError
 	g.Expect(errors.As(err, &operationErr)).To(BeTrue())
 	g.Expect(operationErr.Service()).To(Equal("STS"))
-	g.Expect(operationErr.Operation()).To(Equal("GetTrustBundles"))
+	g.Expect(operationErr.Operation()).To(Equal(testOperation))
 	var apiErr smithy.APIError
 	g.Expect(errors.As(err, &apiErr)).To(BeTrue())
 	g.Expect(apiErr.ErrorCode()).To(Equal("ResourceNotFoundException"))
@@ -230,11 +104,11 @@ func TestGetTrustBundles_ErrorResponse_DecodesToTheSDKErrorChain(t *testing.T) {
 	g.Expect(responseErr.ServiceRequestID()).To(Equal("req-404"))
 }
 
-func TestGetTrustBundles_UnreadableErrorBody_FallsBackToTheStatus(t *testing.T) {
+func TestInvoke_UnreadableErrorBody_FallsBackToTheStatus(t *testing.T) {
 	g := NewWithT(t)
 	fake := newFakeSTS(t, http.StatusServiceUnavailable, "upstream connect error")
 
-	_, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(pinnedService(fake), sessionCreds, nil)
 
 	var apiErr smithy.APIError
 	g.Expect(errors.As(err, &apiErr)).To(BeTrue())
@@ -242,62 +116,76 @@ func TestGetTrustBundles_UnreadableErrorBody_FallsBackToTheStatus(t *testing.T) 
 	g.Expect(apiErr.ErrorFault()).To(Equal(smithy.FaultServer))
 }
 
-func TestGetTrustBundles_MalformedSuccessBody_IsADeserializationError(t *testing.T) {
+func TestInvoke_Throttled_IsAnAPIErrorCarryingTheStatus(t *testing.T) {
 	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, "<GetTrustBundlesResponse><unterminated>")
+	fake := newFakeSTS(t, http.StatusTooManyRequests, `<ErrorResponse><Error><Type>Sender</Type><Code>Throttling</Code><Message>Rate exceeded</Message></Error><RequestId>req-429</RequestId></ErrorResponse>`)
 
-	_, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(pinnedService(fake), sessionCreds, nil)
 
-	var deserializationErr *smithy.DeserializationError
-	g.Expect(errors.As(err, &deserializationErr)).To(BeTrue())
+	var apiErr smithy.APIError
+	g.Expect(errors.As(err, &apiErr)).To(BeTrue())
+	g.Expect(apiErr.ErrorCode()).To(Equal("Throttling"))
+	var responseErr *awshttp.ResponseError
+	g.Expect(errors.As(err, &responseErr)).To(BeTrue())
+	g.Expect(responseErr.HTTPStatusCode()).To(Equal(http.StatusTooManyRequests))
+	g.Expect(fake.requestCount()).To(Equal(1), "one attempt: the calling tier owns retries")
 }
 
-func TestGetTrustBundles_WrongRootElement_IsADeserializationError(t *testing.T) {
+func TestInvoke_ErrorWithoutARequestIDInTheBody_TakesItFromTheHeader(t *testing.T) {
 	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, "<GetCallerIdentityResponse/>")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Amzn-RequestId", "req-from-header")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `<ErrorResponse><Error><Code>AccessDenied</Code><Message>no</Message></Error></ErrorResponse>`)
+	}))
+	defer server.Close()
 
-	_, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(NewService(agentConfig(server.URL)).(*service), sessionCreds, nil)
 
-	var deserializationErr *smithy.DeserializationError
-	g.Expect(errors.As(err, &deserializationErr)).To(BeTrue())
+	var responseErr *awshttp.ResponseError
+	g.Expect(errors.As(err, &responseErr)).To(BeTrue())
+	g.Expect(responseErr.ServiceRequestID()).To(Equal("req-from-header"))
 }
 
-func TestGetTrustBundles_CredentialFailure_SendsNothing(t *testing.T) {
-	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, twoBundlesResponse)
-	cfg := nodeConfig(fake.server.URL)
-	cfg.Credentials = aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-		return aws.Credentials{}, errors.New("IMDS unreachable")
-	})
+func TestInvoke_UndecodableSuccessBody_IsADeserializationError(t *testing.T) {
+	for name, body := range map[string]string{
+		"malformed XML":     "<TestOperationResponse><unterminated>",
+		"wrong root":        "<GetCallerIdentityResponse/>",
+		"over the size cap": `<TestOperationResponse><TestOperationResult><Value>` + strings.Repeat("A", maxResponseBytes) + `</Value></TestOperationResult></TestOperationResponse>`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeSTS(t, http.StatusOK, body)
 
-	_, err := NewService(cfg).GetTrustBundles(context.Background(), testProviderArn)
+			out, err := invokeTest(pinnedService(fake), sessionCreds, nil)
 
-	g.Expect(err).To(MatchError(ContainSubstring("IMDS unreachable")))
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	g.Expect(fake.requests).To(BeEmpty())
+			var deserializationErr *smithy.DeserializationError
+			g.Expect(errors.As(err, &deserializationErr)).To(BeTrue())
+			g.Expect(out.Result.Value).To(BeEmpty(), "nothing is decoded from a truncated body")
+		})
+	}
 }
 
-func TestGetTrustBundles_NoCredentials_IsAnError(t *testing.T) {
+func TestInvoke_NoCredentials_SendsNothing(t *testing.T) {
 	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, twoBundlesResponse)
-	cfg := nodeConfig(fake.server.URL)
-	cfg.Credentials = nil
+	fake := newFakeSTS(t, http.StatusOK, testOperationOK)
 
-	_, err := NewService(cfg).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(pinnedService(fake), aws.Credentials{}, nil)
 
 	g.Expect(err).To(MatchError(ContainSubstring("no AWS credentials")))
+	g.Expect(fake.requestCount()).To(BeZero())
 }
 
-func TestGetTrustBundles_UnreachableEndpoint_IsARequestSendError(t *testing.T) {
+func TestInvoke_UnreachableEndpoint_IsARequestSendErrorNamingTheOperation(t *testing.T) {
 	g := NewWithT(t)
-	fake := newFakeSTS(t, http.StatusOK, twoBundlesResponse)
+	fake := newFakeSTS(t, http.StatusOK, testOperationOK)
 	fake.server.Close()
 
-	_, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+	_, err := invokeTest(pinnedService(fake), sessionCreds, nil)
 
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("GetTrustBundles"))
+	var sendErr *smithyhttp.RequestSendError
+	g.Expect(errors.As(err, &sendErr)).To(BeTrue())
+	g.Expect(err.Error()).To(ContainSubstring(testOperation))
 }
 
 func TestResolveEndpoint_FollowsTheSDKsSTSEndpointRules(t *testing.T) {
@@ -350,33 +238,33 @@ func TestResolveEndpoint_DualStack_UsesTheDualStackEndpoint(t *testing.T) {
 	g.Expect(endpoint.URI.Host).To(Equal("sts.us-west-2.api.aws"))
 }
 
-func TestGetTrustBundles_ErrorWithoutARequestIDInTheBody_TakesItFromTheHeader(t *testing.T) {
-	g := NewWithT(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Amzn-RequestId", "req-from-header")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `<ErrorResponse><Error><Code>AccessDenied</Code><Message>no</Message></Error></ErrorResponse>`)
-	}))
-	defer server.Close()
+// fixedEndpoint is an STS endpoint resolver that always returns endpoint.
+type fixedEndpoint struct{ endpoint smithyendpoints.Endpoint }
 
-	_, err := NewService(nodeConfig(server.URL)).GetTrustBundles(context.Background(), testProviderArn)
-
-	var responseErr *awshttp.ResponseError
-	g.Expect(errors.As(err, &responseErr)).To(BeTrue())
-	g.Expect(responseErr.ServiceRequestID()).To(Equal("req-from-header"))
+func (r fixedEndpoint) ResolveEndpoint(context.Context, awssts.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	return r.endpoint, nil
 }
 
-func TestGetTrustBundles_OversizedResponse_IsRefusedNotTruncatedIntoAResult(t *testing.T) {
-	g := NewWithT(t)
-	oversized := `<GetTrustBundlesResponse><GetTrustBundlesResult><TrustBundles><member><TrustDomain>example.org</TrustDomain><Bundle>` +
-		strings.Repeat("A", maxResponseBytes) + `</Bundle></member></TrustBundles></GetTrustBundlesResult></GetTrustBundlesResponse>`
-	fake := newFakeSTS(t, http.StatusOK, oversized)
+func TestResolveEndpoint_ReadsTheSigningRegionUnderEitherSigV4SchemeID(t *testing.T) {
+	for _, schemeID := range []string{"aws.auth#sigv4", "sigv4"} {
+		t.Run(schemeID, func(t *testing.T) {
+			g := NewWithT(t)
+			option := &smithyauth.Option{SchemeID: schemeID}
+			smithyhttp.SetSigV4SigningRegion(&option.SignerProperties, "us-east-1")
+			var properties smithy.Properties
+			smithyauth.SetAuthOptions(&properties, []*smithyauth.Option{option})
+			svc := NewService(aws.Config{Region: "aws-global"}).(*service)
+			svc.options.EndpointResolverV2 = fixedEndpoint{smithyendpoints.Endpoint{
+				URI:        url.URL{Scheme: "https", Host: "sts.amazonaws.com"},
+				Properties: properties,
+			}}
 
-	entries, err := NewService(nodeConfig(fake.server.URL)).GetTrustBundles(context.Background(), testProviderArn)
+			_, region, err := svc.resolveEndpoint(context.Background())
 
-	g.Expect(entries).To(BeNil())
-	var deserializationErr *smithy.DeserializationError
-	g.Expect(errors.As(err, &deserializationErr)).To(BeTrue())
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(region).To(Equal("us-east-1"), "not the client's aws-global")
+		})
+	}
 }
 
 func TestResolveEndpoint_NoRegion_IsAnError(t *testing.T) {

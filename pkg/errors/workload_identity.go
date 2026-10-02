@@ -30,10 +30,8 @@ const (
 	KindBundleUnavailable
 	// KindInvalidAudience is the kind of ErrInvalidAudience.
 	KindInvalidAudience
-	// KindUnknownTrustDomain is the kind of ErrUnknownTrustDomain.
-	KindUnknownTrustDomain
-	// KindUnknownKeyID is the kind of ErrUnknownKeyID.
-	KindUnknownKeyID
+	// KindSessionRefused is the kind of ErrSessionRefused.
+	KindSessionRefused
 	// KindBundleRefused is the kind of ErrBundleRefused.
 	KindBundleRefused
 	// KindIssuanceRefused is the kind of ErrIssuanceRefused.
@@ -136,15 +134,16 @@ func newWorkloadIdentityError(kind Kind, label string, retryable bool) *Workload
 }
 
 var (
-	// ErrUnattestable is produced by the attestor (T3) when the process on the
-	// other end of an accepted connection cannot be resolved to a pod, including
-	// a caller arriving over something other than a Unix socket. Not retryable:
-	// retrying re-reads the same kernel facts and gets the same answer.
+	// ErrUnattestable is produced by the attestor (T3) when the caller on an
+	// accepted connection, including one not on a Unix socket, cannot be resolved
+	// to a pod, and by the bundle source (T6) for a nil workload. Not retryable: a
+	// retry re-reads the same kernel facts and gets the same answer.
 	ErrUnattestable = newWorkloadIdentityError(KindUnattestable, "unattestable", false)
 
 	// ErrNotEnrolled is produced by the token minter (T4) and the session
-	// provider (T5) when the attested pod has no workload identity association.
-	// Not retryable: the pod has no association and a retry cannot create one.
+	// provider (T5) when the attested pod has no workload identity association,
+	// and by the bundle source (T6) for a session that names no provider. Not
+	// retryable: the pod has no association and a retry cannot create one.
 	ErrNotEnrolled = newWorkloadIdentityError(KindNotEnrolled, "not_enrolled", false)
 
 	// ErrTokenMintFailed is produced by the token minter (T4) when a TokenRequest
@@ -186,21 +185,17 @@ var (
 	// accept. Not retryable: the same request will be rejected the same way.
 	ErrInvalidAudience = newWorkloadIdentityError(KindInvalidAudience, "invalid_audience", false)
 
-	// ErrUnknownTrustDomain is produced by the bundle source (T6) when a JWT
-	// authority is asked for in a trust domain the current bundles do not
-	// cover. Not retryable: the same token names the same domain on a retry.
-	ErrUnknownTrustDomain = newWorkloadIdentityError(KindUnknownTrustDomain, "unknown_trust_domain", false)
-
-	// ErrUnknownKeyID is produced by the bundle source (T6) when a known trust
-	// domain holds no JWT authority with the requested key ID. Not retryable:
-	// STS publishes a key before signing with it and the tier refreshes well
-	// inside that lead, so a key the cached bundle lacks is not about to appear.
-	ErrUnknownKeyID = newWorkloadIdentityError(KindUnknownKeyID, "unknown_key_id", false)
+	// ErrSessionRefused is produced by the session provider (T5) when EKS Auth
+	// refuses the exchange with AccessDenied (such as a role missing
+	// sts:SetContext) or InvalidToken. Not retryable: a repeat gets the same
+	// answer. It is distinct from ErrSessionUnavailable so a misconfigured role
+	// or node does not read as an EKS Auth outage.
+	ErrSessionRefused = newWorkloadIdentityError(KindSessionRefused, "session_refused", false)
 
 	// ErrBundleRefused is produced by the bundle source (T6) when STS refuses a
 	// provider's bundles for a reason a repeat cannot change. Not retryable. It is
-	// distinct from ErrBundleUnavailable so a misconfigured node does not read as
-	// an STS outage.
+	// distinct from ErrBundleUnavailable so a workload role missing
+	// sts:GetTrustBundles does not read as an STS outage.
 	ErrBundleRefused = newWorkloadIdentityError(KindBundleRefused, "bundle_refused", false)
 
 	// ErrIssuanceRefused is produced by the certificate source (T7) and the token
@@ -278,8 +273,7 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrIssuanceThrottled,
 		ErrBundleUnavailable,
 		ErrInvalidAudience,
-		ErrUnknownTrustDomain,
-		ErrUnknownKeyID,
+		ErrSessionRefused,
 		ErrBundleRefused,
 		ErrIssuanceRefused,
 	}

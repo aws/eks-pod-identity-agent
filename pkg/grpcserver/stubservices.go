@@ -6,10 +6,21 @@ import (
 	"google.golang.org/grpc"
 )
 
-// RegisterStubServices registers the SPIFFE Workload API and Envoy SDS services
-// with handlers that answer every method Unimplemented. The wiring site passes it
-// as Opts.Register until the real handlers land. Using the real descriptors means
-// a client is told a method is not implemented, not that the service is unknown.
+// RegisterStubServices registers the two services the workload identity socket will
+// serve, with handlers that answer every method with Unimplemented.
+//
+// It is what the wiring site passes as Opts.Register until the real handlers land.
+// The SPIFFE Workload API handlers and the Envoy SDS handler replace one stub each,
+// at this call site, and nothing else about the server changes.
+//
+// Registering the real service descriptors rather than something invented is
+// deliberate, for two reasons. It makes the socket's surface what it is going to be,
+// so a client that connects gets a structured Unimplemented for a method the agent
+// does not serve yet instead of an unknown-service error for one it will. And it
+// links the upstream descriptors into the binary, so the size recorded for this task
+// is the size the proto swap will be measured against; a stub that avoided them
+// would understate the cost by the whole of the dependency the swap exists to
+// remove.
 func RegisterStubServices(registrar grpc.ServiceRegistrar) {
 	workload.RegisterSpiffeWorkloadAPIServer(registrar, stubWorkloadAPI{})
 	secretv3.RegisterSecretDiscoveryServiceServer(registrar, stubSDS{})

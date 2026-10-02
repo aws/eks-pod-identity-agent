@@ -116,15 +116,15 @@ func TestParseDocument_ServedMaterial_IsWhatGoSpiffeParses(t *testing.T) {
 	jwt, err := jwtbundle.Parse(trustDomain, parsed.jwks)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(jwt.JWTAuthorities()).To(HaveLen(2))
-	g.Expect(jwt.Equal(parsed.jwt)).To(BeTrue(), "a workload trusts exactly the keys the agent trusts")
+	g.Expect(jwt.Equal(parsed.jwtAuthorities)).To(BeTrue(), "a workload trusts exactly the keys the agent trusts")
 	var rawDER []byte
-	for _, der := range parsed.x509 {
+	for _, der := range parsed.x509Authorities {
 		rawDER = append(rawDER, der...)
 	}
 	x509Authorities, err := x509bundle.ParseRaw(trustDomain, rawDER)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(x509Authorities.X509Authorities()).To(HaveLen(2))
-	g.Expect(parsed.x509).To(Equal(sortedDER(caA.der, caB.der)), "every authority, sorted")
+	g.Expect(parsed.x509Authorities).To(Equal(sortedDER(caA.der, caB.der)), "every authority, sorted")
 
 	var set struct {
 		Keys []map[string]any `json:"keys"`
@@ -151,7 +151,8 @@ func TestParseDocument_SameSetInAnyOrder_ServesTheSameBytes(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(second.jwks).To(Equal(first.jwks))
-	g.Expect(second.sameAuthorities(first)).To(BeTrue())
+	g.Expect(second.sameX509Authorities(first)).To(BeTrue())
+	g.Expect(second.sameJWTAuthorities(first)).To(BeTrue())
 }
 
 func TestParseDocument_SameX509SetInAnyOrder_ServesTheSameBytes(t *testing.T) {
@@ -164,9 +165,10 @@ func TestParseDocument_SameX509SetInAnyOrder_ServesTheSameBytes(t *testing.T) {
 	second, err := parseDocument(trustDomain, bundleDoc(t, 0, x509Key(t, c), x509Key(t, a), x509Key(t, b)))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(first.x509).To(Equal(sortedDER(a.der, b.der, c.der)))
-	g.Expect(second.x509).To(Equal(first.x509))
-	g.Expect(second.sameAuthorities(first)).To(BeTrue())
+	g.Expect(first.x509Authorities).To(Equal(sortedDER(a.der, b.der, c.der)))
+	g.Expect(second.x509Authorities).To(Equal(first.x509Authorities))
+	g.Expect(second.sameX509Authorities(first)).To(BeTrue())
+	g.Expect(second.sameJWTAuthorities(first)).To(BeTrue())
 }
 
 func TestJWTSet_IsOrderedByKeyID(t *testing.T) {
@@ -200,7 +202,7 @@ func TestParseDocument_X509KeyCarryingAKid_IsNotAJWTAuthority(t *testing.T) {
 	parsed, err := parseDocument(spiffeid.RequireTrustDomainFromString(testDomain), bundleDoc(t, 0, x509Authority, jwtECKey(t, "k1", newECKey(t))))
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(parsed.jwt.HasJWTAuthority("ca-kid")).To(BeFalse())
+	g.Expect(parsed.jwtAuthorities.HasJWTAuthority("ca-kid")).To(BeFalse())
 	g.Expect(string(parsed.jwks)).ToNot(ContainSubstring("ca-kid"))
 }
 
@@ -211,7 +213,7 @@ func TestParseDocument_RepeatedX509Authority_IsServedOnce(t *testing.T) {
 	parsed, err := parseDocument(spiffeid.RequireTrustDomainFromString(testDomain), bundleDoc(t, 0, x509Key(t, ca), x509Key(t, ca)))
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(parsed.x509).To(Equal([][]byte{ca.der}))
+	g.Expect(parsed.x509Authorities).To(Equal([][]byte{ca.der}))
 }
 
 func TestParseDocument_OnlyX509Keys_ServesAnEmptyJWTSet(t *testing.T) {
@@ -220,7 +222,7 @@ func TestParseDocument_OnlyX509Keys_ServesAnEmptyJWTSet(t *testing.T) {
 	parsed, err := parseDocument(spiffeid.RequireTrustDomainFromString(testDomain), bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca"))))
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(parsed.jwt.Empty()).To(BeTrue())
+	g.Expect(parsed.jwtAuthorities.Empty()).To(BeTrue())
 	g.Expect(string(parsed.jwks)).To(Equal(`{"keys":[]}`))
 }
 
@@ -250,6 +252,6 @@ func TestParseResponse_TrustDomainGivenAsASPIFFEID_IsKeyedByItsName(t *testing.T
 	parsed, err := parseResponse([]sts.TrustBundle{{TrustDomain: "spiffe://" + testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}})
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(parsed.own).To(Equal(testDomain))
+	g.Expect(parsed.ownDomain).To(Equal(testDomain))
 	g.Expect(parsed.domains).To(HaveKey(testDomain))
 }

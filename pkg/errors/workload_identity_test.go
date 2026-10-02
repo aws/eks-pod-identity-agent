@@ -107,18 +107,10 @@ func taxonomyCases() []taxonomyCase {
 			expectedRetryable: false,
 		},
 		{
-			name:              "unknown trust domain",
-			err:               ErrUnknownTrustDomain,
-			expectedKind:      KindUnknownTrustDomain,
-			expectedLabel:     "unknown_trust_domain",
-			expectedRetryable: false,
-		},
-		{
-			name:              "unknown key id",
-			err:               ErrUnknownKeyID,
-			expectedKind:      KindUnknownKeyID,
-			expectedLabel:     "unknown_key_id",
-			expectedRetryable: false,
+			name:          "session refused",
+			err:           ErrSessionRefused,
+			expectedKind:  KindSessionRefused,
+			expectedLabel: "session_refused",
 		},
 		{
 			name:              "bundle refused",
@@ -340,14 +332,14 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 	g := NewWithT(t)
 	taxonomy := WorkloadIdentityTaxonomy()
 
-	g.Expect(taxonomy).To(HaveLen(13))
+	g.Expect(taxonomy).To(HaveLen(12))
 
 	seenKinds := make(map[Kind]bool, len(taxonomy))
 	seenLabels := make(map[string]bool, len(taxonomy))
 	for i, member := range taxonomy {
 		g.Expect(member).ToNot(BeNil())
 
-		// kinds are contiguous 1..13 in slice order, so there is no gap and no
+		// kinds are contiguous 1..12 in slice order, so there is no gap and no
 		// duplicate
 		g.Expect(member.Kind()).To(Equal(Kind(i + 1)))
 		g.Expect(seenKinds).ToNot(HaveKey(member.Kind()))
@@ -362,8 +354,8 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		g.Expect(MetricLabel(member)).ToNot(Equal(MetricLabelUnknown))
 	}
 
-	g.Expect(seenKinds).To(HaveLen(13))
-	g.Expect(seenLabels).To(HaveLen(13))
+	g.Expect(seenKinds).To(HaveLen(12))
+	g.Expect(seenLabels).To(HaveLen(12))
 
 	// every sentinel declared in the package is reachable from the taxonomy
 	g.Expect(taxonomy).To(ConsistOf(
@@ -376,8 +368,7 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		ErrIssuanceThrottled,
 		ErrBundleUnavailable,
 		ErrInvalidAudience,
-		ErrUnknownTrustDomain,
-		ErrUnknownKeyID,
+		ErrSessionRefused,
 		ErrBundleRefused,
 		ErrIssuanceRefused,
 	))

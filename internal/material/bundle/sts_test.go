@@ -12,19 +12,19 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 )
 
-// TestRegistry_OverTheSTSClient_FetchesSignedWithTheNodeRole runs the tier over
-// the real STS client against a fake STS endpoint: the caller's ARN goes out as
-// the request input, the request is signed with the agent's own credentials, and
-// the parsed authorities come back keyed by trust domain.
-func TestRegistry_OverTheSTSClient_FetchesSignedWithTheNodeRole(t *testing.T) {
+// TestRegistry_OverTheSTSClient_FetchesSignedWithTheWorkloadSession runs the tier
+// over the real STS client against a fake STS endpoint: the ARN from the reader's
+// session goes out as the request input, the request is signed with that
+// session, and the parsed authorities come back keyed by trust domain.
+func TestRegistry_OverTheSTSClient_FetchesSignedWithTheWorkloadSession(t *testing.T) {
 	g := NewWithT(t)
 	ca := newAuthority(t, "ca")
 	jwtKey := newECKey(t)
@@ -42,39 +42,41 @@ func TestRegistry_OverTheSTSClient_FetchesSignedWithTheNodeRole(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		form, _ := url.ParseQuery(string(raw))
-		mu.Lock()
-		forms = append(forms, form)
-		authorizations = append(authorizations, r.Header.Get("Authorization"))
-		mu.Unlock()
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+			forms = append(forms, form)
+			authorizations = append(authorizations, r.Header.Get("Authorization"))
+		}()
 		_, _ = io.WriteString(w, response)
 	}))
 	defer server.Close()
 
-	nodeConfig := aws.Config{
-		Region:       "us-west-2",
-		Credentials:  credentials.NewStaticCredentialsProvider("AKIDNODEROLE", "node-secret", ""),
-		BaseEndpoint: aws.String(server.URL),
-	}
-	registry, err := New(Opts{Fetcher: sts.NewService(nodeConfig), Notifier: &fake.Subscriber{}})
+	agentConfig := aws.Config{Region: "us-west-2", BaseEndpoint: aws.String(server.URL)}
+	registry, err := New(sessionOpts(sts.NewService(agentConfig), &fake.Subscriber{}, newTestSessions()))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	x509Bundles, err := registry.X509Bundles(context.Background(), testProviderArn)
+	x509Bundles, err := registry.X509Bundles(context.Background(), ownPod)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(x509Bundles).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
-	authority, err := registry.JWTAuthority(testProviderArn, testDomain, "k1")
+	jwt, err := registry.JWTSource(context.Background(), ownPod)
 	g.Expect(err).ToNot(HaveOccurred())
+	bundle, err := jwt.GetJWTBundleForTrustDomain(spiffeid.RequireTrustDomainFromString(testDomain))
+	g.Expect(err).ToNot(HaveOccurred())
+	authority, found := bundle.FindJWTAuthority("k1")
+	g.Expect(found).To(BeTrue())
 	g.Expect(jwtKey.PublicKey.Equal(authority)).To(BeTrue())
-	g.Expect(registry.OwnTrustDomain(testProviderArn)).To(Equal(testDomain))
+	g.Expect(registry.OwnTrustDomain(context.Background(), ownPod)).To(Equal(testDomain))
 
 	mu.Lock()
 	defer mu.Unlock()
 	g.Expect(forms).To(HaveLen(1))
 	g.Expect(forms[0].Get("Action")).To(Equal("GetTrustBundles"))
 	g.Expect(forms[0].Get("ProviderArn")).To(Equal(testProviderArn))
-	g.Expect(authorizations[0]).To(ContainSubstring("Credential=AKIDNODEROLE/"))
+	g.Expect(authorizations[0]).To(ContainSubstring("Credential=AKID-own-pod/"), "signed with the workload's session")
 }
 
-// TestSource_OverTheSTSClient_UnknownProvider_IsARefusal carries the one error
+// TestRegistry_OverTheSTSClient_UnknownProvider_IsARefusal carries the one error
 // the API model declares for GetTrustBundles through the real client, so the
 // classification is pinned against the wire error and not only a hand-built one.
 func TestRegistry_OverTheSTSClient_UnknownProvider_IsARefusal(t *testing.T) {
@@ -86,17 +88,14 @@ func TestRegistry_OverTheSTSClient_UnknownProvider_IsARefusal(t *testing.T) {
 			`<RequestId>req-1</RequestId></ErrorResponse>`)
 	}))
 	defer server.Close()
-	registry, err := New(Opts{
-		Fetcher: sts.NewService(aws.Config{
-			Region:       "us-west-2",
-			Credentials:  credentials.NewStaticCredentialsProvider("AKIDNODEROLE", "node-secret", ""),
-			BaseEndpoint: aws.String(server.URL),
-		}),
-		Notifier: &fake.Subscriber{},
-	})
+	registry, err := New(sessionOpts(
+		sts.NewService(aws.Config{Region: "us-west-2", BaseEndpoint: aws.String(server.URL)}),
+		&fake.Subscriber{},
+		newTestSessions(),
+	))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	_, err = registry.X509Bundles(context.Background(), testProviderArn)
+	_, err = registry.X509Bundles(context.Background(), ownPod)
 
 	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
 	g.Expect(wierrors.IsRetryable(err)).To(BeFalse())

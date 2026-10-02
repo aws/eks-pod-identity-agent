@@ -36,6 +36,10 @@ type EksCredentialsResponse struct {
 	Token           string                     `json:"Token,omitempty"`
 	AccountId       string                     `json:"AccountId,omitempty"`
 	Expiration      SdkCompliantExpirationTime `json:"Expiration,omitempty"`
+	// ProviderArn is the workload identity provider EKS Auth decorated the
+	// session with, and empty for a pod not enrolled. It's for the agent only,
+	// so json:"-" keeps it out of the credentials served to pods.
+	ProviderArn string `json:"-"`
 }
 
 type SdkCompliantExpirationTime struct {

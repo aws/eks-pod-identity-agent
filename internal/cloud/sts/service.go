@@ -1,12 +1,12 @@
-// Package sts calls GetTrustBundles, which no released aws-sdk-go-v2 STS client
-// carries yet. It builds the call from the SDK's public pieces (the STS client's
-// resolved options, the STS endpoint rules, the SigV4 signer and the awsQuery
-// error decoder), so partitions, FIPS, dual-stack and AWS_ENDPOINT_URL_STS are
-// handled as the SDK handles them. Only the awsQuery request and response bodies
-// are written by hand.
+// Package sts calls the STS operations the agent needs that no released
+// aws-sdk-go-v2 client carries yet, one file per operation on a shared awsQuery
+// transport. The transport is built from the SDK's public pieces (resolved client
+// options, endpoint rules, SigV4 signer, awsQuery error decoder), so partitions,
+// FIPS, dual-stack and AWS_ENDPOINT_URL_STS behave as they do in the SDK.
 //
-// Delete it once the SDK releases the operation: the service becomes a call to
-// sts.Client.GetTrustBundles and nothing that uses Iface changes.
+// Each call is signed with the credentials it is given and makes one attempt; the
+// calling tier owns retries. Once the SDK releases an operation, its method body
+// becomes the SDK call and its types and Iface method stay, so callers keep working.
 package sts
 
 import (
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/protocol/query"
 	awsxml "github.com/aws/aws-sdk-go-v2/aws/protocol/xml"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -40,36 +41,25 @@ import (
 // Iface is the set of STS operations the agent calls outside the released SDK.
 type Iface interface {
 	// GetTrustBundles returns the trust bundles for the named workload
-	// identity provider, one entry per trust domain, in response order.
-	GetTrustBundles(ctx context.Context, providerArn string) ([]TrustBundle, error)
+	// identity provider, one entry per trust domain, in response order, signing
+	// the request with creds.
+	GetTrustBundles(ctx context.Context, creds aws.Credentials, providerArn string) ([]TrustBundle, error)
 
-	// GetWorkloadIdentityCertificate mints an X.509-SVID for the workload
-	// identity that creds already carries. Unlike GetTrustBundles it is signed
-	// with a workload's session rather than the node role, because STS reads the
-	// subject off the caller's session and there is no request input naming it.
+	// GetWorkloadIdentityCertificate mints an X.509-SVID for the workload identity
+	// that creds already carries. Unlike GetTrustBundles, which names its provider in
+	// the request, this call names no identity: STS takes it from whoever signed, so
+	// creds have to be the workload's own.
 	GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req CertificateRequest) (*IssuedCertificate, error)
-}
-
-// TrustBundle is one entry of a GetTrustBundles response.
-type TrustBundle struct {
-	// TrustDomain is the SPIFFE trust domain the entry is for.
-	TrustDomain string
-	// Bundle is the domain's SPIFFE bundle document, an RFC 7517 JWK Set. It is
-	// opaque here; the bundle tier parses it.
-	Bundle string
 }
 
 const (
 	// apiVersion is the STS API version every awsQuery request names.
 	apiVersion = "2011-06-15"
-	// operationGetTrustBundles is the operation name, used as the awsQuery
-	// Action and in errors.
-	operationGetTrustBundles = "GetTrustBundles"
 	// signingName is the SigV4 service name STS signs under.
 	signingName = "sts"
-	// maxResponseBytes bounds how much of a response body is read. A bundle
-	// document is a few kilobytes; this only stops a broken or hostile endpoint
-	// from growing the agent's memory.
+	// maxResponseBytes bounds how much of a response body is read. A response is
+	// a few kilobytes; this only stops a broken or hostile endpoint from growing
+	// the agent's memory.
 	maxResponseBytes = 1 << 20
 )
 
@@ -79,10 +69,10 @@ type service struct {
 	now     func() time.Time
 }
 
-// NewService builds the client from cfg, which must be the configuration the
-// agent loaded at boot with the node's credentials, never a workload session.
-// GetTrustBundles takes the provider ARN as a request input, so the call needs
-// nothing else from a workload.
+// NewService builds the client from cfg, taking only its region, endpoint
+// settings and HTTP client. Each call is signed with the credentials it is
+// given: at launch those are the workload's session, and the client does not
+// care whose they are.
 func NewService(cfg aws.Config) Iface {
 	return &service{
 		// The STS client is built only to resolve its options the way the SDK
@@ -94,81 +84,55 @@ func NewService(cfg aws.Config) Iface {
 	}
 }
 
-func (s *service) GetTrustBundles(ctx context.Context, providerArn string) ([]TrustBundle, error) {
-	body := url.Values{
-		"Action":      {operationGetTrustBundles},
-		"Version":     {apiVersion},
-		"ProviderArn": {providerArn},
-	}.Encode()
-
-	var decoded getTrustBundlesResponse
-	if err := s.call(ctx, nil, body, &decoded); err != nil {
-		return nil, &smithy.OperationError{
-			ServiceID:     awssts.ServiceID,
-			OperationName: operationGetTrustBundles,
-			Err:           err,
-		}
+// invoke makes one awsQuery call to operation, signed with creds, and decodes a
+// successful response into out. params, which may be nil, writes the input
+// members with the SDK's query encoder; Action and Version are written after it,
+// so it cannot override them. Errors come wrapped in a smithy.OperationError.
+func (s *service) invoke(ctx context.Context, creds aws.Credentials, operation string, params func(*query.Object), out any) error {
+	var body bytes.Buffer
+	encoder := query.NewEncoder(&body)
+	input := encoder.Object()
+	if params != nil {
+		params(input)
 	}
-
-	entries := make([]TrustBundle, 0, len(decoded.Result.TrustBundles.Members))
-	for _, member := range decoded.Result.TrustBundles.Members {
-		entries = append(entries, TrustBundle(member))
+	input.Key("Action").String(operation)
+	input.Key("Version").String(apiVersion)
+	err := encoder.Encode()
+	if err != nil {
+		err = &smithy.SerializationError{Err: err}
+	} else {
+		err = s.call(ctx, creds, body.String(), out)
 	}
-	return entries, nil
+	if err != nil {
+		return &smithy.OperationError{ServiceID: awssts.ServiceID, OperationName: operation, Err: err}
+	}
+	return nil
 }
 
-// getTrustBundlesResponse is the awsQuery response shape of GetTrustBundles. A
-// list is a sequence of member elements under the list's own element, and the
-// output structure sits under the operation's Result element.
-type getTrustBundlesResponse struct {
-	XMLName xml.Name `xml:"GetTrustBundlesResponse"`
-	Result  struct {
-		TrustBundles struct {
-			Members []struct {
-				TrustDomain string `xml:"TrustDomain"`
-				Bundle      string `xml:"Bundle"`
-			} `xml:"member"`
-		} `xml:"TrustBundles"`
-	} `xml:"GetTrustBundlesResult"`
-}
-
-// call signs and sends one awsQuery request and decodes a successful response
-// into out. It makes one attempt. The calling tier owns retrying, on its own
-// backoff, and a retry loop here would multiply that against every node's
-// schedule during an STS outage.
-//
-// signWith names the credentials to sign with. Nil means the client's own, which
-// is the node role: that is what GetTrustBundles wants, since it names its target
-// provider as a request input. An operation whose result depends on who asked,
-// GetWorkloadIdentityCertificate being the one, passes a workload's session
-// credentials instead.
-func (s *service) call(ctx context.Context, signWith *aws.Credentials, body string, out any) error {
+// call signs one awsQuery request body with creds, sends it, and decodes a
+// successful response into out. It makes one attempt: a retry loop here would
+// multiply the calling tier's own backoff during an STS outage.
+func (s *service) call(ctx context.Context, creds aws.Credentials, body string, out any) error {
 	endpoint, signingRegion, err := s.resolveEndpoint(ctx)
 	if err != nil {
 		return err
 	}
-	var creds aws.Credentials
-	switch {
-	case signWith != nil:
-		creds = *signWith
-	case s.options.Credentials == nil:
-		return errors.New("no AWS credentials are configured to sign the request with")
-	default:
-		if creds, err = s.options.Credentials.Retrieve(ctx); err != nil {
-			return fmt.Errorf("retrieving credentials to sign the request: %w", err)
-		}
+	if !creds.HasKeys() {
+		return errors.New("no AWS credentials to sign the request with")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.URI.String(), strings.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("building the request: %w", err)
 	}
+	// Headers the endpoint rules require, then the awsQuery content type.
 	for name := range endpoint.Headers {
 		req.Header.Set(name, endpoint.Headers.Get(name))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
 	req.Header.Set("User-Agent", "eks-pod-identity-agent/"+configuration.AgentVersion)
 
+	// SigV4 over the body's hash, scoped to STS in the endpoint's signing region.
 	payloadHash := sha256.Sum256([]byte(body))
 	if err := s.signer.SignHTTP(ctx, creds, req, hex.EncodeToString(payloadHash[:]), signingName, signingRegion, s.now().UTC()); err != nil {
 		return fmt.Errorf("signing the request: %w", err)
@@ -212,7 +176,9 @@ func (s *service) resolveEndpoint(ctx context.Context) (endpoint smithyEndpoint,
 	signingRegion = s.options.Region
 	if options, ok := smithyauth.GetAuthOptions(&resolved.Properties); ok {
 		for _, option := range options {
-			if option.SchemeID != smithyauth.SchemeIDSigV4 {
+			// STS's endpoint rules name the scheme in full before sts v1.43.0 and
+			// as plain "sigv4" from then on; the SDK accepts both.
+			if option.SchemeID != smithyauth.SchemeIDSigV4 && option.SchemeID != "sigv4" {
 				continue
 			}
 			if region, ok := smithyhttp.GetSigV4SigningRegion(&option.SignerProperties); ok && region != "" {
