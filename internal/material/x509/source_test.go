@@ -120,7 +120,7 @@ func TestX509SVIDsDoesNotClampToTheSession(t *testing.T) {
 
 // TestX509SVIDsCoalescesConcurrentRequests covers the cost property: a burst of
 // streams opening for one pod is one issuance, because each issuance is a real
-// signing operation the customer is billed for.
+// signing operation at the customer's certificate authority.
 func TestX509SVIDsCoalescesConcurrentRequests(t *testing.T) {
 	ca := newTestCA(t)
 	now := time.Now()

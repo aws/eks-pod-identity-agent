@@ -57,5 +57,7 @@ func buildCSR(key crypto.Signer) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("building the certificate signing request: %w", err)
 	}
+	// EncodeToMemory cannot fail here. It returns nil rather than an error, and the only
+	// thing that makes it do so is a header key containing a colon; we pass no headers.
 	return string(pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificateRequest, Bytes: der})), nil
 }

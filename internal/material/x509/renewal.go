@@ -44,8 +44,8 @@ func renewalPoint(notBefore, notAfter time.Time, fraction, jitter float64, draw 
 //
 // Normally the renewal moment is ahead of us and we wait until then. It can be in the
 // past, if the certificate was short lived or earlier attempts failed, and then we wait
-// ten seconds rather than retrying immediately. Every attempt costs the customer a
-// signing operation, so retrying without a pause would spend them in a loop.
+// ten seconds rather than retrying immediately. Every attempt is a signing operation at
+// the customer's certificate authority, so retrying without a pause would hammer it.
 func renewalDelay(now, at time.Time) time.Duration {
 	if delay := at.Sub(now); delay > minRenewalDelay {
 		return delay

@@ -34,9 +34,9 @@ import (
 // The timing defaults, and why each has the value it does.
 //
 // One fact sets most of them: a certificate we ask for is a signing operation at the
-// customer's certificate authority, which they are billed for. So the defaults lean
-// towards asking less often and tolerating a late replacement, which a certificate
-// valid for hours can absorb.
+// customer's own certificate authority, which is rate limited and not free. So the
+// defaults lean towards asking less often and tolerating a late replacement, which a
+// certificate valid for hours can absorb.
 //
 // Three of them are related and should be changed together. The janitor interval is
 // also the retry interval for a failed replacement, because a due entry stays due. The
@@ -173,8 +173,8 @@ type Source struct {
 	// opens one stream for its certificate and another for the trust bundle; Envoy
 	// subscribes separately for its certificate and for what it should trust; and
 	// every container in the pod shares the same socket. So one pod starting up can
-	// easily produce several requests at the same moment, and each certificate we ask
-	// for costs the customer a signing operation.
+	// easily produce several requests at the same moment, and each certificate we ask for
+	// is a signing operation at the customer's certificate authority.
 	group   singleflight.Group
 	limiter *rate.Limiter
 
@@ -438,8 +438,8 @@ func (s *Source) onRefresh(uid string, cached entry) {
 // key. Without it, nothing does: deletion reaches this tier only as a renewal failure,
 // and the agent would hold a dead pod's key until the certificate expired, up to twelve
 // hours. Upstream issue 171 reports the same shape of bug on the AWS credentials path,
-// where ghost renewals for terminated pods consume EKS Auth capacity; here each one is
-// a signing operation the customer is billed for.
+// where ghost renewals for terminated pods consume EKS Auth capacity; here each one is a
+// signing operation against the customer's own certificate authority.
 //
 // Deliberately a named set rather than "not retryable". ErrIssuanceRefused is also not
 // retryable, and means a malformed request or a Provider with no signer, neither of
@@ -477,8 +477,8 @@ func checkIdentity(leafID, reportedSubject string) error {
 }
 
 // refusalCodes are the failures where trying again would get the same answer, so we
-// mark them as refused rather than as something to retry. Retrying costs the customer
-// another signing operation for nothing.
+// mark them as refused rather than as something to retry. Retrying spends another
+// signing operation at the customer's certificate authority for nothing.
 //
 // The first three are the only failures the STS operation itself defines: a request
 // it would not accept, which means we built it wrong; a provider with no certificate
