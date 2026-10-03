@@ -440,15 +440,19 @@ func TestRegistry_AChange_NotifiesOnlyThatProvidersStreams(t *testing.T) {
 			ok(sts.TrustBundle{TrustDomain: peerDomain, Bundle: bundleDoc(t, 0, k1, jwtECKey(t, "k2", newECKey(t)))}),
 		),
 	})
-	registry, notifier, _ := newTestRegistry(t, fetcher)
+	registry, notifier, sessions := newTestRegistry(t, fetcher)
+	// the streams resolve their providers as the tier does
+	notifier.Providers = workloadidentity.SessionProviderArns(sessions)
 	ctx := context.Background()
-	ownStream, releaseOwn := notifier.SubscribeToJWTBundles(ctx, testProviderArn)
+	ownStream, releaseOwn, err := notifier.SubscribeToJWTBundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
 	defer releaseOwn()
-	otherStream, releaseOther := notifier.SubscribeToJWTBundles(ctx, otherProviderArn)
+	otherStream, releaseOther, err := notifier.SubscribeToJWTBundles(ctx, otherPod)
+	g.Expect(err).ToNot(HaveOccurred())
 	defer releaseOther()
 	<-ownStream
 	<-otherStream
-	_, err := registry.JWTBundles(ctx, ownPod)
+	_, err = registry.JWTBundles(ctx, ownPod)
 	g.Expect(err).ToNot(HaveOccurred())
 	_, err = registry.JWTBundles(ctx, otherPod)
 	g.Expect(err).ToNot(HaveOccurred())

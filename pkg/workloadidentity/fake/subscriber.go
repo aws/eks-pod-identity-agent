@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 
+	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -34,10 +35,10 @@ const (
 type Subscription struct {
 	// Kind is which Subscribe method produced this subscription.
 	Kind SubscriptionKind
-	// Workload is the workload SubscribeToWorkloadMaterial was called with, nil
-	// for a bundle subscription, which has no workload to pass.
+	// Workload is the workload the subscribe was called with.
 	Workload *workloadidentity.Workload
-	// ProviderArn is the provider ARN the subscribe was called with.
+	// ProviderArn is what Subscriber.Providers resolved Workload to, empty when
+	// Providers is nil.
 	ProviderArn string
 
 	mu            sync.Mutex
@@ -133,11 +134,15 @@ func (s *Subscription) wantsCertBundle() bool {
 // BundleNotifier, so one value stands in for whichever side a test is driving.
 //
 // Set the fields before use; they are not safe to write once a call can be in
-// flight. There are no setters because there is no canned return value to change:
-// a subscribe cannot fail, and delivery is driven by the Notify methods.
+// flight. A subscribe fails only as the hub's does, when the Gate turns it away or
+// Providers cannot name a provider; delivery is driven by the Notify methods.
 type Subscriber struct {
 	Gate
 
+	// Providers names each subscription's provider, as the hub's resolver does:
+	// its error, or an empty ARN, fails the subscribe. When nil every subscribe
+	// succeeds with an empty ProviderArn.
+	Providers workloadidentity.ProviderArnResolver
 	// Buffer sizes each subscription's channel. Defaults to 1 when zero, which
 	// is the coalescing shape the notification tier uses.
 	Buffer int
@@ -151,7 +156,7 @@ type Subscriber struct {
 	// CancelCalls see nothing of that call. SubscribeCalls still counts it.
 	//
 	// It is handed the kind, so one Func serves all three methods.
-	Func func(ctx context.Context, kind SubscriptionKind, w *workloadidentity.Workload, providerArn string) (<-chan struct{}, func())
+	Func func(ctx context.Context, kind SubscriptionKind, w *workloadidentity.Workload) (<-chan struct{}, func(), error)
 
 	mu              sync.Mutex
 	subscribeCalls  int
@@ -163,52 +168,58 @@ type Subscriber struct {
 }
 
 // SubscribeToWorkloadMaterial records a KindWorkloadMaterial Subscription for w
-// and the provider, and returns its channel and a release func.
-func (s *Subscriber) SubscribeToWorkloadMaterial(ctx context.Context, w *workloadidentity.Workload, providerArn string) (<-chan struct{}, func()) {
-	return s.subscribe(ctx, KindWorkloadMaterial, w, providerArn)
+// and its provider, and returns its channel and a release func.
+func (s *Subscriber) SubscribeToWorkloadMaterial(ctx context.Context, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	return s.subscribe(ctx, KindWorkloadMaterial, w)
 }
 
-// SubscribeToCertBundles records a KindCertBundles Subscription for the
-// provider. Its Workload is nil, which is what tells it apart from a workload
-// material subscription in Subscriptions().
-func (s *Subscriber) SubscribeToCertBundles(ctx context.Context, providerArn string) (<-chan struct{}, func()) {
-	return s.subscribe(ctx, KindCertBundles, nil, providerArn)
+// SubscribeToCertBundles records a KindCertBundles Subscription for w's
+// provider. NotifyWorkload never reaches it, as the hub's per-pod signal does not.
+func (s *Subscriber) SubscribeToCertBundles(ctx context.Context, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	return s.subscribe(ctx, KindCertBundles, w)
 }
 
-// SubscribeToJWTBundles records a KindJWTBundles Subscription for the provider.
-func (s *Subscriber) SubscribeToJWTBundles(ctx context.Context, providerArn string) (<-chan struct{}, func()) {
-	return s.subscribe(ctx, KindJWTBundles, nil, providerArn)
+// SubscribeToJWTBundles records a KindJWTBundles Subscription for w's provider.
+func (s *Subscriber) SubscribeToJWTBundles(ctx context.Context, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	return s.subscribe(ctx, KindJWTBundles, w)
 }
 
-// subscribe is what all three Subscribe methods record through.
-//
-// It parks at the Gate first, so a test can hold a subscribe open. A subscribe has
-// no error return, so a Gate error is discarded: the call still gets a usable
-// channel and release func, and a done ctx simply means it never receives a signal.
-//
-// The call is counted and recorded under one lock, so a test polling SubscribeCalls
-// as a synchronisation point cannot see the count move before Subscriptions knows
-// of the call. Func runs after the lock is dropped, so a Func that calls back into
-// the fake does not deadlock.
-func (s *Subscriber) subscribe(ctx context.Context, kind SubscriptionKind, w *workloadidentity.Workload, providerArn string) (<-chan struct{}, func()) {
-	// The Gate error is deliberately ignored; see the doc comment.
-	_ = s.enter(ctx)
+// subscribe is what all three Subscribe methods record through. A call the Gate
+// turns away returns its error uncounted; every other call counts, and is counted
+// and recorded under one lock so SubscribeCalls never runs ahead of Subscriptions.
+// Func and Providers run without the lock, so either may call back into the fake.
+func (s *Subscriber) subscribe(ctx context.Context, kind SubscriptionKind, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	if err := s.enter(ctx); err != nil {
+		return nil, nil, err
+	}
+	if s.Func != nil {
+		func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.subscribeCalls++
+		}()
+		return s.Func(ctx, kind, w)
+	}
 
-	s.mu.Lock()
-	s.subscribeCalls++
-	fn, buffer, closeOnCancel := s.Func, s.Buffer, s.CloseOnCancel
-	var sub *Subscription
-	if fn == nil {
+	providerArn, err := s.providerOf(ctx, w)
+	sub := func() *Subscription {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.subscribeCalls++
+		if err != nil {
+			return nil
+		}
+		buffer := s.Buffer
 		if buffer <= 0 {
 			buffer = 1
 		}
-		sub = &Subscription{
+		sub := &Subscription{
 			Kind:          kind,
 			Workload:      w,
 			ProviderArn:   providerArn,
 			ch:            make(chan struct{}, buffer),
 			ctx:           ctx,
-			closeOnCancel: closeOnCancel,
+			closeOnCancel: s.CloseOnCancel,
 		}
 		// A live subscribe comes back primed, as the real tier does, so a
 		// wait-then-send handler produces its initial response. The prime is not
@@ -218,13 +229,28 @@ func (s *Subscriber) subscribe(ctx context.Context, kind SubscriptionKind, w *wo
 			sub.ch <- struct{}{}
 		}
 		s.subs = append(s.subs, sub)
+		return sub
+	}()
+	if err != nil {
+		return nil, nil, err
 	}
-	s.mu.Unlock()
+	return sub.ch, func() { s.cancelSubscription(sub) }, nil
+}
 
-	if fn != nil {
-		return fn(ctx, kind, w, providerArn)
+// providerOf names w's provider through Providers, failing as the hub does on an
+// error or an empty ARN, and answers "" when Providers is nil.
+func (s *Subscriber) providerOf(ctx context.Context, w *workloadidentity.Workload) (string, error) {
+	if s.Providers == nil {
+		return "", nil
 	}
-	return sub.ch, func() { s.cancelSubscription(sub) }
+	providerArn, err := s.Providers.ProviderArn(ctx, w)
+	if err != nil {
+		return "", err
+	}
+	if providerArn == "" {
+		return "", wierrors.ErrNotEnrolled.Wrapf(nil, "the workload names no workload identity provider")
+	}
+	return providerArn, nil
 }
 
 // NotifyWorkloadChange signals the live workload material subscriptions for the

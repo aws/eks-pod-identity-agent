@@ -2,6 +2,8 @@ package notify
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"testing"
@@ -10,7 +12,9 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 )
 
 // The metric collectors are package-level and shared by every Subscriber, so a test
@@ -33,6 +37,24 @@ const (
 	// prove a rotation is scoped to one.
 	hubOtherProvider = "arn:aws:iam::111122223333:workload-identity-provider/provider-b"
 )
+
+// newTestHub resolves every pod to hubTestProvider except pod-other, which is
+// hubOtherProvider's.
+func newTestHub() *Hub {
+	return NewHub(&fake.ProviderArnResolver{
+		Arn:  hubTestProvider,
+		Arns: map[string]string{"pod-other": hubOtherProvider},
+	})
+}
+
+// hubMust takes a subscribe's results and fails loudly on an error, for the
+// tests whose subscribe has no reason to fail.
+func hubMust(ch <-chan struct{}, release func(), err error) (<-chan struct{}, func()) {
+	if err != nil {
+		panic(fmt.Sprintf("subscribe failed: %v", err))
+	}
+	return ch, release
+}
 
 // hubWorkload builds an attested caller for one pod UID.
 func hubWorkload(podUID string) *workloadidentity.Workload {
@@ -135,20 +157,20 @@ func TestHubForRPC_EmptyLabel_Panics(t *testing.T) {
 
 	// An unlabelled series is one no dashboard and no alarm looks at, and the only
 	// way to get one is a wiring mistake, so it fails at wiring time.
-	g.Expect(func() { NewHub().ForRPC("") }).To(Panic())
+	g.Expect(func() { newTestHub().ForRPC("") }).To(Panic())
 }
 
 func TestHubSubscribeToWorkloadMaterial_PodRenewal_SignalsOnlyThatPod(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_pod_scope")
 
-	firstCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), hubTestProvider)
+	firstCh, _ := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a")))
 	// A second stream for the same pod, which is what a library holding an SVID
 	// stream beside a bundle stream looks like.
-	secondCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), hubTestProvider)
-	otherCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-b"), hubTestProvider)
+	secondCh, _ := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a")))
+	otherCh, _ := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-b")))
 	hubDrainPrimes(t, firstCh, secondCh, otherCh)
 
 	hubDo(t, func() { hub.NotifyWorkloadChange("pod-a") })
@@ -169,12 +191,12 @@ func TestHubSubscribeToWorkloadMaterial_PodRenewal_SignalsOnlyThatPod(t *testing
 func TestHubNotifyBundleChange_CertAndJWT_ReachDisjointAudiences(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_bundle_kinds")
 
-	materialCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), hubTestProvider)
-	certCh, _ := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
-	jwtCh, _ := stream.SubscribeToJWTBundles(context.Background(), hubTestProvider)
+	materialCh, _ := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a")))
+	certCh, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
+	jwtCh, _ := hubMust(stream.SubscribeToJWTBundles(context.Background(), hubWorkload("pod-a")))
 	hubDrainPrimes(t, materialCh, certCh, jwtCh)
 
 	// The X.509 authorities verify the peers of a stream serving an SVID, so the
@@ -201,12 +223,12 @@ func TestHubNotifyBundleChange_CertAndJWT_ReachDisjointAudiences(t *testing.T) {
 func TestHubNotifyBundleChange_OtherProvider_SignalsNothing(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_provider_scope")
 
-	materialCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), hubTestProvider)
-	certCh, _ := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
-	otherCh, _ := stream.SubscribeToCertBundles(context.Background(), hubOtherProvider)
+	materialCh, _ := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a")))
+	certCh, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
+	otherCh, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-other")))
 	hubDrainPrimes(t, materialCh, certCh, otherCh)
 
 	// A node hosts the pods of however many providers its associations name. A
@@ -230,42 +252,65 @@ func TestHubNotifyBundleChange_OtherProvider_SignalsNothing(t *testing.T) {
 	g.Expect(hubSignals(otherCh)).To(Equal(0))
 }
 
-func TestHubSubscribe_EmptyKeys_AreNeverSignalled(t *testing.T) {
+func TestHubSubscribe_UnresolvableWorkload_FailsAndRegistersNothing(t *testing.T) {
+	errUnavailable := errors.New("session unavailable")
+	for name, tc := range map[string]struct {
+		providers *fake.ProviderArnResolver
+		workload  *workloadidentity.Workload
+		expected  error
+	}{
+		"no workload":           {providers: &fake.ProviderArnResolver{Arn: hubTestProvider}, expected: wierrors.ErrUnattestable},
+		"a resolver error":      {providers: &fake.ProviderArnResolver{Err: errUnavailable}, workload: hubWorkload("pod-a"), expected: errUnavailable},
+		"no provider for a pod": {providers: &fake.ProviderArnResolver{}, workload: hubWorkload("pod-a"), expected: wierrors.ErrNotEnrolled},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			hub := NewHub(tc.providers)
+			stream := hub.ForRPC("test_unresolvable")
+			base := hubCounts(stream)
+
+			for _, subscribe := range []func(context.Context, *workloadidentity.Workload) (<-chan struct{}, func(), error){
+				stream.SubscribeToWorkloadMaterial, stream.SubscribeToCertBundles, stream.SubscribeToJWTBundles,
+			} {
+				ch, release, err := subscribe(context.Background(), tc.workload)
+				g.Expect(err).To(MatchError(tc.expected))
+				g.Expect(ch).To(BeNil())
+				g.Expect(release).To(BeNil())
+			}
+
+			g.Expect(hubCounts(stream).since(base).active).To(BeZero())
+			hub.mu.Lock()
+			defer hub.mu.Unlock()
+			g.Expect(hub.all).To(BeEmpty())
+		})
+	}
+}
+
+func TestHubSubscribe_BundleSubscriptions_AreNotIndexedByPod(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
-	stream := hub.ForRPC("test_empty_keys")
-
-	// A nil workload and an empty provider: both degenerate, neither a panic.
-	nilWorkloadCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), nil, hubTestProvider)
-	noProviderCh, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), "")
-	hubDrainPrimes(t, nilWorkloadCh, noProviderCh)
+	hub := newTestHub()
+	stream := hub.ForRPC("test_bundles_not_by_pod")
+	certCh, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
+	jwtCh, _ := hubMust(stream.SubscribeToJWTBundles(context.Background(), hubWorkload("pod-a")))
+	hubDrainPrimes(t, certCh, jwtCh)
 
 	hubDo(t, func() { hub.NotifyWorkloadChange("pod-a") })
-	// The one with no provider still has a pod, so a renewal reaches it.
-	g.Expect(hubSignals(noProviderCh)).To(Equal(1))
-	// The one with no pod cannot be named by a renewal.
-	g.Expect(hubSignals(nilWorkloadCh)).To(Equal(0))
 
-	hubDo(t, func() { hub.NotifyCertBundleChange(hubTestProvider) })
-	g.Expect(hubSignals(nilWorkloadCh)).To(Equal(1))
-	g.Expect(hubSignals(noProviderCh)).To(Equal(0))
-
-	// Neither index kept an empty key, so nothing is left behind to leak.
+	g.Expect(hubSignals(certCh)).To(Equal(0), "an SVID renewal is not news to a bundle stream")
+	g.Expect(hubSignals(jwtCh)).To(Equal(0))
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
-	g.Expect(hub.byPod).To(HaveLen(1))
-	g.Expect(hub.byProviderCert).To(HaveLen(1))
-	g.Expect(hub.byProviderJWT).To(BeEmpty())
+	g.Expect(hub.byPod).To(BeEmpty())
 }
 
 func TestHubSignal_SubscriberNotReading_CoalescesToOnePending(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_coalesce")
 	base := hubCounts(stream)
-	ch, _ := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
+	ch, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
 	hubDrainPrimes(t, ch)
 
 	// Publishing repeatedly while nobody reads must neither block nor queue. A
@@ -294,9 +339,9 @@ func TestHubSignal_SubscriberNotReading_CoalescesToOnePending(t *testing.T) {
 func TestHubSignal_SlowSubscriber_ObservesTheNewestStateThroughOnePending(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_latest_wins")
-	ch, _ := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
+	ch, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
 
 	// The source the subscriber re-reads on waking. Each publish moves it, which is
 	// what a sequence of rotations looks like to a handler.
@@ -342,9 +387,9 @@ func TestHubSignal_SlowSubscriber_ReceiveIsOrderedAfterTheLatestPublish(t *testi
 
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_ordering")
-	ch, _ := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
+	ch, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
 	hubDrainPrimes(t, ch)
 
 	// An unlocked source, read by the subscriber and written by the publisher. The
@@ -388,13 +433,13 @@ func TestHubBundleChange_ManySubscribers_AllWoken(t *testing.T) {
 
 	const subscriptions = 500
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_fan_out")
 	base := hubCounts(stream)
 
 	channels := make([]<-chan struct{}, 0, subscriptions)
 	for range subscriptions {
-		ch, _ := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
+		ch, _ := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
 		channels = append(channels, ch)
 	}
 	hubDrainPrimes(t, channels...)
@@ -414,10 +459,10 @@ func TestHubBundleChange_ManySubscribers_AllWoken(t *testing.T) {
 func TestHubRelease_CalledTwice_IsSafeAndStopsDelivery(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_release_twice")
 	base := hubCounts(stream)
-	ch, release := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), hubTestProvider)
+	ch, release := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a")))
 	hubDrainPrimes(t, ch)
 
 	hubDo(t, func() { hub.NotifyWorkloadChange("pod-a") })
@@ -445,9 +490,9 @@ func TestHubRelease_CalledTwice_IsSafeAndStopsDelivery(t *testing.T) {
 func TestHubRelease_ChannelIsNotClosed(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_no_close")
-	ch, release := stream.SubscribeToCertBundles(context.Background(), hubTestProvider)
+	ch, release := hubMust(stream.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
 	hubDrainPrimes(t, ch)
 
 	release()
@@ -466,12 +511,12 @@ func TestHubRelease_ChannelIsNotClosed(t *testing.T) {
 func TestHubSubscribe_ContextCancelled_ReleasesWithoutAnExplicitRelease(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_ctx_release")
 	base := hubCounts(stream)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ch, _ := stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a"), hubTestProvider)
+	ch, _ := hubMust(stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a")))
 	hubDrainPrimes(t, ch)
 
 	hubDo(t, func() { hub.NotifyWorkloadChange("pod-a") })
@@ -496,13 +541,13 @@ func TestHubSubscribe_ContextCancelled_ReleasesWithoutAnExplicitRelease(t *testi
 func TestHubSubscribe_ContextAlreadyDone_RegistersNothingAndIsNotPrimed(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_ctx_done")
 	base := hubCounts(stream)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	ch, release := stream.SubscribeToCertBundles(ctx, hubTestProvider)
+	ch, release := hubMust(stream.SubscribeToCertBundles(ctx, hubWorkload("pod-a")))
 
 	// The stream is already over, so there is nobody to wake. Registering would
 	// put an entry in the indexes for every publish to walk until the context hook
@@ -531,7 +576,7 @@ func TestHubSubscribe_ManyOpenSubscriptions_HoldNoGoroutine(t *testing.T) {
 
 	const subscriptions = 1000
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_open_goroutines")
 
 	// An open subscription has to cost a channel and two map entries and nothing
@@ -544,7 +589,7 @@ func TestHubSubscribe_ManyOpenSubscriptions_HoldNoGoroutine(t *testing.T) {
 	for range subscriptions {
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		_, release := stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a"), hubTestProvider)
+		_, release := hubMust(stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a")))
 		releases = append(releases, release)
 	}
 
@@ -562,12 +607,12 @@ func TestHubSubscribe_ManyOpenSubscriptions_HoldNoGoroutine(t *testing.T) {
 func TestHubPublish_DoesNotAllocate(t *testing.T) {
 	const subscriptions = 200
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_allocations")
 
 	channels := make([]<-chan struct{}, 0, subscriptions)
 	for range subscriptions {
-		ch, _ := stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a"), hubTestProvider)
+		ch, _ := hubMust(stream.SubscribeToWorkloadMaterial(context.Background(), hubWorkload("pod-a")))
 		channels = append(channels, ch)
 	}
 	hubDrainPrimes(t, channels...)
@@ -610,12 +655,12 @@ func TestHubPublish_DoesNotAllocate(t *testing.T) {
 func TestHubRelease_ExplicitThenContext_MovesTheGaugeOnce(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_double_path_release")
 	base := hubCounts(stream)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	_, release := stream.SubscribeToCertBundles(ctx, hubTestProvider)
+	_, release := hubMust(stream.SubscribeToCertBundles(ctx, hubWorkload("pod-a")))
 
 	g.Expect(hubCounts(stream).since(base).active).To(Equal(float64(1)))
 
@@ -632,7 +677,7 @@ func TestHubRelease_ExplicitThenContext_MovesTheGaugeOnce(t *testing.T) {
 func TestHubSubscribe_ManyCycles_LeaksNoGoroutines(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_goroutines")
 
 	// A released subscription must cost nothing afterwards. context.AfterFunc is
@@ -642,7 +687,7 @@ func TestHubSubscribe_ManyCycles_LeaksNoGoroutines(t *testing.T) {
 
 	for range 1000 {
 		ctx, cancel := context.WithCancel(context.Background())
-		_, release := stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a"), hubTestProvider)
+		_, release := hubMust(stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a")))
 		release()
 		cancel()
 	}
@@ -662,7 +707,7 @@ func TestHub_ConcurrentSubscribePublishRelease_IsRaceFree(t *testing.T) {
 
 	const workers = 24
 
-	hub := NewHub()
+	hub := newTestHub()
 	stream := hub.ForRPC("test_concurrency")
 	base := hubCounts(stream)
 
@@ -673,7 +718,7 @@ func TestHub_ConcurrentSubscribePublishRelease_IsRaceFree(t *testing.T) {
 			defer wg.Done()
 			for range 50 {
 				ctx, cancel := context.WithCancel(context.Background())
-				ch, release := stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a"), hubTestProvider)
+				ch, release := hubMust(stream.SubscribeToWorkloadMaterial(ctx, hubWorkload("pod-a")))
 				_ = hubSignals(ch)
 				// Half release explicitly and half leave it to the context, so both
 				// teardown paths run against a live fan-out.
@@ -712,13 +757,13 @@ func TestHub_ConcurrentSubscribePublishRelease_IsRaceFree(t *testing.T) {
 func TestHubForRPC_SeparateLabels_CountIndependently(t *testing.T) {
 	g := NewWithT(t)
 
-	hub := NewHub()
+	hub := newTestHub()
 	first := hub.ForRPC("test_label_first")
 	second := hub.ForRPC("test_label_second")
 	firstBase, secondBase := hubCounts(first), hubCounts(second)
 
-	firstCh, _ := first.SubscribeToCertBundles(context.Background(), hubTestProvider)
-	secondCh, _ := second.SubscribeToCertBundles(context.Background(), hubTestProvider)
+	firstCh, _ := hubMust(first.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
+	secondCh, _ := hubMust(second.SubscribeToCertBundles(context.Background(), hubWorkload("pod-a")))
 	hubDrainPrimes(t, firstCh, secondCh)
 
 	// One hub, one publish, two RPCs: the fan-out reaches both, and each RPC's

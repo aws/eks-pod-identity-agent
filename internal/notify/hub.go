@@ -27,6 +27,7 @@ import (
 	"context"
 	"sync"
 
+	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -37,6 +38,10 @@ import (
 // One index per publish method, so a publish walks exactly its audience and
 // tests nothing as it goes.
 type Hub struct {
+	// providers names each subscriber's provider, the same resolver the bundle
+	// tier keys its notifications by.
+	providers workloadidentity.ProviderArnResolver
+
 	mu sync.Mutex
 	// all is every live subscription. Membership is the liveness flag, which is
 	// what makes release idempotent without a second piece of state. Nothing
@@ -53,9 +58,11 @@ type Hub struct {
 	byProviderJWT map[string]map[*subscription]struct{}
 }
 
-// NewHub returns an empty Hub. It owns no goroutine and needs no shutdown.
-func NewHub() *Hub {
+// NewHub returns an empty Hub that resolves each subscriber's provider through
+// providers. It owns no goroutine and needs no shutdown.
+func NewHub(providers workloadidentity.ProviderArnResolver) *Hub {
 	return &Hub{
+		providers:      providers,
 		all:            make(map[*subscription]struct{}),
 		byPod:          make(map[string]map[*subscription]struct{}),
 		byProviderCert: make(map[string]map[*subscription]struct{}),
@@ -70,7 +77,7 @@ func NewHub() *Hub {
 type subscription struct {
 	// podUID is empty for a bundle-only subscription.
 	podUID string
-	// providerArn comes from the caller's session.
+	// providerArn is the workload's resolved provider.
 	providerArn string
 	// ch is depth one and never closed: a closed channel receives forever, which
 	// would spin a handler racing its own teardown. Build it with
@@ -144,41 +151,64 @@ func (h *Hub) ForRPC(rpc string) *Subscriber {
 // SubscribeToWorkloadMaterial is woken by the workload's own credential changes
 // and by its provider's X.509 rotations, the two things a stream serving an SVID
 // beside its peers' anchors has to react to.
-//
-// A nil workload or an empty pod UID gets no per-pod signal. Every caller
-// attests before subscribing, so that is degenerate rather than supported.
-func (s *Subscriber) SubscribeToWorkloadMaterial(ctx context.Context, w *workloadidentity.Workload, providerArn string) (<-chan struct{}, func()) {
-	podUID := ""
-	if w != nil {
-		podUID = w.PodUID
+func (s *Subscriber) SubscribeToWorkloadMaterial(ctx context.Context, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	providerArn, err := s.hub.providerOf(ctx, w)
+	if err != nil {
+		return nil, nil, err
 	}
-	return s.hub.subscribe(ctx, s.metrics, podUID, providerArn, func(h *Hub, sub *subscription) {
-		addLocked(h.byPod, podUID, sub)
+	ch, release := s.hub.subscribe(ctx, s.metrics, w.PodUID, providerArn, func(h *Hub, sub *subscription) {
+		addLocked(h.byPod, w.PodUID, sub)
 		addLocked(h.byProviderCert, providerArn, sub)
 	})
+	return ch, release, nil
 }
 
-// SubscribeToCertBundles is woken only by the provider's X.509 rotations.
-func (s *Subscriber) SubscribeToCertBundles(ctx context.Context, providerArn string) (<-chan struct{}, func()) {
-	return s.hub.subscribe(ctx, s.metrics, "", providerArn, func(h *Hub, sub *subscription) {
+// SubscribeToCertBundles is woken only by the workload's provider's X.509
+// rotations; the subscription is not indexed by pod.
+func (s *Subscriber) SubscribeToCertBundles(ctx context.Context, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	providerArn, err := s.hub.providerOf(ctx, w)
+	if err != nil {
+		return nil, nil, err
+	}
+	ch, release := s.hub.subscribe(ctx, s.metrics, "", providerArn, func(h *Hub, sub *subscription) {
 		addLocked(h.byProviderCert, providerArn, sub)
 	})
+	return ch, release, nil
 }
 
-// SubscribeToJWTBundles is woken only by the provider's JWT rotations.
-func (s *Subscriber) SubscribeToJWTBundles(ctx context.Context, providerArn string) (<-chan struct{}, func()) {
-	return s.hub.subscribe(ctx, s.metrics, "", providerArn, func(h *Hub, sub *subscription) {
+// SubscribeToJWTBundles is woken only by the workload's provider's JWT rotations.
+func (s *Subscriber) SubscribeToJWTBundles(ctx context.Context, w *workloadidentity.Workload) (<-chan struct{}, func(), error) {
+	providerArn, err := s.hub.providerOf(ctx, w)
+	if err != nil {
+		return nil, nil, err
+	}
+	ch, release := s.hub.subscribe(ctx, s.metrics, "", providerArn, func(h *Hub, sub *subscription) {
 		addLocked(h.byProviderJWT, providerArn, sub)
 	})
+	return ch, release, nil
+}
+
+// providerOf resolves the workload's provider before anything is registered, so
+// a subscribe either fails whole or is indexed under a real ARN. Resolution can
+// do I/O, which is why it runs before, never under, h.mu.
+func (h *Hub) providerOf(ctx context.Context, w *workloadidentity.Workload) (string, error) {
+	if w == nil {
+		return "", wierrors.ErrUnattestable.Wrapf(nil, "a subscription names no workload")
+	}
+	providerArn, err := h.providers.ProviderArn(ctx, w)
+	if err != nil {
+		return "", err
+	}
+	if providerArn == "" {
+		return "", wierrors.ErrNotEnrolled.Wrapf(nil, "the workload names no workload identity provider")
+	}
+	return providerArn, nil
 }
 
 // subscribe registers one subscription in the audiences index puts it in and
 // returns its channel and release func. The index func is the only thing that
-// differs between the three Subscribe methods.
-//
-// Nothing is rejected here. A subscribe that cannot fail keeps the handler's
-// error mapping at the call that produced a missing value, which for a missing
-// provider is the session read returning ErrNotEnrolled.
+// differs between the three Subscribe methods, which have already resolved the
+// provider, so nothing is rejected here.
 func (h *Hub) subscribe(ctx context.Context, metrics *rpcMetrics, podUID, providerArn string, index func(*Hub, *subscription)) (<-chan struct{}, func()) {
 	sub := newSubscription(podUID, providerArn, metrics)
 

@@ -165,11 +165,11 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 
-	// The change notification tier, built once because both sides of it have to
-	// be the same value: the handlers subscribe through it and the bundle and
-	// SVID tiers publish to it. A second hub means a rotation that reaches no
-	// stream. It owns no goroutine, so there is nothing to start or shut down.
-	notificationHub := notify.NewHub()
+	// The change notification tier, built once because the handlers subscribe
+	// through it and the bundle and SVID tiers publish to it. It owns no goroutine.
+	// PLACEHOLDER(T10): pass the bundle tier's ProviderArnResolver once T5 is
+	// wired; nothing subscribes before the handlers replace the stub services.
+	notificationHub := notify.NewHub(nil)
 
 	// The workload identity socket is bound here, last, so a socket that cannot be
 	// bound fails the boot before anything is serving. The path is the constant

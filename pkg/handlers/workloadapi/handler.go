@@ -37,9 +37,6 @@ type Opts struct {
 	// Attestor resolves the process behind a connection. The handler attests on
 	// every RPC, since a Workload API request carries no identity.
 	Attestor workloadidentity.Attestor
-	// Sessions exchanges an attested workload for an AWS session, which is what
-	// names the provider for every bundle read. There is no node-level fallback.
-	Sessions workloadidentity.SessionProvider
 	// Certs yields the workload's X.509-SVIDs, minting or renewing as needed.
 	Certs workloadidentity.CertSource
 	// Tokens yields JWT-SVIDs for the audiences a caller asks for.
@@ -47,12 +44,9 @@ type Opts struct {
 	// Bundles yields trust material, which is per provider rather than per pod.
 	Bundles workloadidentity.BundleSource
 	// Subs is how a stream learns its material changed. Each streaming RPC
-	// subscribes on open with the provider ARN from its caller's session, and
-	// releases on end.
-	//
-	// One Subscriber for the whole handler, so all three streams share one RPC
-	// metric label. A field per RPC is a wiring change and nothing more, since
-	// the tier hands out a per-RPC view; whether that is worth it is T10's call.
+	// subscribes with the attested caller and releases on end. One Subscriber
+	// serves all three streams, so they share one RPC metric label; a field per
+	// RPC would be a wiring change only.
 	Subs workloadidentity.Subscriber
 }
 
@@ -91,20 +85,23 @@ func (h *Handler) Register(registrar grpc.ServiceRegistrar) {
 func (h *Handler) FetchX509SVID(_ *workload.X509SVIDRequest, stream grpc.ServerStreamingServer[workload.X509SVIDResponse]) error {
 	ctx := stream.Context()
 
-	caller, session, err := h.caller(ctx)
+	caller, err := h.caller(ctx)
 	if err != nil {
 		return err
 	}
 
-	signals, release := h.opts.Subs.SubscribeToWorkloadMaterial(ctx, caller, session.ProviderArn)
+	signals, release, err := h.opts.Subs.SubscribeToWorkloadMaterial(ctx, caller)
+	if err != nil {
+		return statusError(err)
+	}
 	defer release()
 
-	// PLACEHOLDER(T10): take BundleSource.Lease(ctx, session.ProviderArn) and
-	// defer its release beside this one, so T6 does not evict a provider whose
-	// only reader is waiting on a signal. Lease arrives with T6.
+	// PLACEHOLDER(T10): take BundleSource.Lease(ctx, caller) and defer its
+	// release beside this one, so T6 does not evict a provider whose only reader
+	// is waiting on a signal.
 
 	return serveStream(ctx, signals, func() error {
-		response, err := h.buildX509SVIDResponse(ctx, caller, session)
+		response, err := h.buildX509SVIDResponse(ctx, caller)
 		if err != nil {
 			return err
 		}
@@ -113,28 +110,28 @@ func (h *Handler) FetchX509SVID(_ *workload.X509SVIDRequest, stream grpc.ServerS
 }
 
 // FetchX509Bundles streams trust material only, for a caller that verifies peers
-// without holding an identity of its own. Its request carries no fields, so the
-// provider comes from the caller's session: this RPC needs a session even though
-// it never touches an SVID.
-//
-// Subscribes through SubscribeToCertBundles, so a renewed SVID it could not act
-// on never wakes it, and deduplicates as SPIRE's bundle streams do.
+// without an identity of its own. Its request carries no fields, so the attested
+// caller names the provider. It subscribes through SubscribeToCertBundles, so an
+// SVID renewal never wakes it, and deduplicates as SPIRE's bundle streams do.
 func (h *Handler) FetchX509Bundles(_ *workload.X509BundlesRequest, stream grpc.ServerStreamingServer[workload.X509BundlesResponse]) error {
 	ctx := stream.Context()
 
-	caller, session, err := h.caller(ctx)
+	caller, err := h.caller(ctx)
 	if err != nil {
 		return err
 	}
 
-	signals, release := h.opts.Subs.SubscribeToCertBundles(ctx, session.ProviderArn)
+	signals, release, err := h.opts.Subs.SubscribeToCertBundles(ctx, caller)
+	if err != nil {
+		return statusError(err)
+	}
 	defer release()
 
 	// PLACEHOLDER(T10): take the bundle lease, as in FetchX509SVID.
 
 	var last *workload.X509BundlesResponse
 	return serveStream(ctx, signals, func() error {
-		response, err := h.buildX509BundlesResponse(ctx, caller, session)
+		response, err := h.buildX509BundlesResponse(ctx, caller)
 		if err != nil {
 			return err
 		}
@@ -165,19 +162,22 @@ func (h *Handler) FetchJWTSVID(_ context.Context, _ *workload.JWTSVIDRequest) (*
 func (h *Handler) FetchJWTBundles(_ *workload.JWTBundlesRequest, stream grpc.ServerStreamingServer[workload.JWTBundlesResponse]) error {
 	ctx := stream.Context()
 
-	caller, session, err := h.caller(ctx)
+	caller, err := h.caller(ctx)
 	if err != nil {
 		return err
 	}
 
-	signals, release := h.opts.Subs.SubscribeToJWTBundles(ctx, session.ProviderArn)
+	signals, release, err := h.opts.Subs.SubscribeToJWTBundles(ctx, caller)
+	if err != nil {
+		return statusError(err)
+	}
 	defer release()
 
 	// PLACEHOLDER(T10): take the bundle lease, as in FetchX509SVID.
 
 	var last *workload.JWTBundlesResponse
 	return serveStream(ctx, signals, func() error {
-		response, err := h.buildJWTBundlesResponse(ctx, caller, session)
+		response, err := h.buildJWTBundlesResponse(ctx, caller)
 		if err != nil {
 			return err
 		}
@@ -192,13 +192,10 @@ func (h *Handler) FetchJWTBundles(_ *workload.JWTBundlesRequest, stream grpc.Ser
 	})
 }
 
-// ValidateJWTSVID verifies a token the caller presents and returns its SPIFFE ID
-// and claims. It validates someone else's token, so it needs the bundle rather
-// than the caller's own credential and does not require the caller to hold an SVID.
-//
-// PLACEHOLDER(T10): read the JWT bundles first, then validate with go-spiffe's
-// jwtsvid.ParseAndValidate. Reading first keeps a bundle outage reported as
-// Unavailable rather than as a rejected token.
+// ValidateJWTSVID verifies someone else's token and returns its SPIFFE ID and
+// claims, so it needs the bundle and not an SVID of the caller's own.
+// PLACEHOLDER(T10): get BundleSource.JWTSource(ctx, caller) before
+// jwtsvid.ParseAndValidate, so a bundle outage is Unavailable, not a bad token.
 func (h *Handler) ValidateJWTSVID(_ context.Context, _ *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "ValidateJWTSVID is not implemented yet")
 }
@@ -230,29 +227,23 @@ func serveStream(ctx context.Context, signals <-chan struct{}, sendCurrent func(
 	}
 }
 
-// caller attests the process on the other end of the stream and reads its AWS
-// session, which names the identity provider for every bundle read. The
-// connection comes from the server's transport credentials, the only route to it.
-func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, *workloadidentity.WorkloadSession, error) {
+// caller attests the process on the other end of the stream. The connection
+// comes from the server's transport credentials, the only route to it. Every
+// tier the handler reads takes the attested workload; none of them needs more.
+func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, error) {
 	conn, ok := grpcserver.ConnFromContext(ctx)
 	if !ok {
 		// The server was built without the conn-carrying credentials, so nobody
 		// on this socket can be attested. A wiring bug, but refusing is still the
 		// only safe answer.
-		return nil, nil, status.Error(codes.PermissionDenied, "the caller's connection is not available, so it cannot be attested")
+		return nil, status.Error(codes.PermissionDenied, "the caller's connection is not available, so it cannot be attested")
 	}
 
 	caller, err := h.opts.Attestor.Attest(ctx, conn)
 	if err != nil {
-		return nil, nil, statusError(err)
+		return nil, statusError(err)
 	}
-
-	session, err := h.opts.Sessions.Session(ctx, caller)
-	if err != nil {
-		return nil, nil, statusError(err)
-	}
-
-	return caller, session, nil
+	return caller, nil
 }
 
 // statusError maps a tier error onto a gRPC status.
@@ -267,21 +258,21 @@ func statusError(err error) error {
 //
 // PLACEHOLDER(T10): read CertSource and BundleSource, translate onto the wire
 // types.
-func (h *Handler) buildX509SVIDResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*workload.X509SVIDResponse, error) {
+func (h *Handler) buildX509SVIDResponse(_ context.Context, _ *workloadidentity.Workload) (*workload.X509SVIDResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "building an X509SVIDResponse is not implemented yet")
 }
 
 // buildX509BundlesResponse assembles the current X.509 trust bundle response.
 //
-// PLACEHOLDER(T10): read BundleSource.X509Bundles for the session's provider.
-func (h *Handler) buildX509BundlesResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*workload.X509BundlesResponse, error) {
+// PLACEHOLDER(T10): read BundleSource.X509Bundles with the caller.
+func (h *Handler) buildX509BundlesResponse(_ context.Context, _ *workloadidentity.Workload) (*workload.X509BundlesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "building an X509BundlesResponse is not implemented yet")
 }
 
 // buildJWTBundlesResponse assembles the current JWT trust bundle response.
 //
-// PLACEHOLDER(T10): read BundleSource.JWTBundles for the session's provider.
-func (h *Handler) buildJWTBundlesResponse(_ context.Context, _ *workloadidentity.Workload, _ *workloadidentity.WorkloadSession) (*workload.JWTBundlesResponse, error) {
+// PLACEHOLDER(T10): read BundleSource.JWTBundles with the caller.
+func (h *Handler) buildJWTBundlesResponse(_ context.Context, _ *workloadidentity.Workload) (*workload.JWTBundlesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "building a JWTBundlesResponse is not implemented yet")
 }
 
