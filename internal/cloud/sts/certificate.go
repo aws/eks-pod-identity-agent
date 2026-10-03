@@ -12,7 +12,6 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -32,13 +31,21 @@ type CertificateRequest struct {
 	// whoever signed the call. Required.
 	CertificateSigningRequestPEM string
 
-	// MaxDuration is how long a certificate we would like. An upper limit: STS can
-	// issue less, and sets the start a few minutes in the past, so the real dates come
-	// off the response. Zero means no preference, and we take what STS returns.
+	// MaxDuration is how long a certificate we would like.
+	//
+	// The model calls it a ceiling, so STS may issue less. STS said on 2026-10-02 that in
+	// P0 nothing reduces it, which makes it effectively the lifetime we get, but "in P0"
+	// names a phase while the ceiling is the contract. So nothing works out a validity
+	// window by adding this value to the clock. The window is read off the issued leaf
+	// certificate, and it differs from this value either way, because STS backdates the
+	// start by five minutes so a client whose clock is behind still accepts the
+	// certificate.
+	//
+	// Zero means no preference, which STS answers with twelve hours.
 	//
 	// It is not limited by how long our own credentials have left. The comment on
 	// workloadIdentityCertificateMaxDurationSecondsType in IAMTokenServiceModel says it
-	// is; that is out of date, planned and then dropped, confirmed by STS on 2026-09-30.
+	// is; STS confirmed on 2026-10-02 that it no longer does.
 	//
 	// 1 to 12 hours is accepted, checked at startup against --x509-svid-duration so a bad
 	// value stops the agent booting rather than failing every pod.
@@ -54,8 +61,12 @@ type IssuedCertificate struct {
 	// left out: whoever verifies this workload already has it from the trust bundle.
 	CertificateChainPEM string
 
-	// NotBefore and NotAfter are the dates the certificate is actually valid between.
-	// The renewal schedule is worked out from these, not from MaxDuration.
+	// NotBefore and NotAfter are the window STS reports alongside the certificate.
+	//
+	// Nothing reads them. The renewal schedule comes off the leaf certificate instead, so
+	// these are parsed to reject a response carrying no window or an inverted one, and
+	// they are kept because comparing them against the leaf would catch a signer
+	// disagreeing with the service.
 	NotBefore time.Time
 	NotAfter  time.Time
 
@@ -101,41 +112,19 @@ type getWorkloadIdentityCertificateResponse struct {
 // read as plain strings and parsed afterwards, because Go's XML support has no notion
 // of a timestamp.
 //
-// CertificateChain accepts more shapes than it strictly needs to, because the two
-// descriptions of this response disagree about it. The API model says it is a single
-// block of PEM text; the Java sample in the onboarding guide loops over it as a list.
+// CertificateChain is one block of PEM text holding the whole chain, not a list of
+// separate certificates. The model says so and STS confirmed it on 2026-10-02, adding
+// that the Java sample in the onboarding guide, which loops over the field as a list, is
+// out of date.
 //
-// Read as one string, several certificates would leave only the last, silently dropping
-// the intermediates a workload needs to prove its chain. Accepting either shape costs
-// nothing.
-//
-// Subject has the same disagreement, the model's name for it against the sample's
-// spiffeId. Nothing depends on it: the identity we use comes out of the certificate,
-// and this is only compared against it when STS sends it.
+// Subject had the same disagreement, the model's name against the sample's spiffeId, and
+// STS confirmed the model there too.
 type workloadIdentityCertificate struct {
-	Certificate      string            `xml:"Certificate"`
-	CertificateChain []certificateList `xml:"CertificateChain"`
-	NotBefore        string            `xml:"NotBefore"`
-	NotAfter         string            `xml:"NotAfter"`
-	Subject          string            `xml:"Subject"`
-}
-
-// certificateList is one CertificateChain element. The PEM is either sitting in the
-// element directly, or wrapped in the list members AWS sometimes uses.
-type certificateList struct {
-	Value   string   `xml:",chardata"`
-	Members []string `xml:"member"`
-}
-
-// pem returns every PEM block this element carries, in order.
-func (c certificateList) pem() []string {
-	if len(c.Members) > 0 {
-		return c.Members
-	}
-	if strings.TrimSpace(c.Value) == "" {
-		return nil
-	}
-	return []string{c.Value}
+	Certificate      string `xml:"Certificate"`
+	CertificateChain string `xml:"CertificateChain"`
+	NotBefore        string `xml:"NotBefore"`
+	NotAfter         string `xml:"NotAfter"`
+	Subject          string `xml:"Subject"`
 }
 
 // toIssuedCertificate checks the response has the parts we cannot do without, and turns
@@ -159,24 +148,9 @@ func (c workloadIdentityCertificate) toIssuedCertificate() (*IssuedCertificate, 
 		return nil, fmt.Errorf("the response's validity window ends at or before it starts: NotBefore %s, NotAfter %s", notBefore, notAfter)
 	}
 
-	// Joined into one piece of text rather than kept as a list. PEM certificates can be
-	// written one after another, and the caller reads certificates out of the text
-	// rather than counting fields.
-	var chain strings.Builder
-	for _, element := range c.CertificateChain {
-		for _, block := range element.pem() {
-			block = strings.TrimSpace(block)
-			if block == "" {
-				continue
-			}
-			chain.WriteString(block)
-			chain.WriteString("\n")
-		}
-	}
-
 	return &IssuedCertificate{
 		CertificatePEM:      c.Certificate,
-		CertificateChainPEM: chain.String(),
+		CertificateChainPEM: c.CertificateChain,
 		NotBefore:           notBefore,
 		NotAfter:            notAfter,
 		Subject:             c.Subject,

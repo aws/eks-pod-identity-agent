@@ -9,6 +9,7 @@ import (
 	. "github.com/onsi/gomega"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults pins the
@@ -26,8 +27,10 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		expectedUsageBound string
 	}{
 		{
+			// Twelve hours, which is both the top of the envelope and what STS issues
+			// when the request names no lifetime. Confirmed with STS on 2026-10-02.
 			flag:               handlers.FlagX509SVIDDuration,
-			expectedDefault:    "6h0m0s",
+			expectedDefault:    "12h0m0s",
 			expectedUsageBound: fmt.Sprintf("between %s and %s", x509Lower, x509Upper),
 		},
 		{
@@ -35,8 +38,14 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 			expectedDefault:    "6h0m0s",
 			expectedUsageBound: fmt.Sprintf("between %s and %s", jwtLower, jwtUpper),
 		},
+		// Half life, which STS recommended on 2026-10-02.
 		{flag: handlers.FlagSVIDRenewalFraction, expectedDefault: "0.5"},
 		{flag: handlers.FlagSVIDRenewalJitter, expectedDefault: "0.1"},
+		{
+			flag:               handlers.FlagSVIDKeyType,
+			expectedDefault:    string(workloadidentity.DefaultKeyType),
+			expectedUsageBound: workloadidentity.KeyTypeList(),
+		},
 	}
 
 	for _, tc := range testCases {
@@ -66,10 +75,11 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 	opts := newWorkloadIdentityServerOpts(aws.Config{})
 
 	g.Expect(opts.Validate()).To(Succeed())
-	g.Expect(opts.X509SVIDDuration).To(Equal(6 * time.Hour))
+	g.Expect(opts.X509SVIDDuration).To(Equal(12 * time.Hour))
 	g.Expect(opts.JWTSVIDDuration).To(Equal(6 * time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.5))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.1))
+	g.Expect(opts.SVIDKeyType).To(Equal(workloadidentity.DefaultKeyType))
 }
 
 // TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions proves the wiring

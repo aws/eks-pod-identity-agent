@@ -13,11 +13,13 @@ import (
 
 	"github.com/aws/smithy-go"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	agentlogger "go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+
 	// Initializes the agent's logger, which the tier logs a failed renewal
 	// through. Without it FromContext returns an entry over a nil logger.
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
@@ -74,28 +76,26 @@ func TestX509SVIDsIssuesAndParses(t *testing.T) {
 	require.Len(t, svids, 1, "STS issues one identity per workload, so there is never a set to select from")
 	svid := svids[0]
 
-	assert.Equal(t, testSpiffeID, svid.SpiffeID)
+	assert.Equal(t, testSpiffeID, svid.ID.String())
 	assert.Empty(t, svid.Hint, "nothing populates Hint")
 	require.NotNil(t, svid.PrivateKey)
-
-	// Timestamps come off the parsed leaf, to the second: a certificate's own
-	// window is what the renewal schedule is derived from.
-	assert.WithinDuration(t, notBefore, svid.NotBefore, time.Second)
-	assert.WithinDuration(t, notAfter, svid.NotAfter, time.Second)
 
 	// Leaf first, then the issuing chain, and the root is absent because a verifier
 	// takes it from the trust bundle.
 	require.Len(t, svid.Certificates, 2)
-	leaf, err := x509.ParseCertificate(svid.Certificates[0])
-	require.NoError(t, err)
-	assert.Equal(t, testSpiffeID, leaf.URIs[0].String())
-	assert.Equal(t, svid.PrivateKey.Public(), leaf.PublicKey, "the leaf certifies the key the agent generated")
+	leafCert, intermediate := svid.Certificates[0], svid.Certificates[1]
 
-	intermediate, err := x509.ParseCertificate(svid.Certificates[1])
-	require.NoError(t, err)
+	// The window comes off the leaf, to the second, and it is the window STS issued
+	// rather than the one that was asked for. Nothing stores these separately, so they
+	// cannot drift away from the certificate they describe.
+	assert.WithinDuration(t, notBefore, leafCert.NotBefore, time.Second)
+	assert.WithinDuration(t, notAfter, leafCert.NotAfter, time.Second)
+
+	assert.Equal(t, testSpiffeID, leafCert.URIs[0].String())
+	assert.Equal(t, svid.PrivateKey.Public(), leafCert.PublicKey, "the leaf certifies the key the agent generated")
 	assert.Equal(t, "test intermediate", intermediate.Subject.CommonName)
-	for _, der := range svid.Certificates {
-		assert.NotEqual(t, ca.rootDER, der, "the chain excludes the root")
+	for _, cert := range svid.Certificates {
+		assert.NotEqual(t, ca.rootDER, cert.Raw, "the chain excludes the root")
 	}
 }
 
@@ -143,7 +143,7 @@ func TestX509SVIDsCoalescesConcurrentRequests(t *testing.T) {
 
 	const callers = 8
 	var wg sync.WaitGroup
-	results := make([]*workloadidentity.X509SVID, callers)
+	results := make([]*x509svid.SVID, callers)
 	errs := make([]error, callers)
 	for i := range callers {
 		wg.Add(1)
@@ -185,7 +185,7 @@ func TestX509SVIDsSeparatePodsIssueSeparately(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, 2, issuer.calls())
-	assert.Equal(t, first[0].SpiffeID, second[0].SpiffeID,
+	assert.Equal(t, first[0].ID, second[0].ID,
 		"replicas of one Deployment share a SPIFFE ID, since the name renders from cluster, namespace and service account")
 	assert.NotEqual(t, first[0].PrivateKey.Public(), second[0].PrivateKey.Public(),
 		"but each pod holds its own key")
@@ -447,7 +447,30 @@ func TestNonSpiffeLeafIsRejected(t *testing.T) {
 
 	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "not a SPIFFE ID")
+	assert.ErrorContains(t, err, "reading the identity from the leaf certificate",
+		"go-spiffe rejects the URI, and the wrapper has to say which step failed")
+}
+
+// TestMissingSubjectIsRejected covers the case STS named on 2026-10-02: the response
+// always carries a Subject, and one that does not means the call resolved to no workload
+// identity at all, which is a failure rather than something to shrug at.
+func TestMissingSubjectIsRejected(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		issued := ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour))
+		issued.Subject = ""
+		return issued, nil
+	}}
+	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
+
+	svids, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+	assert.Nil(t, svids)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "no subject")
+
+	_, ok := source.cache.Get(testPodUID)
+	assert.False(t, ok, "a certificate that fails the check is never cached")
 }
 
 func TestIssuanceFailuresAreClassified(t *testing.T) {

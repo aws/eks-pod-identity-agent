@@ -22,6 +22,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/server"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 var (
@@ -44,6 +45,7 @@ var (
 	jwtSVIDDuration     time.Duration
 	svidRenewalFraction float64
 	svidRenewalJitter   float64
+	svidKeyType         string
 )
 
 var serverCmd = &cobra.Command{
@@ -227,6 +229,7 @@ func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServ
 		JWTSVIDDuration:     jwtSVIDDuration,
 		SVIDRenewalFraction: svidRenewalFraction,
 		SVIDRenewalJitter:   svidRenewalJitter,
+		SVIDKeyType:         workloadidentity.KeyType(svidKeyType),
 	}
 }
 
@@ -274,14 +277,20 @@ func init() {
 	// the renewal schedule is derived from what it issued.
 	// the accepted range is read off the envelope rather than written out again,
 	// so --help cannot claim a bound validation does not enforce
+	// Twelve hours is both the top of the envelope and what STS issues when the request
+	// names no lifetime, confirmed on 2026-10-02. Asking for less does not make anything
+	// safer, because a shorter certificate is replaced sooner and each replacement is a
+	// signing operation.
 	x509Lower, x509Upper := handlers.X509SVIDDurationBounds()
-	serverCmd.Flags().DurationVar(&x509SVIDDuration, handlers.FlagX509SVIDDuration, 6*time.Hour,
+	serverCmd.Flags().DurationVar(&x509SVIDDuration, handlers.FlagX509SVIDDuration, 12*time.Hour,
 		fmt.Sprintf("Lifetime requested for each X.509-SVID, between %s and %s", x509Lower, x509Upper))
 	jwtLower, jwtUpper := handlers.JWTSVIDDurationBounds()
 	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, 6*time.Hour,
 		fmt.Sprintf("Lifetime requested for each JWT-SVID, between %s and %s", jwtLower, jwtUpper))
 	serverCmd.Flags().Float64Var(&svidRenewalFraction, handlers.FlagSVIDRenewalFraction, 0.5,
 		"Fraction of an SVID's issued lifetime at which renewal starts")
+	serverCmd.Flags().StringVar(&svidKeyType, handlers.FlagSVIDKeyType, string(workloadidentity.DefaultKeyType),
+		fmt.Sprintf("Key type generated for each X.509-SVID, one of %s", workloadidentity.KeyTypeList()))
 	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
 		"Jitter applied to the renewal point, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
 }

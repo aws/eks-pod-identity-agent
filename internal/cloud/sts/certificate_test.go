@@ -15,42 +15,31 @@ const (
 	testRootPEM  = "-----BEGIN CERTIFICATE-----\nroot\n-----END CERTIFICATE-----\n"
 )
 
-// TestDecodeCertificateChainShapes covers the disagreement between the two
-// descriptions of this response. The API model declares CertificateChain a single
-// PEM string; the onboarding guide's Java sample iterates it as a list. Reading it
-// as one string would be the expensive way to be wrong, because a repeated element
-// decoded into a string keeps only the last and silently drops intermediate
-// certificate authorities, leaving every verifier unable to build a path.
-func TestDecodeCertificateChainShapes(t *testing.T) {
+// TestDecodeCertificateChain covers the shape of the chain field. STS confirmed on
+// 2026-10-02 that it is one block of PEM text holding the whole chain, as the API model
+// declares, and that the onboarding guide's Java sample, which iterates it as a list, is
+// out of date. So the case that matters is several certificates concatenated inside the
+// one element, which is what a chain with more than one issuer looks like.
+func TestDecodeCertificateChain(t *testing.T) {
 	tests := []struct {
 		name  string
 		chain string
 		want  []string
 	}{
 		{
-			name:  "one element holding one certificate, as the model declares it",
+			name:  "one certificate",
 			chain: "<CertificateChain>" + testInterPEM + "</CertificateChain>",
 			want:  []string{testInterPEM},
 		},
 		{
-			name:  "one element holding several concatenated certificates",
+			name:  "several concatenated certificates, which a longer chain has",
 			chain: "<CertificateChain>" + testInterPEM + testRootPEM + "</CertificateChain>",
 			want:  []string{testInterPEM, testRootPEM},
 		},
 		{
-			name: "repeated elements, as the guide's sample iterates",
-			chain: "<CertificateChain>" + testInterPEM + "</CertificateChain>" +
-				"<CertificateChain>" + testRootPEM + "</CertificateChain>",
-			want: []string{testInterPEM, testRootPEM},
-		},
-		{
-			name: "awsQuery list members",
-			chain: "<CertificateChain><member>" + testInterPEM + "</member>" +
-				"<member>" + testRootPEM + "</member></CertificateChain>",
-			want: []string{testInterPEM, testRootPEM},
-		},
-		{
-			name:  "absent, which a leaf issued directly by the root has",
+			// STS said a root should never sign leaves directly, so this should not
+			// happen. Decoding it is still better than refusing a usable certificate.
+			name:  "absent",
 			chain: "",
 			want:  nil,
 		},

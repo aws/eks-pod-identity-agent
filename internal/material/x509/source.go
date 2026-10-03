@@ -13,6 +13,7 @@ package x509
 
 import (
 	"context"
+	cryptox509 "crypto/x509"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -21,8 +22,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/smithy-go"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
+	"k8s.io/utils/set"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
@@ -87,8 +90,8 @@ const (
 	// picks it up a minute later.
 	//
 	// The risk this creates is a backlog on a node where many certificates come due
-	// together, which jitter on the replacement point is what avoids. Aditya raised the
-	// same concern against the session tier on PR #7, where it bites harder because a
+	// together, which jitter on the replacement point is what avoids. The same concern
+	// was raised against the session tier on PR #7, where it matters more because a
 	// session lives an hour against a certificate's twelve. Whatever that settles on
 	// should apply here too.
 	defaultRefreshQPS = 2
@@ -128,9 +131,9 @@ type Opts struct {
 	// not something to end up with by accident.
 	MaxCacheSize int
 
-	// Duration is the certificate lifetime we ask for, from --x509-svid-duration. STS
-	// treats it as an upper bound and may give us less. Zero means we do not ask and
-	// take whatever STS considers normal.
+	// Duration is the certificate lifetime we ask for, from --x509-svid-duration. Zero
+	// means we do not ask, which STS answers with twelve hours, the same as the flag's
+	// default.
 	Duration time.Duration
 
 	// RenewFraction and RenewJitter decide when we replace a certificate, and come
@@ -138,6 +141,11 @@ type Opts struct {
 	// startup, so by the time we get here the values make sense. See renewal.go.
 	RenewFraction float64
 	RenewJitter   float64
+
+	// KeyType is the kind of key pair to generate, from --svid-key-type. Empty takes
+	// the default. An unknown value is rejected when the tier is built, rather than at
+	// the first issuance, so a mistyped flag stops the agent instead of failing pods.
+	KeyType workloadidentity.KeyType
 
 	// MinRemaining overrides defaultMinRemaining.
 	MinRemaining time.Duration
@@ -165,7 +173,7 @@ type Opts struct {
 // carrying that request's details along would only put stale information in the logs.
 type entry struct {
 	workload *workloadidentity.Workload
-	svid     *workloadidentity.X509SVID
+	svid     *x509svid.SVID
 }
 
 // Source hands out X.509 certificates to workloads.
@@ -190,6 +198,7 @@ type Source struct {
 	duration       time.Duration
 	renewFraction  float64
 	renewJitter    float64
+	keyType        workloadidentity.KeyType
 	minRemaining   time.Duration
 	renewalTimeout time.Duration
 	issueTimeout   time.Duration
@@ -211,6 +220,12 @@ func New(opts Opts) (*Source, error) {
 	}
 	if opts.MaxCacheSize <= 0 {
 		return nil, fmt.Errorf("an X.509-SVID source needs a positive cache bound, got %d", opts.MaxCacheSize)
+	}
+	if opts.KeyType == "" {
+		opts.KeyType = workloadidentity.DefaultKeyType
+	}
+	if err := opts.KeyType.Validate(); err != nil {
+		return nil, fmt.Errorf("an X.509-SVID source cannot generate that key type: %w", err)
 	}
 	if opts.MinRemaining <= 0 {
 		opts.MinRemaining = defaultMinRemaining
@@ -245,6 +260,7 @@ func New(opts Opts) (*Source, error) {
 		duration:       opts.Duration,
 		renewFraction:  opts.RenewFraction,
 		renewJitter:    opts.RenewJitter,
+		keyType:        opts.KeyType,
 		minRemaining:   opts.MinRemaining,
 		renewalTimeout: opts.RenewalTimeout,
 		issueTimeout:   opts.IssueTimeout,
@@ -262,13 +278,13 @@ func New(opts Opts) (*Source, error) {
 // The result always has exactly one certificate in it. STS gives a workload one
 // identity, so there is never a choice to make. It is a list only because the SPIFFE
 // API this feeds is defined to return a list.
-func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([]*workloadidentity.X509SVID, error) {
+func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([]*x509svid.SVID, error) {
 	if w == nil || w.PodUID == "" {
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(nil, "cannot issue a certificate for an empty workload")
 	}
 
 	if cached, ok := s.cache.Get(w.PodUID); ok && s.servable(cached.svid) {
-		return []*workloadidentity.X509SVID{cached.svid}, nil
+		return []*x509svid.SVID{cached.svid}, nil
 	}
 	// We can also get here holding a certificate too close to expiry to pass on, which
 	// happens when replacements have been failing. It stays in the cache, since
@@ -292,7 +308,7 @@ func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([
 		if outcome.Err != nil {
 			return nil, outcome.Err
 		}
-		return []*workloadidentity.X509SVID{outcome.Val.(*workloadidentity.X509SVID)}, nil
+		return []*x509svid.SVID{outcome.Val.(*x509svid.SVID)}, nil
 	case <-ctx.Done():
 		// Wrapped in one of our own error types rather than passed back raw, so the gRPC
 		// handlers above have something they recognise to turn into a status code.
@@ -311,13 +327,19 @@ func (s *Source) Invalidate(podUID string) {
 }
 
 // servable says whether a certificate has enough life left to hand out.
-func (s *Source) servable(svid *workloadidentity.X509SVID) bool {
-	return s.now().Before(svid.NotAfter.Add(-s.minRemaining))
+func (s *Source) servable(svid *x509svid.SVID) bool {
+	return s.now().Before(leaf(svid).NotAfter.Add(-s.minRemaining))
+}
+
+// leaf is the workload's own certificate. parseChain puts it first and never returns an
+// empty chain, so this is in range for every SVID this package builds.
+func leaf(svid *x509svid.SVID) *cryptox509.Certificate {
+	return svid.Certificates[0]
 }
 
 // issueAndStore gets one certificate and puts it in the cache. The renewal flag only
 // affects which metrics the attempt is counted on.
-func (s *Source) issueAndStore(ctx context.Context, w *workloadidentity.Workload, renewal bool) (*workloadidentity.X509SVID, error) {
+func (s *Source) issueAndStore(ctx context.Context, w *workloadidentity.Workload, renewal bool) (*x509svid.SVID, error) {
 	start := s.now()
 	svid, err := s.issue(ctx, w)
 	observeIssuance(err, s.now().Sub(start).Seconds(), renewal)
@@ -330,7 +352,7 @@ func (s *Source) issueAndStore(ctx context.Context, w *workloadidentity.Workload
 
 // issue does the actual work of getting one certificate: credentials, key pair,
 // request, then checking what came back.
-func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.X509SVID, error) {
+func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*x509svid.SVID, error) {
 	session, err := s.sessionProvider.Session(ctx, w)
 	if err != nil {
 		// Passed straight through. The session tier already said what went wrong, and in
@@ -339,7 +361,7 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*work
 		return nil, err
 	}
 
-	key, err := generateKey()
+	key, err := generateKey(s.keyType)
 	if err != nil {
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(err, "generating a key for %s/%s", w.Namespace, w.PodName)
 	}
@@ -355,8 +377,12 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*work
 	//
 	// The comment on workloadIdentityCertificateMaxDurationSecondsType in
 	// IAMTokenServiceModel says the certificate is cut down to the credentials' remaining
-	// life. That is out of date, planned and then dropped, confirmed by STS on
-	// 2026-09-30. Do not add a cap on the strength of it.
+	// life. STS confirmed on 2026-10-02 that nothing clamps it, so the lifetime we ask
+	// for is the one we get, within the model's range. Do not add a cap on the strength
+	// of that comment.
+	//
+	// They did add that the session lifetime is recorded in the certificate and limits
+	// its use "in some places". Where, and what reads it, is an open question.
 	issued, err := s.issuer.GetWorkloadIdentityCertificate(ctx, session.Credentials, sts.CertificateRequest{
 		CertificateSigningRequestPEM: csr,
 		MaxDuration:                  s.duration,
@@ -379,12 +405,10 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*work
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(err, "the certificate issued for %s/%s was not issued for the identity it should have been", w.Namespace, w.PodName)
 	}
 
-	return &workloadidentity.X509SVID{
-		SpiffeID:     chain.spiffeID,
-		Certificates: chain.der,
+	return &x509svid.SVID{
+		ID:           chain.spiffeID,
+		Certificates: chain.certs,
 		PrivateKey:   key,
-		NotBefore:    chain.notBefore,
-		NotAfter:     chain.notAfter,
 	}, nil
 }
 
@@ -394,14 +418,15 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*work
 // The two times are kept apart so a failed replacement loses nothing. Passing the
 // replacement time does not remove the entry, so a workload carries on using the
 // certificate it has while we keep trying. Only the real expiry removes it.
-func (s *Source) store(w *workloadidentity.Workload, svid *workloadidentity.X509SVID) {
+func (s *Source) store(w *workloadidentity.Workload, svid *x509svid.SVID) {
 	now := s.now()
-	renewAt := renewalPoint(svid.NotBefore, svid.NotAfter, s.renewFraction, s.renewJitter, s.draw)
+	leafCert := leaf(svid)
+	renewAt := renewalPoint(leafCert.NotBefore, leafCert.NotAfter, s.renewFraction, s.renewJitter, s.draw)
 	s.cache.SetWithRefreshExpire(
 		w.PodUID,
 		entry{workload: w, svid: svid},
 		renewalDelay(now, renewAt),
-		svid.NotAfter.Sub(now),
+		leafCert.NotAfter.Sub(now),
 	)
 
 	// Told after the cache holds the new certificate, never before. A stream woken
@@ -450,7 +475,7 @@ func (s *Source) onRefresh(uid string, cached entry) {
 		return
 	}
 	log.Infof("X.509-SVID renewal for pod %s failed, keeping the certificate it holds until it expires at %s",
-		uid, cached.svid.NotAfter)
+		uid, leaf(cached.svid).NotAfter)
 }
 
 // workloadGone reports whether err means there is no workload left to serve, as opposed
@@ -483,15 +508,22 @@ func (s *Source) onEvicted(_ string, _ entry) {}
 // EKS Auth does not return an identity with the credentials, so there is nothing to
 // compare against. If that changes, the comparison goes here.
 //
-// What is checked instead: the identity is a well formed SPIFFE name, and it matches
-// what STS said it issued, which catches the signer and STS disagreeing.
-func checkIdentity(leafID, reportedSubject string) error {
-	if _, err := spiffeid.FromString(leafID); err != nil {
-		return fmt.Errorf("the leaf's URI SAN %q is not a SPIFFE ID: %w", leafID, err)
+// What is checked instead: STS reported an identity, and it is the one in the
+// certificate. That the leaf's identity is a well formed SPIFFE name is already known,
+// because go-spiffe parsed it in parseChain.
+//
+// A missing subject is a failure. STS said on 2026-10-02 that the field is always set,
+// and that an empty one means there is no workload identity behind the call.
+//
+// The comparison is exact because the two are the same kind of string. The model
+// documents workloadIdentitySubjectType as the workload identity stamped into the
+// certificate, so it is a SPIFFE ID rather than a distinguished name.
+func checkIdentity(leafID spiffeid.ID, reportedSubject string) error {
+	if reportedSubject == "" {
+		return fmt.Errorf("STS reported no subject, so it issued for no workload identity")
 	}
-	// STS not telling us is fine, and is not evidence of a mismatch.
-	if reportedSubject != "" && reportedSubject != leafID {
-		return fmt.Errorf("the leaf names %q but STS reported issuing for %q", leafID, reportedSubject)
+	if reportedSubject != leafID.String() {
+		return fmt.Errorf("the leaf names %q but STS reported issuing for %q", leafID.String(), reportedSubject)
 	}
 	return nil
 }
@@ -505,43 +537,42 @@ func checkIdentity(leafID, reportedSubject string) error {
 // signer set up, which the customer has to fix; and a signer whose key material is
 // not present in this region.
 //
-// That last one is the judgement call in this list. If it turns out to be a temporary
-// state while a new signer propagates between regions, it should move out of here and
-// be treated as retryable.
-var refusalCodes = map[string]bool{
-	"MalformedCertificateSigningRequestException": true,
-	"SignerNotConfiguredException":                true,
-	"RegionalSignerUnavailableException":          true,
-	"ValidationError":                             true,
-	"ValidationException":                         true,
-	"AccessDenied":                                true,
-	"AccessDeniedException":                       true,
-	"InvalidAction":                               true,
-}
+// STS confirmed on 2026-10-02 that RegionalSignerUnavailableException is not
+// retryable, so all three belong here.
+var refusalCodes = set.New(
+	"MalformedCertificateSigningRequestException",
+	"SignerNotConfiguredException",
+	"RegionalSignerUnavailableException",
+	"ValidationError",
+	"ValidationException",
+	"AccessDenied",
+	"AccessDeniedException",
+	"InvalidAction",
+)
 
 // staleSessionCodes are the failures where our credentials are plausibly the problem,
 // so we throw them away. A badly built request or a missing signer has nothing to do
 // with the credentials, and discarding them would mean fetching new ones for nothing.
-var staleSessionCodes = map[string]bool{
-	"AccessDenied":          true,
-	"AccessDeniedException": true,
-	"InvalidClientTokenId":  true,
-	"ExpiredToken":          true,
-	"ExpiredTokenException": true,
-}
+var staleSessionCodes = set.New(
+	"AccessDenied",
+	"AccessDeniedException",
+	"InvalidClientTokenId",
+	"ExpiredToken",
+	"ExpiredTokenException",
+)
 
 // throttleCodes mean STS turned us away because we asked too often.
-var throttleCodes = map[string]bool{
-	"Throttling":               true,
-	"ThrottlingException":      true,
-	"RequestLimitExceeded":     true,
-	"TooManyRequestsException": true,
-}
+var throttleCodes = set.New(
+	"Throttling",
+	"ThrottlingException",
+	"RequestLimitExceeded",
+	"TooManyRequestsException",
+)
 
 // staleSession says whether this failure suggests our credentials are the problem.
 func staleSession(err error) bool {
 	var apiErr smithy.APIError
-	return errors.As(err, &apiErr) && staleSessionCodes[apiErr.ErrorCode()]
+	return errors.As(err, &apiErr) && staleSessionCodes.Has(apiErr.ErrorCode())
 }
 
 // classify turns an STS failure into one of our own error types, so that callers and
@@ -550,9 +581,9 @@ func classify(err error, w *workloadidentity.Workload) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch code := apiErr.ErrorCode(); {
-		case throttleCodes[code]:
+		case throttleCodes.Has(code):
 			return wierrors.ErrIssuanceThrottled.Wrapf(err, "STS throttled the certificate issuance for %s/%s", w.Namespace, w.PodName)
-		case refusalCodes[code]:
+		case refusalCodes.Has(code):
 			return wierrors.ErrIssuanceRefused.Wrapf(err, "STS refused the certificate issuance for %s/%s", w.Namespace, w.PodName)
 		}
 	}

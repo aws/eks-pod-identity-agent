@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -21,13 +23,13 @@ type CertSource struct {
 	// Result is returned by X509SVIDs when Func and Err are nil. A copy of the
 	// slice is returned, so a caller mutating what it got cannot corrupt the
 	// canned value. The elements are shared.
-	Result []*workloadidentity.X509SVID
+	Result []*x509svid.SVID
 	// Err, when non-nil and Func is nil, is returned by X509SVIDs together with
 	// a nil slice.
 	Err error
 	// Func, when non-nil, wins over Result and Err: X509SVIDs returns whatever
 	// it returns, uncopied.
-	Func func(ctx context.Context, w *workloadidentity.Workload) ([]*workloadidentity.X509SVID, error)
+	Func func(ctx context.Context, w *workloadidentity.Workload) ([]*x509svid.SVID, error)
 
 	mu        sync.Mutex
 	calls     int
@@ -44,7 +46,7 @@ type CertSource struct {
 // is next scheduled, which can be after Release has returned. Use WaitForBlocked
 // to observe a parked call, and observe the call's own return before asserting on
 // Calls or Workloads.
-func (s *CertSource) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([]*workloadidentity.X509SVID, error) {
+func (s *CertSource) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([]*x509svid.SVID, error) {
 	if err := s.enter(ctx); err != nil {
 		return nil, err
 	}
@@ -81,7 +83,7 @@ func (s *CertSource) Workloads() []*workloadidentity.Workload {
 }
 
 // SetResult replaces the canned X.509-SVIDs and error while the fake is live.
-func (s *CertSource) SetResult(svids []*workloadidentity.X509SVID, err error) {
+func (s *CertSource) SetResult(svids []*x509svid.SVID, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Result = svids

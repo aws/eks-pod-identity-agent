@@ -2,16 +2,19 @@ package x509
 
 // Reading what STS sent back.
 //
-// STS returns certificates as PEM text. The SPIFFE Workload API hands them to the
-// workload as raw bytes instead, so we convert, and while we are here we pull out
-// the pieces we need to keep: the workload's identity and the dates the certificate
-// is valid between.
+// STS returns the certificate and its issuers as PEM text. We parse both into
+// certificates, which is the shape go-spiffe's SVID holds, and read the workload's
+// identity out of the leaf. The validity dates are not carried separately: whoever
+// needs them reads them off the leaf, so they cannot drift away from the certificate
+// they describe.
 
 import (
 	cryptox509 "crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"time"
+
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
 // pemTypeCertificate is the label in the "-----BEGIN ...-----" line of a
@@ -20,83 +23,63 @@ const pemTypeCertificate = "CERTIFICATE"
 
 // parsedChain is one issued certificate after we have read it.
 type parsedChain struct {
-	// spiffeID is the workload's identity, for example
-	// spiffe://example.aws/my-cluster/default/payments. It lives in the certificate
-	// as a URI, not as the usual subject name.
-	spiffeID string
-
-	// der holds the certificate and the ones that signed it, in bytes, with the
-	// workload's own certificate first.
+	// spiffeID is the workload's SPIFFE ID, read from the leaf's URI SAN.
 	//
-	// The root is left out: whoever verifies this workload already has it, from the
-	// trust bundle.
-	der [][]byte
+	// Named for the format on purpose. STS calls the same value Subject so they can
+	// change identity formats later, but nothing in this tier is format-neutral: it
+	// depends on go-spiffe, it enforces the SPIFFE rule of exactly one URI SAN, and it
+	// serves the SPIFFE Workload API.
+	spiffeID spiffeid.ID
 
-	// notBefore and notAfter are the dates the certificate is valid between, read from
-	// the certificate rather than the surrounding response, because the replacement
-	// schedule is worked out from them.
-	notBefore time.Time
-	notAfter  time.Time
+	// certs holds the leaf first, then the certificates that signed it.
+	//
+	// The root is not among them. STS leaves it out, and whoever verifies this
+	// workload takes the root from the trust bundle instead.
+	certs []*cryptox509.Certificate
 }
 
-// parseChain reads the certificate and its signers, and finds the workload's
-// identity inside it.
-//
-// Exactly one identity is required, which is what a SPIFFE certificate carries.
-// Picking the first of several would hand out a certificate with an ambiguous identity
-// and nobody would notice.
+// parseChain reads the certificate and its issuers, and finds the workload's identity
+// inside the leaf.
 func parseChain(leafPEM, chainPEM string) (*parsedChain, error) {
-	leafDER, err := decodeOne(leafPEM)
+	leaves, err := parseCertificates(leafPEM)
 	if err != nil {
 		return nil, fmt.Errorf("the leaf certificate: %w", err)
 	}
-	leaf, err := cryptox509.ParseCertificate(leafDER)
-	if err != nil {
-		return nil, fmt.Errorf("parsing the leaf certificate: %w", err)
+	if len(leaves) != 1 {
+		return nil, fmt.Errorf("the leaf certificate: holds %d certificates where there should be one", len(leaves))
 	}
-	if len(leaf.URIs) != 1 {
-		return nil, fmt.Errorf("the leaf certificate carries %d URI SANs, and an X.509-SVID carries exactly one", len(leaf.URIs))
+	leaf := leaves[0]
+
+	// go-spiffe reads the identity and enforces the rule that an X.509-SVID carries
+	// exactly one URI SAN, so we do not write either ourselves. Accepting the first of
+	// several would hand out a certificate with an ambiguous identity unnoticed.
+	spiffeID, err := x509svid.IDFromCert(leaf)
+	if err != nil {
+		return nil, fmt.Errorf("reading the identity from the leaf certificate: %w", err)
 	}
 
-	// The list of signers can legitimately be empty, when the customer's certificate
-	// authority signs workload certificates directly.
-	issuers, err := decodeAll(chainPEM)
+	// An empty chain is tolerated rather than expected. STS said on 2026-10-02 that a
+	// root should never sign leaves directly, so this should not happen, but they were
+	// not certain and an empty chain is not a reason to refuse a usable certificate.
+	issuers, err := parseCertificates(chainPEM)
 	if err != nil {
 		return nil, fmt.Errorf("the issuing chain: %w", err)
 	}
 
-	der := make([][]byte, 0, 1+len(issuers))
-	der = append(der, leafDER)
-	der = append(der, issuers...)
+	certs := make([]*cryptox509.Certificate, 0, 1+len(issuers))
+	certs = append(certs, leaf)
+	certs = append(certs, issuers...)
 
-	return &parsedChain{
-		spiffeID:  leaf.URIs[0].String(),
-		der:       der,
-		notBefore: leaf.NotBefore.UTC(),
-		notAfter:  leaf.NotAfter.UTC(),
-	}, nil
+	return &parsedChain{spiffeID: spiffeID, certs: certs}, nil
 }
 
-// decodeOne reads a single certificate out of PEM text, and complains if there is
-// more than one or none at all.
-func decodeOne(s string) ([]byte, error) {
-	block, rest := pem.Decode([]byte(s))
-	if block == nil {
-		return nil, fmt.Errorf("holds no PEM block")
-	}
-	if block.Type != pemTypeCertificate {
-		return nil, fmt.Errorf("holds a %q PEM block rather than a %q block", block.Type, pemTypeCertificate)
-	}
-	if len(trimPEM(rest)) != 0 {
-		return nil, fmt.Errorf("holds more than one PEM block")
-	}
-	return block.Bytes, nil
-}
-
-// decodeAll reads every certificate in PEM text, keeping the order they appear in.
-// Empty text is fine and gives back nothing.
-func decodeAll(s string) ([][]byte, error) {
-	var out [][]byte
+// parseCertificates reads every certificate out of PEM text, keeping the order they
+// appear in. Empty text is fine and gives back nothing.
+//
+// Every certificate is parsed, including ones whose bytes we only pass along, so a
+// malformed one fails here with a clear error rather than inside the workload.
+func parseCertificates(s string) ([]*cryptox509.Certificate, error) {
+	var out []*cryptox509.Certificate
 	rest := []byte(s)
 	for len(trimPEM(rest)) > 0 {
 		var block *pem.Block
@@ -107,12 +90,11 @@ func decodeAll(s string) ([][]byte, error) {
 		if block.Type != pemTypeCertificate {
 			return nil, fmt.Errorf("holds a %q PEM block rather than a %q block", block.Type, pemTypeCertificate)
 		}
-		// Parsed and discarded; the bytes pass through untouched. Checking here means a
-		// malformed certificate fails with a clear error rather than inside the workload.
-		if _, err := cryptox509.ParseCertificate(block.Bytes); err != nil {
-			return nil, fmt.Errorf("parsing an issuer certificate: %w", err)
+		cert, err := cryptox509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parsing a certificate: %w", err)
 		}
-		out = append(out, block.Bytes)
+		out = append(out, cert)
 	}
 	return out, nil
 }

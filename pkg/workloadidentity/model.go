@@ -17,12 +17,12 @@ package workloadidentity
 
 import (
 	"context"
-	"crypto"
 	"net"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
 // Workload is an attested caller. Every field is established by the agent,
@@ -110,35 +110,20 @@ type ProviderArnResolver interface {
 // The slice will always hold exactly one element. WISE issues one SVID per
 // workload, so there is nothing to select among and no selection logic is
 // needed anywhere.
+// It yields go-spiffe's x509svid.SVID rather than a type of ours. The agent depends
+// on go-spiffe already, and reusing the type means the identity arrives as a parsed
+// spiffeid.ID and the chain as parsed certificates, so the validity dates are read
+// off the leaf and cannot disagree with it. Its Hint field is the Workload API's,
+// and nothing populates it: WISE issues one SVID per workload, so there is never a
+// set to disambiguate.
+//
+// The private key stays a crypto.Signer the whole way, which x509svid.SVID also
+// holds, so the key is never carried around the agent as a byte slice. The Workload
+// API wants PKCS#8 DER and Envoy wants PEM, so a marshal happens at the handler
+// either way.
 type CertSource interface {
 	// X509SVIDs returns the workload's X.509-SVIDs.
-	X509SVIDs(ctx context.Context, w *Workload) ([]*X509SVID, error)
-}
-
-// X509SVID tracks the Workload API X509SVID message. The API carries the key as
-// PKCS#8 DER bytes; this holds a crypto.Signer instead and marshals at the edge,
-// so the private key is not copied through the agent as a byte slice. Envoy
-// wants PEM and the Workload API wants DER, so a marshal happens in the handler
-// either way.
-type X509SVID struct {
-	// SpiffeID is the SPIFFE ID asserted by the leaf certificate.
-	SpiffeID string
-	// Certificates is the certificate chain as DER, leaf first.
-	Certificates [][]byte
-	// PrivateKey signs for the leaf certificate.
-	PrivateKey crypto.Signer
-	// Hint is on the wire and nothing populates it. WISE issues one SVID per
-	// workload, so there is never a set to disambiguate. It is present so the
-	// handler does not need changing if that ever stops being true.
-	Hint string
-	// NotBefore is agent-internal and not on the wire. It is parsed off the
-	// leaf and used to schedule renewal. Derive it from the issued
-	// certificate, never from what was requested.
-	NotBefore time.Time
-	// NotAfter is agent-internal and not on the wire. It is parsed off the
-	// leaf and used to schedule renewal. Derive it from the issued
-	// certificate, never from what was requested.
-	NotAfter time.Time
+	X509SVIDs(ctx context.Context, w *Workload) ([]*x509svid.SVID, error)
 }
 
 // TokenSource yields JWT-SVIDs for a workload. Audiences is plural because
