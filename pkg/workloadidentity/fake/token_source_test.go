@@ -2,11 +2,18 @@ package fake
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
+
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -27,40 +34,56 @@ var tokenSourceTestWorkload = &workloadidentity.Workload{
 // tokenSourceJWTSVIDResult is what a JWTSVIDs call running in another goroutine
 // hands back to the test.
 type tokenSourceJWTSVIDResult struct {
-	svids []*workloadidentity.JWTSVID
+	svids []*jwtsvid.SVID
 	err   error
 }
 
 // tokenSourceSVID builds a fully populated JWT-SVID, so every field is available
-// to assert on.
-func tokenSourceSVID(audience string) *workloadidentity.JWTSVID {
-	return &workloadidentity.JWTSVID{
-		SpiffeID:  "spiffe://example.org/my-pod",
-		Token:     "token-for-" + audience,
-		Hint:      "hint-for-" + audience,
-		ExpiresAt: time.Date(2026, 3, 27, 7, 45, 23, 0, time.UTC),
-	}
+// to assert on. It signs a real token and parses it, because a jwtsvid.SVID
+// literal has no token and would make the token assertion vacuous.
+func tokenSourceSVID(t *testing.T, audience string) *jwtsvid.SVID {
+	t.Helper()
+	g := NewWithT(t)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	g.Expect(err).To(Not(HaveOccurred()))
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT"))
+	g.Expect(err).To(Not(HaveOccurred()))
+	token, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Subject:  "spiffe://example.org/my-pod",
+		Audience: jwt.Audience{audience},
+		Expiry:   jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}).Serialize()
+	g.Expect(err).To(Not(HaveOccurred()))
+	svid, err := jwtsvid.ParseInsecure(token, []string{audience})
+	g.Expect(err).To(Not(HaveOccurred()))
+	svid.Hint = "hint-for-" + audience
+	return svid
 }
 
 // tokenSourceExpectSVID asserts every field of a returned JWT-SVID.
-func tokenSourceExpectSVID(g *WithT, got, want *workloadidentity.JWTSVID) {
+func tokenSourceExpectSVID(g *WithT, got, want *jwtsvid.SVID) {
 	g.Expect(got).To(Not(BeNil()))
-	g.Expect(got.SpiffeID).To(Equal(want.SpiffeID))
-	g.Expect(got.Token).To(Equal(want.Token))
+	g.Expect(got.ID).To(Equal(want.ID))
+	g.Expect(got.Marshal()).To(Not(BeEmpty()))
+	g.Expect(got.Marshal()).To(Equal(want.Marshal()))
+	g.Expect(got.Audience).To(Equal(want.Audience))
+	g.Expect(got.Expiry).To(Equal(want.Expiry))
+	g.Expect(got.Claims).To(Equal(want.Claims))
 	g.Expect(got.Hint).To(Equal(want.Hint))
-	g.Expect(got.ExpiresAt).To(Equal(want.ExpiresAt))
 }
 
 func TestTokenSourceJWTSVIDs_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 	cannedErr := errors.New("jwt issuance failed")
-	first := tokenSourceSVID("aud-1")
-	second := tokenSourceSVID("aud-2")
+	first := tokenSourceSVID(t, "aud-1")
+	second := tokenSourceSVID(t, "aud-2")
+	byAudience := map[string]*jwtsvid.SVID{"aud-1": first, "aud-2": second}
 
 	testCases := []struct {
 		name        string
 		source      *TokenSource
 		audiences   []string
-		expected    []*workloadidentity.JWTSVID
+		expected    []*jwtsvid.SVID
 		expectedErr error
 	}{
 		{
@@ -71,37 +94,37 @@ func TestTokenSourceJWTSVIDs_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) 
 		},
 		{
 			name:      "canned result is returned for one audience",
-			source:    &TokenSource{Result: []*workloadidentity.JWTSVID{first}},
+			source:    &TokenSource{Result: []*jwtsvid.SVID{first}},
 			audiences: []string{"aud-1"},
-			expected:  []*workloadidentity.JWTSVID{first},
+			expected:  []*jwtsvid.SVID{first},
 		},
 		{
 			name:      "canned result is returned unchanged for several audiences",
-			source:    &TokenSource{Result: []*workloadidentity.JWTSVID{first, second}},
+			source:    &TokenSource{Result: []*jwtsvid.SVID{first, second}},
 			audiences: []string{"aud-1", "aud-2", "aud-3"},
-			expected:  []*workloadidentity.JWTSVID{first, second},
+			expected:  []*jwtsvid.SVID{first, second},
 		},
 		{
 			name:        "canned error wins over canned result",
-			source:      &TokenSource{Result: []*workloadidentity.JWTSVID{first}, Err: cannedErr},
+			source:      &TokenSource{Result: []*jwtsvid.SVID{first}, Err: cannedErr},
 			audiences:   []string{"aud-1"},
 			expectedErr: cannedErr,
 		},
 		{
 			name: "func wins over canned result and canned error",
 			source: &TokenSource{
-				Result: []*workloadidentity.JWTSVID{first},
+				Result: []*jwtsvid.SVID{first},
 				Err:    cannedErr,
-				Func: func(_ context.Context, _ *workloadidentity.Workload, audiences []string) ([]*workloadidentity.JWTSVID, error) {
-					svids := make([]*workloadidentity.JWTSVID, 0, len(audiences))
+				Func: func(_ context.Context, _ *workloadidentity.Workload, audiences []string) ([]*jwtsvid.SVID, error) {
+					svids := make([]*jwtsvid.SVID, 0, len(audiences))
 					for _, audience := range audiences {
-						svids = append(svids, tokenSourceSVID(audience))
+						svids = append(svids, byAudience[audience])
 					}
 					return svids, nil
 				},
 			},
 			audiences: []string{"aud-1", "aud-2"},
-			expected:  []*workloadidentity.JWTSVID{first, second},
+			expected:  []*jwtsvid.SVID{first, second},
 		},
 	}
 
@@ -141,7 +164,7 @@ func TestTokenSourceJWTSVIDs_CalledRepeatedly_CountsCallsAndRecordsRequests(t *t
 		ServiceAccount: "other-service-account",
 		NodeName:       "my-node",
 	}
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{tokenSourceSVID("aud-1")}}
+	source := &TokenSource{Result: []*jwtsvid.SVID{tokenSourceSVID(t, "aud-1")}}
 
 	g.Expect(source.Calls()).To(Equal(0))
 	g.Expect(source.Requests()).To(BeEmpty())
@@ -176,7 +199,7 @@ func TestTokenSourceJWTSVIDs_CalledRepeatedly_CountsCallsAndRecordsRequests(t *t
 func TestTokenSourceJWTSVIDs_CallerMutatesAudiences_RecordedAudiencesUnaffected(t *testing.T) {
 	g := NewWithT(t)
 
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{tokenSourceSVID("aud-1")}}
+	source := &TokenSource{Result: []*jwtsvid.SVID{tokenSourceSVID(t, "aud-1")}}
 	audiences := []string{"aud-1", "aud-2"}
 
 	_, err := source.JWTSVIDs(context.Background(), tokenSourceTestWorkload, audiences)
@@ -195,7 +218,7 @@ func TestTokenSourceJWTSVIDs_FuncSet_ReceivesCallersAudiencesNotTheRecordedCopy(
 
 	var seen []string
 	source := &TokenSource{
-		Func: func(_ context.Context, _ *workloadidentity.Workload, audiences []string) ([]*workloadidentity.JWTSVID, error) {
+		Func: func(_ context.Context, _ *workloadidentity.Workload, audiences []string) ([]*jwtsvid.SVID, error) {
 			seen = audiences
 			return nil, nil
 		},
@@ -220,15 +243,15 @@ func TestTokenSourceJWTSVIDs_FuncSet_ReceivesCallersAudiencesNotTheRecordedCopy(
 func TestTokenSourceJWTSVIDs_ReturnedSliceMutated_NextCallIsUnaffected(t *testing.T) {
 	g := NewWithT(t)
 
-	canned := tokenSourceSVID("aud-1")
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{canned}}
+	canned := tokenSourceSVID(t, "aud-1")
+	source := &TokenSource{Result: []*jwtsvid.SVID{canned}}
 
 	got, err := source.JWTSVIDs(context.Background(), tokenSourceTestWorkload, []string{"aud-1"})
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(HaveLen(1))
 	tokenSourceExpectSVID(g, got[0], canned)
 
-	got[0] = tokenSourceSVID("mutated")
+	got[0] = tokenSourceSVID(t, "mutated")
 
 	again, err := source.JWTSVIDs(context.Background(), tokenSourceTestWorkload, []string{"aud-1"})
 	g.Expect(err).To(Not(HaveOccurred()))
@@ -241,17 +264,17 @@ func TestTokenSourceJWTSVIDs_ReturnedSliceMutated_NextCallIsUnaffected(t *testin
 func TestTokenSourceSetResult_CalledWhileLive_ReplacesCannedBehaviour(t *testing.T) {
 	g := NewWithT(t)
 
-	first := tokenSourceSVID("aud-1")
-	second := tokenSourceSVID("aud-2")
+	first := tokenSourceSVID(t, "aud-1")
+	second := tokenSourceSVID(t, "aud-2")
 	cannedErr := errors.New("jwt issuance failed")
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{first}}
+	source := &TokenSource{Result: []*jwtsvid.SVID{first}}
 
 	got, err := source.JWTSVIDs(context.Background(), tokenSourceTestWorkload, []string{"aud-1"})
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(HaveLen(1))
 	tokenSourceExpectSVID(g, got[0], first)
 
-	source.SetResult([]*workloadidentity.JWTSVID{second}, nil)
+	source.SetResult([]*jwtsvid.SVID{second}, nil)
 	got, err = source.JWTSVIDs(context.Background(), tokenSourceTestWorkload, []string{"aud-2"})
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(HaveLen(1))
@@ -268,8 +291,8 @@ func TestTokenSourceSetResult_CalledWhileLive_ReplacesCannedBehaviour(t *testing
 func TestTokenSourceJWTSVIDs_GateBlocked_ReturnsCannedResultAfterRelease(t *testing.T) {
 	g := NewWithT(t)
 
-	canned := tokenSourceSVID("aud-1")
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{canned}}
+	canned := tokenSourceSVID(t, "aud-1")
+	source := &TokenSource{Result: []*jwtsvid.SVID{canned}}
 	source.Block()
 
 	ctx, cancel := context.WithTimeout(context.Background(), tokenSourceTestTimeout)
@@ -310,7 +333,7 @@ func TestTokenSourceJWTSVIDs_GateBlocked_ReturnsCannedResultAfterRelease(t *test
 func TestTokenSourceJWTSVIDs_ParkedCallContextCancelled_ReturnsContextError(t *testing.T) {
 	g := NewWithT(t)
 
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{tokenSourceSVID("aud-1")}}
+	source := &TokenSource{Result: []*jwtsvid.SVID{tokenSourceSVID(t, "aud-1")}}
 	source.Block()
 
 	waitCtx, cancelWait := context.WithTimeout(context.Background(), tokenSourceTestTimeout)
@@ -344,7 +367,7 @@ func TestTokenSourceJWTSVIDs_ParkedCallContextCancelled_ReturnsContextError(t *t
 func TestTokenSourceJWTSVIDs_ContextAlreadyDone_ReturnsContextErrorWithoutParking(t *testing.T) {
 	g := NewWithT(t)
 
-	source := &TokenSource{Result: []*workloadidentity.JWTSVID{tokenSourceSVID("aud-1")}}
+	source := &TokenSource{Result: []*jwtsvid.SVID{tokenSourceSVID(t, "aud-1")}}
 	source.Block()
 
 	ctx, cancel := context.WithCancel(context.Background())

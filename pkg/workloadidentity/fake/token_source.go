@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
+
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -31,13 +33,13 @@ type TokenSource struct {
 	// how many audiences were asked for. A copy of the slice is returned, so a
 	// caller mutating what it got cannot corrupt the canned value. The elements
 	// are shared. Use Func to vary the answer per audience.
-	Result []*workloadidentity.JWTSVID
+	Result []*jwtsvid.SVID
 	// Err, when non-nil and Func is nil, is returned by JWTSVIDs together with a
 	// nil slice.
 	Err error
 	// Func, when non-nil, wins over Result and Err: JWTSVIDs returns whatever it
 	// returns, uncopied.
-	Func func(ctx context.Context, w *workloadidentity.Workload, audiences []string) ([]*workloadidentity.JWTSVID, error)
+	Func func(ctx context.Context, w *workloadidentity.Workload, audiences []string) ([]*jwtsvid.SVID, error)
 
 	mu       sync.Mutex
 	calls    int
@@ -55,7 +57,7 @@ type TokenSource struct {
 // is next scheduled, which can be after Release has returned. Use WaitForBlocked
 // to observe a parked call, and observe the call's own return before asserting on
 // Calls or Requests.
-func (s *TokenSource) JWTSVIDs(ctx context.Context, w *workloadidentity.Workload, audiences []string) ([]*workloadidentity.JWTSVID, error) {
+func (s *TokenSource) JWTSVIDs(ctx context.Context, w *workloadidentity.Workload, audiences []string) ([]*jwtsvid.SVID, error) {
 	if err := s.enter(ctx); err != nil {
 		return nil, err
 	}
@@ -100,7 +102,7 @@ func (s *TokenSource) Requests() []JWTSVIDRequest {
 }
 
 // SetResult replaces the canned JWT-SVIDs and error while the fake is live.
-func (s *TokenSource) SetResult(svids []*workloadidentity.JWTSVID, err error) {
+func (s *TokenSource) SetResult(svids []*jwtsvid.SVID, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Result = svids

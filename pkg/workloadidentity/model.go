@@ -22,6 +22,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
@@ -129,27 +130,16 @@ type CertSource interface {
 // TokenSource yields JWT-SVIDs for a workload. Audiences is plural because
 // FetchJWTSVID takes a repeated audience field.
 //
-// The STS call underneath also takes a list but permits only one entry, so an
-// implementation fans out: one call per requested audience, and one cache entry
-// each. A caller asking for three audiences costs three issuances.
+// The implementation fans out to one STS call and one cache entry per audience
+// because the Workload API returns independently renewable JWT-SVIDs. A token
+// carrying several audiences would couple their cache and renewal lifecycles.
+//
+// It yields go-spiffe's jwtsvid.SVID, which keeps the token unexported: only
+// jwtsvid.ParseInsecure or ParseAndValidate build one whose Marshal returns it,
+// and both check exp, iat and nbf against the wall clock. Hint is never set.
 type TokenSource interface {
 	// JWTSVIDs returns one JWT-SVID per requested audience.
-	JWTSVIDs(ctx context.Context, w *Workload, audiences []string) ([]*JWTSVID, error)
-}
-
-// JWTSVID tracks the Workload API JWTSVID message.
-type JWTSVID struct {
-	// SpiffeID is the SPIFFE ID asserted by the token's subject.
-	SpiffeID string
-	// Token is the serialized JWT-SVID.
-	Token string
-	// Hint is on the wire and nothing populates it, for the same reason as on
-	// X509SVID: WISE issues one SVID per workload, so there is never a set to
-	// disambiguate.
-	Hint string
-	// ExpiresAt is agent-internal, parsed from the token's exp claim and used
-	// to schedule renewal.
-	ExpiresAt time.Time
+	JWTSVIDs(ctx context.Context, w *Workload, audiences []string) ([]*jwtsvid.SVID, error)
 }
 
 // BundleSource yields trust material per workload identity provider, not per
