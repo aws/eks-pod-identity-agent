@@ -2,11 +2,9 @@ package sts
 
 // The call that asks STS to sign a certificate for a workload.
 //
-// Differs from GetTrustBundles only in what the credentials mean. GetTrustBundles
-// names its provider in the request and the node role signs it. This call names no
-// identity: STS takes the identity for the certificate from whoever signed, so the
-// credentials have to be the workload's own and they decide whose certificate comes
-// back.
+// Differs from GetTrustBundles only in what the credentials mean. That call names its
+// provider in the request; this one names no identity, so STS takes it from whoever
+// signed and the credentials have to be the workload's own.
 
 import (
 	"context"
@@ -31,24 +29,11 @@ type CertificateRequest struct {
 	// whoever signed the call. Required.
 	CertificateSigningRequestPEM string
 
-	// MaxDuration is how long a certificate we would like.
+	// MaxDuration is the certificate lifetime we request, 1 to 12 hours, checked at
+	// startup. Zero means no preference, which STS answers with 12 hours.
 	//
-	// The model calls it a ceiling, so STS may issue less. STS said on 2026-10-02 that in
-	// P0 nothing reduces it, which makes it effectively the lifetime we get, but "in P0"
-	// names a phase while the ceiling is the contract. So nothing works out a validity
-	// window by adding this value to the clock. The window is read off the issued leaf
-	// certificate, and it differs from this value either way, because STS backdates the
-	// start by five minutes so a client whose clock is behind still accepts the
-	// certificate.
-	//
-	// Zero means no preference, which STS answers with twelve hours.
-	//
-	// It is not limited by how long our own credentials have left. The comment on
-	// workloadIdentityCertificateMaxDurationSecondsType in IAMTokenServiceModel says it
-	// is; STS confirmed on 2026-10-02 that it no longer does.
-	//
-	// 1 to 12 hours is accepted, checked at startup against --x509-svid-duration so a bad
-	// value stops the agent booting rather than failing every pod.
+	// It is a ceiling, so the issued window comes off the certificate rather than from this
+	// value. STS does not reduce it to the signing credentials' remaining life.
 	MaxDuration time.Duration
 }
 
@@ -61,12 +46,9 @@ type IssuedCertificate struct {
 	// left out: whoever verifies this workload already has it from the trust bundle.
 	CertificateChainPEM string
 
-	// NotBefore and NotAfter are the window STS reports alongside the certificate.
-	//
-	// Nothing reads them. The renewal schedule comes off the leaf certificate instead, so
-	// these are parsed to reject a response carrying no window or an inverted one, and
-	// they are kept because comparing them against the leaf would catch a signer
-	// disagreeing with the service.
+	// NotBefore and NotAfter are the window STS reports alongside the certificate. They are
+	// parsed so that a response carrying no window, or an inverted one, is rejected. The
+	// renewal schedule uses the leaf's own dates rather than these.
 	NotBefore time.Time
 	NotAfter  time.Time
 
@@ -83,7 +65,7 @@ func (s *service) GetWorkloadIdentityCertificate(ctx context.Context, creds aws.
 		// Omitted rather than sent as zero, so the service default applies instead of a
 		// value the model would reject.
 		if req.MaxDuration > 0 {
-			input.Key("MaxDurationSeconds").Integer(int32(req.MaxDuration / time.Second))
+			input.Key("MaxDurationSeconds").Integer(int32(req.MaxDuration.Seconds()))
 		}
 	}, &decoded)
 	if err != nil {
@@ -109,16 +91,11 @@ type getWorkloadIdentityCertificateResponse struct {
 }
 
 // workloadIdentityCertificate is the response as it arrives on the wire. The dates are
-// read as plain strings and parsed afterwards, because Go's XML support has no notion
-// of a timestamp.
+// strings here and parsed afterwards, because Go's XML support has no notion of a
+// timestamp.
 //
 // CertificateChain is one block of PEM text holding the whole chain, not a list of
-// separate certificates. The model says so and STS confirmed it on 2026-10-02, adding
-// that the Java sample in the onboarding guide, which loops over the field as a list, is
-// out of date.
-//
-// Subject had the same disagreement, the model's name against the sample's spiffeId, and
-// STS confirmed the model there too.
+// separate certificates. The identity field is Subject.
 type workloadIdentityCertificate struct {
 	Certificate      string `xml:"Certificate"`
 	CertificateChain string `xml:"CertificateChain"`

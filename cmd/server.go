@@ -278,7 +278,7 @@ func init() {
 	// the accepted range is read off the envelope rather than written out again,
 	// so --help cannot claim a bound validation does not enforce
 	// Twelve hours is both the top of the envelope and what STS issues when the request
-	// names no lifetime, confirmed on 2026-10-02. Asking for less does not make anything
+	// names no lifetime. Asking for less does not make anything
 	// safer, because a shorter certificate is replaced sooner and each replacement is a
 	// signing operation.
 	x509Lower, x509Upper := handlers.X509SVIDDurationBounds()

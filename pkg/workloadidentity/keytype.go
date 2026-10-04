@@ -5,12 +5,9 @@ import (
 	"strings"
 )
 
-// KeyType is the kind of key pair the agent generates for each X.509-SVID.
-//
-// An operator fixes one for the whole agent at startup. A workload cannot ask for a
-// particular kind, because the SPIFFE Workload API has no field to ask with. SPIRE
-// settles it the same way, as a static choice made when the agent boots, and these
-// names match SPIRE's so an operator moving between the two reads one spelling.
+// KeyType is the kind of key pair the agent generates for each X.509-SVID. An operator
+// fixes one for the whole agent at startup, because the SPIFFE Workload API gives a
+// workload no field to request one. The names match SPIRE's.
 type KeyType string
 
 const (
@@ -24,16 +21,9 @@ const (
 	KeyTypeRSA4096 KeyType = "rsa-4096"
 )
 
-// DefaultKeyType is what the agent generates when an operator names nothing.
-//
-// P-256 is the SPIFFE default and what the onboarding guide's own sample generates. It
-// is also far the cheapest of the four to generate, which matters because the agent
-// makes a fresh key for every pod at every renewal. Generating RSA-4096 takes long
-// enough to be visible on that path.
-//
-// Which of the four STS accepts is not confirmed. On 2026-10-02 they called the list
-// reasonable and deferred the detail, so choosing anything other than this is choosing
-// something untested against the real service.
+// DefaultKeyType is what the agent generates when an operator names nothing. P-256 is the
+// SPIFFE default and the cheapest of the four to generate, which matters because the agent
+// makes a key for every pod at every renewal.
 const DefaultKeyType = KeyTypeECP256
 
 // KeyTypes returns every accepted value, in the order a flag's usage string lists them.

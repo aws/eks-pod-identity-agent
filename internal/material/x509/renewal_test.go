@@ -99,6 +99,7 @@ func TestRenewalDelayFloorsAPassedPoint(t *testing.T) {
 
 	assert.Equal(t, 2*time.Hour, renewalDelay(now, now.Add(2*time.Hour)))
 	assert.Equal(t, minRenewalDelay, renewalDelay(now, now.Add(-time.Hour)),
-		"a point already passed waits the floor rather than zero, so a late renewal is prompt without looping")
-	assert.Equal(t, minRenewalDelay, renewalDelay(now, now.Add(time.Second)))
+		"a point already passed returns the floor, not zero: the cache reads a non-positive refresh deadline as never refresh")
+	assert.Equal(t, minRenewalDelay, renewalDelay(now, now.Add(time.Second)),
+		"a point inside the floor is raised to it, so the deadline stays positive")
 }

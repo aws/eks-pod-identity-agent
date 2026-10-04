@@ -25,14 +25,9 @@ const pemTypeCertificateRequest = "CERTIFICATE REQUEST"
 
 // generateKey creates a new key pair of the configured kind for one certificate.
 //
-// It hands back a crypto.Signer rather than the key itself. A Signer can sign things
-// but does not expose the secret as bytes, so there is no easy way for later code to
-// copy it somewhere it should not be.
-//
-// An unknown kind is an error rather than a fallback to the default. The kind is checked
-// once at startup, so reaching here with an unknown one means a caller built the tier
-// without that check, and quietly generating something other than what was asked for
-// would hide it.
+// It returns a crypto.Signer rather than the key, because a Signer does not expose the
+// secret as bytes. An unknown kind is an error rather than a fallback: the kind is checked
+// at startup, so reaching here with an unknown one means a caller skipped that check.
 func generateKey(kind workloadidentity.KeyType) (crypto.Signer, error) {
 	switch kind {
 	case workloadidentity.KeyTypeECP256:
@@ -66,15 +61,11 @@ func rsaKey(bits int, kind workloadidentity.KeyType) (crypto.Signer, error) {
 	return key, nil
 }
 
-// buildCSR creates the certificate request we send to STS.
+// buildCSR creates the certificate request we send to STS. It carries the public half of
+// the key pair and a signature made with the private half, which proves possession.
 //
-// The request contains two things: the public half of the key pair, and a signature
-// made with the private half. The signature proves we hold the private key.
-//
-// No name goes in it. STS decides the identity from the credentials the call is signed
-// with, and supplies the subject itself from the attested workload identity, so a name
-// here would be discarded. Left blank, because a name in this request would suggest the
-// agent chooses the workload's identity.
+// It carries no name. STS takes the subject from the attested workload identity in the
+// session, and ignores any subject or SAN in the request.
 func buildCSR(key crypto.Signer) (string, error) {
 	der, err := cryptox509.CreateCertificateRequest(rand.Reader, &cryptox509.CertificateRequest{
 		Subject: pkix.Name{},

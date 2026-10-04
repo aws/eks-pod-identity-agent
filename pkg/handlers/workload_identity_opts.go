@@ -70,13 +70,10 @@ type WorkloadIdentityServerOpts struct {
 	// same renewal instant, which puts every renewal on the node into one burst
 	// against STS. Zero disables jitter, which is only useful in a test.
 	SVIDRenewalJitter float64
-	// SVIDKeyType is the kind of key pair generated for every X.509-SVID on this
-	// node. It is one setting for the whole agent because the SPIFFE Workload API
-	// gives a workload no way to ask for a particular kind, and SPIRE fixes it at
-	// bootstrap for the same reason.
-	//
-	// Empty means workloadidentity.DefaultKeyType. JWT-SVIDs are unaffected: STS
-	// signs those, so no key is generated here for them.
+	// SVIDKeyType is the kind of key pair generated for every X.509-SVID on this node.
+	// Empty means workloadidentity.DefaultKeyType, and workloadidentity.KeyType says why
+	// it is one setting for the agent. JWT-SVIDs are unaffected, since STS signs those
+	// and the agent generates no key for them.
 	SVIDKeyType workloadidentity.KeyType
 }
 

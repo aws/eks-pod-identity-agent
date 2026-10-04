@@ -34,40 +34,21 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// The timing defaults, and why each has the value it does.
-//
-// One fact sets most of them: a certificate we ask for is a signing operation at the
-// customer's own certificate authority, which is rate limited and not free. So the
-// defaults lean towards asking less often and tolerating a late replacement, which a
-// certificate valid for hours can absorb.
-//
-// Three of them are related and should be changed together. The janitor interval is
-// also the retry interval for a failed replacement, because a due entry stays due. The
-// renewal timeout sits below the janitor interval so a slow attempt cannot still be
-// running when the next sweep arrives. And the rate limit is per second, so what a
-// single sweep gets through depends on how long the sweep itself takes.
-//
-// Two values are not here. The lifetime we request and the point we replace at come
-// from --x509-svid-duration, --svid-renewal-fraction and --svid-renewal-jitter, which
-// T1 validates at startup. See renewal.go.
+// The timing defaults. Each certificate is a signing operation at the customer's
+// certificate authority, so these favour asking less often over replacing promptly. The
+// janitor interval, the renewal timeout and the rate limit interact; change them together.
+// The lifetime we request and the point we replace at are not here. They come from
+// --x509-svid-duration, --svid-renewal-fraction and --svid-renewal-jitter.
 const (
 	// defaultMinRemaining is how much life a certificate needs left before we hand it to
-	// a workload.
-	//
-	// A minute is longer than a TLS handshake and the requests likely to follow it, so a
-	// workload will not find its certificate expiring mid-connection. Generous rather
-	// than tuned: too big fetches a new certificate slightly early, too small hands out
-	// one that dies while in use. The first is cheap.
+	// a workload. A minute outlasts a TLS handshake and the requests that follow it, so a
+	// workload does not find its certificate expiring mid-connection.
 	defaultMinRemaining = 1 * time.Minute
 
-	// defaultCleanupInterval is how often the cache's background timer looks for
-	// certificates due for replacement, and so also how long a failed replacement waits
-	// before the next attempt.
-	//
-	// A minute against lifetimes measured in hours means a replacement happens within a
-	// minute of becoming due, and a transient failure gets dozens of attempts before the
-	// certificate expires. It matches the existing credentials cache, which sweeps on
-	// the same interval.
+	// defaultCleanupInterval is how often the cache looks for certificates due for
+	// replacement, and so also how long a failed replacement waits before retrying. A
+	// minute against lifetimes in hours gives a transient failure dozens of attempts. It
+	// matches the credentials cache.
 	defaultCleanupInterval = 1 * time.Minute
 
 	// defaultRenewalTimeout caps one background replacement, below
@@ -75,25 +56,16 @@ const (
 	// sweep arrives.
 	defaultRenewalTimeout = 30 * time.Second
 
-	// defaultIssueTimeout caps one request made while a workload waits. Separate from
-	// the renewal timeout because the situations differ: here a pod is blocked with no
-	// certificate at all, where a renewal runs behind one that still works. The values
-	// happen to match today.
+	// defaultIssueTimeout caps one request made while a workload waits. Separate from the
+	// renewal timeout because here a pod has no certificate at all, whereas a renewal runs
+	// behind one that still works. The values happen to match today.
 	defaultIssueTimeout = 30 * time.Second
 
-	// defaultRefreshQPS is the rate and burst of background replacements, in calls per
-	// second.
-	//
-	// Two is low, for the reason above. A sweep accrues tokens while it runs, so
-	// this is not a cap of two per sweep; the throughput is roughly two per second of
-	// sweep. Work the limit turns away is skipped rather than queued, and the next sweep
-	// picks it up a minute later.
-	//
-	// The risk this creates is a backlog on a node where many certificates come due
-	// together, which jitter on the replacement point is what avoids. The same concern
-	// was raised against the session tier on PR #7, where it matters more because a
-	// session lives an hour against a certificate's twelve. Whatever that settles on
-	// should apply here too.
+	// defaultRefreshQPS is the rate and burst of background replacements, per second, not
+	// per sweep: a sweep accrues tokens while it runs. Work the limit turns away is
+	// skipped, and the next sweep picks it up a minute later. Jitter on the renewal point
+	// is what stops a node's certificates coming due together. Two may be low for a node
+	// running many pods, and should be revisited alongside the other per-pod tiers.
 	defaultRefreshQPS = 2
 )
 
@@ -115,20 +87,14 @@ type Opts struct {
 	// credentials decide whose certificate comes back. Required.
 	SessionProvider workloadidentity.SessionProvider
 
-	// Notifier is told when a pod's certificate has changed, so the streams serving
-	// that pod wake up and send the new one. Required.
-	//
-	// Without it a replacement never reaches a workload: the agent would hold a fresh
-	// certificate while the pod carried on with the old one until its stream was
-	// re-established. One hub serves the node, and this tier only publishes to it.
+	// Notifier is told when a pod's certificate has changed, so the streams serving that
+	// pod wake and send the new one. Required: without it a replacement reaches a workload
+	// only when its stream is re-established.
 	Notifier workloadidentity.WorkloadNotifier
 
-	// MaxCacheSize is the most certificates we will hold, one per pod. It comes from
-	// --max-cache-size, the same per-node budget the other per-pod caches use.
-	//
-	// There is no default and a zero or negative value is rejected, because the cache
-	// underneath treats zero as "no limit", and an unlimited store of private keys is
-	// not something to end up with by accident.
+	// MaxCacheSize is the most certificates we hold, one per pod, from --max-cache-size.
+	// Zero or negative is rejected rather than defaulted: the cache underneath reads zero
+	// as "no limit", and an unbounded store of private keys should not happen by accident.
 	MaxCacheSize int
 
 	// Duration is the certificate lifetime we ask for, from --x509-svid-duration. Zero
@@ -183,15 +149,10 @@ type Source struct {
 	notifier        workloadidentity.WorkloadNotifier
 	cache           *expiring.Cache[string, entry]
 
-	// group makes sure that several requests arriving for the same pod at once result
-	// in one call to STS, with the rest waiting for its answer.
-	//
-	// This is the normal case, not a rare one. A workload using the SPIFFE library
-	// opens one stream for its certificate and another for the trust bundle; Envoy
-	// subscribes separately for its certificate and for what it should trust; and
-	// every container in the pod shares the same socket. So one pod starting up can
-	// easily produce several requests at the same moment, and each certificate we ask for
-	// is a signing operation at the customer's certificate authority.
+	// group collapses several requests for one pod into a single call to STS. This is the
+	// normal case: a workload using the SPIFFE library opens one stream per material, Envoy
+	// subscribes separately for its certificate and its trust store, and every container in
+	// the pod shares the socket. Each call signs a new certificate.
 	group   singleflight.Group
 	limiter *rate.Limiter
 
@@ -272,12 +233,10 @@ func New(opts Opts) (*Source, error) {
 	return s, nil
 }
 
-// X509SVIDs returns the pod's certificate, fetching one if we do not have a usable
-// one already.
+// X509SVIDs returns the pod's certificate, fetching one if the cache holds nothing usable.
 //
-// The result always has exactly one certificate in it. STS gives a workload one
-// identity, so there is never a choice to make. It is a list only because the SPIFFE
-// API this feeds is defined to return a list.
+// The result always holds exactly one certificate, because STS gives a workload one
+// identity. It is a list only because the SPIFFE API this feeds returns a list.
 func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([]*x509svid.SVID, error) {
 	if w == nil || w.PodUID == "" {
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(nil, "cannot issue a certificate for an empty workload")
@@ -290,13 +249,10 @@ func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([
 	// happens when replacements have been failing. It stays in the cache, since
 	// workloads already holding it can keep using it, and this caller gets a fresh one.
 
-	// The request to STS is cut loose from this caller's context. If the workload that
-	// triggered it hangs up, we still want the answer, because other callers are
-	// waiting on the same one and abandoning it would mean paying for a second
-	// certificate. issueTimeout stops it running forever.
-	//
-	// DoChan rather than Do lets this caller stop waiting when its own context ends,
-	// while the request carries on for everyone else.
+	// Detached from this caller's context, because other callers wait on the same answer
+	// and abandoning it would mean asking for a second certificate. issueTimeout stops it
+	// running forever. DoChan rather than Do lets this caller stop waiting when its own
+	// context ends, while the request carries on for the others.
 	issueCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.issueTimeout)
 	result := s.group.DoChan(w.PodUID, func() (any, error) {
 		defer cancel()
@@ -317,11 +273,9 @@ func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([
 	}
 }
 
-// Invalidate forgets the pod's certificate, and with it the private key.
-//
-// The pod watcher calls this when a pod goes away. Kubernetes never reuses a pod's
-// UID, so nothing will ever ask for this entry again, and there is no reason to keep
-// a key belonging to something that no longer exists.
+// Invalidate forgets the pod's certificate, and with it the private key. The pod watcher
+// calls this when a pod goes away. Kubernetes never reuses a pod UID, so nothing will ask
+// for this entry again.
 func (s *Source) Invalidate(podUID string) {
 	s.cache.Delete(podUID)
 }
@@ -370,19 +324,10 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*x509
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(err, "building a certificate signing request for %s/%s", w.Namespace, w.PodName)
 	}
 
-	// We ask for the full lifetime even when the credentials are about to expire. They
-	// only prove who we are now; the certificate has its own life. Credentials are capped
-	// at an hour, so matching them would put every certificate under an hour and multiply
-	// signing operations at the customer's certificate authority by about six.
-	//
-	// The comment on workloadIdentityCertificateMaxDurationSecondsType in
-	// IAMTokenServiceModel says the certificate is cut down to the credentials' remaining
-	// life. STS confirmed on 2026-10-02 that nothing clamps it, so the lifetime we ask
-	// for is the one we get, within the model's range. Do not add a cap on the strength
-	// of that comment.
-	//
-	// They did add that the session lifetime is recorded in the certificate and limits
-	// its use "in some places". Where, and what reads it, is an open question.
+	// The full lifetime, even when the credentials are nearly expired: they prove who we
+	// are now, and the certificate has its own life. Capping to the credentials would put
+	// every certificate under an hour and multiply signing operations by about six. Do not
+	// add a cap here.
 	issued, err := s.issuer.GetWorkloadIdentityCertificate(ctx, session.Credentials, sts.CertificateRequest{
 		CertificateSigningRequestPEM: csr,
 		MaxDuration:                  s.duration,
@@ -412,12 +357,10 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*x509
 	}, nil
 }
 
-// store puts the certificate in the cache under the pod's UID, with two separate
-// times attached: when to replace it, and when to throw it away.
-//
-// The two times are kept apart so a failed replacement loses nothing. Passing the
-// replacement time does not remove the entry, so a workload carries on using the
-// certificate it has while we keep trying. Only the real expiry removes it.
+// store caches the certificate under the pod's UID with two deadlines: when to replace
+// it, and when to discard it. They are separate so a failed replacement loses nothing.
+// Passing the replacement deadline leaves the entry in place, so a workload keeps using
+// what it holds while we retry. Only the real expiry removes it.
 func (s *Source) store(w *workloadidentity.Workload, svid *x509svid.SVID) {
 	now := s.now()
 	leafCert := leaf(svid)
@@ -429,26 +372,18 @@ func (s *Source) store(w *workloadidentity.Workload, svid *x509svid.SVID) {
 		leafCert.NotAfter.Sub(now),
 	)
 
-	// Told after the cache holds the new certificate, never before. A stream woken
-	// first would re-read and find the old one, and nothing would wake it again until
-	// the next change.
-	//
-	// Only on success, which is why this sits in store rather than in issueAndStore:
-	// a failed replacement changes nothing a stream could send, and an eviction is not
-	// a change either.
+	// After the cache holds the new certificate, never before: a stream woken first would
+	// re-read the old one and nothing would wake it again. In store rather than
+	// issueAndStore so it runs only on success, since a failed replacement changes nothing
+	// a stream could send.
 	s.notifier.NotifyWorkloadChange(w.PodUID)
 }
 
-// onRefresh replaces a certificate that is due, and is called by the cache's
-// background timer. The rate limit stops a node full of pods all coming due together
-// from overwhelming the customer's certificate authority.
-//
-// A failure usually keeps the certificate the workload already has. The workload is
-// holding something that still works, and taking it away would turn a replacement
+// onRefresh replaces a certificate that is due. The cache's timer calls it, and the rate
+// limit paces a node whose certificates come due together. A failure keeps the certificate
+// the workload already holds, because taking a working one away turns a replacement
 // problem into an outage for that pod. The entry stays due, so the next sweep retries.
-//
-// The exception is a failure saying the workload is gone, where we drop the entry. See
-// workloadGone.
+// See workloadGone for the exception.
 func (s *Source) onRefresh(uid string, cached entry) {
 	if !s.limiter.Allow() {
 		return
@@ -478,19 +413,11 @@ func (s *Source) onRefresh(uid string, cached entry) {
 		uid, leaf(cached.svid).NotAfter)
 }
 
-// workloadGone reports whether err means there is no workload left to serve, as opposed
-// to something transient we should retry through.
-//
-// Dropping the entry on these is what evicts a deleted pod's certificate and private
-// key. Without it, nothing does: deletion reaches this tier only as a renewal failure,
-// and the agent would hold a dead pod's key until the certificate expired, up to twelve
-// hours. Upstream issue 171 reports the same shape of bug on the AWS credentials path,
-// where ghost renewals for terminated pods consume EKS Auth capacity; here each one is a
-// signing operation against the customer's own certificate authority.
-//
-// A named set rather than "not retryable". ErrIssuanceRefused is also not retryable,
-// and means a malformed request or a Provider with no signer, neither of which says
-// anything about whether the pod is still there.
+// workloadGone reports whether err means there is no workload left to serve. Dropping the
+// entry on these is the only thing that evicts a deleted pod's private key today, because
+// deletion reaches this tier only as a renewal failure; upstream issue 171 reports the same
+// bug on the credentials path. A named set rather than "not retryable": ErrIssuanceRefused
+// is also not retryable and says nothing about whether the pod exists.
 func workloadGone(err error) bool {
 	return errors.Is(err, wierrors.ErrNotEnrolled) ||
 		errors.Is(err, wierrors.ErrTokenMintForbidden) ||
@@ -501,23 +428,12 @@ func workloadGone(err error) bool {
 // and is collected. It records nothing; metrics.go explains why.
 func (s *Source) onEvicted(_ string, _ entry) {}
 
-// checkIdentity makes sure the certificate we got back names who we expected.
+// checkIdentity confirms STS reported an identity and that it matches the certificate. An
+// empty subject fails, because STS always reports one, so its absence means the call
+// resolved to no workload identity.
 //
-// Weaker than intended. The check to have is the certificate's identity against the
-// identity the credentials carried, which would catch the agent muddling up two pods.
-// EKS Auth does not return an identity with the credentials, so there is nothing to
-// compare against. If that changes, the comparison goes here.
-//
-// What is checked instead: STS reported an identity, and it is the one in the
-// certificate. That the leaf's identity is a well formed SPIFFE name is already known,
-// because go-spiffe parsed it in parseChain.
-//
-// A missing subject is a failure. STS said on 2026-10-02 that the field is always set,
-// and that an empty one means there is no workload identity behind the call.
-//
-// The comparison is exact because the two are the same kind of string. The model
-// documents workloadIdentitySubjectType as the workload identity stamped into the
-// certificate, so it is a SPIFFE ID rather than a distinguished name.
+// Weaker than intended: the check worth having compares the certificate against the
+// identity the credentials carried, but EKS Auth returns no identity alongside them.
 func checkIdentity(leafID spiffeid.ID, reportedSubject string) error {
 	if reportedSubject == "" {
 		return fmt.Errorf("STS reported no subject, so it issued for no workload identity")
@@ -528,17 +444,10 @@ func checkIdentity(leafID spiffeid.ID, reportedSubject string) error {
 	return nil
 }
 
-// refusalCodes are the failures where trying again would get the same answer, so we
-// mark them as refused rather than as something to retry. Retrying spends another
-// signing operation at the customer's certificate authority for nothing.
-//
-// The first three are the only failures the STS operation itself defines: a request
-// it would not accept, which means we built it wrong; a provider with no certificate
-// signer set up, which the customer has to fix; and a signer whose key material is
-// not present in this region.
-//
-// STS confirmed on 2026-10-02 that RegionalSignerUnavailableException is not
-// retryable, so all three belong here.
+// refusalCodes are the failures a retry would get the same answer to, so they are marked
+// refused rather than retryable. The first three are the only failures the operation
+// models: a request we built wrong, a Provider with no signer, and a signer absent from
+// this Region.
 var refusalCodes = set.New(
 	"MalformedCertificateSigningRequestException",
 	"SignerNotConfiguredException",

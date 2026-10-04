@@ -23,12 +23,7 @@ const pemTypeCertificate = "CERTIFICATE"
 
 // parsedChain is one issued certificate after we have read it.
 type parsedChain struct {
-	// spiffeID is the workload's SPIFFE ID, read from the leaf's URI SAN.
-	//
-	// Named for the format on purpose. STS calls the same value Subject so they can
-	// change identity formats later, but nothing in this tier is format-neutral: it
-	// depends on go-spiffe, it enforces the SPIFFE rule of exactly one URI SAN, and it
-	// serves the SPIFFE Workload API.
+	// spiffeID is the workload's identity, read from the leaf's single URI SAN.
 	spiffeID spiffeid.ID
 
 	// certs holds the leaf first, then the certificates that signed it.
@@ -58,9 +53,8 @@ func parseChain(leafPEM, chainPEM string) (*parsedChain, error) {
 		return nil, fmt.Errorf("reading the identity from the leaf certificate: %w", err)
 	}
 
-	// An empty chain is tolerated rather than expected. STS said on 2026-10-02 that a
-	// root should never sign leaves directly, so this should not happen, but they were
-	// not certain and an empty chain is not a reason to refuse a usable certificate.
+	// A root should not sign leaf certificates directly, so an empty chain is unexpected.
+	// It is tolerated anyway, because it is no reason to refuse a usable certificate.
 	issuers, err := parseCertificates(chainPEM)
 	if err != nil {
 		return nil, fmt.Errorf("the issuing chain: %w", err)
