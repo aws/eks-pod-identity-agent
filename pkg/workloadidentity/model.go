@@ -22,6 +22,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
@@ -160,12 +162,13 @@ type BundleSource interface {
 	// OwnTrustDomain is the provider's own domain, which is the workload's. The
 	// Workload API presents its authorities inline on each X509SVID and every
 	// other entry under federated_bundles, so the handler has to know which.
-	OwnTrustDomain(ctx context.Context, w *Workload) (string, error)
+	OwnTrustDomain(ctx context.Context, w *Workload) (spiffeid.TrustDomain, error)
 
-	// X509Bundles mirrors FetchX509Bundles: authorities as DER, keyed by trust
-	// domain, decoded from each JWK's x5c member. Envoy wants these
-	// PEM-encoded, which the SDS handler does at the edge.
-	X509Bundles(ctx context.Context, w *Workload) (map[string][][]byte, error)
+	// X509Bundles mirrors FetchX509Bundles: one bundle per trust domain that has
+	// x509-svid authorities, kept in a fixed order so an unchanged set marshals to
+	// the same bytes. The set and its bundles are the caller's copy; the
+	// certificates are shared and must not be modified. Envoy's PEM is Marshal.
+	X509Bundles(ctx context.Context, w *Workload) (*x509bundle.Set, error)
 
 	// JWTBundles mirrors FetchJWTBundles: per trust domain, a JWK Set of the
 	// jwt-svid keys only, which the RPC returns as is. x509-svid entries are

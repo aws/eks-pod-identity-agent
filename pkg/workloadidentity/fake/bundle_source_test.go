@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ed25519"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"slices"
@@ -14,6 +15,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -48,7 +50,7 @@ func bundleSourceNamedWorkload(name string) *workloadidentity.Workload {
 type bundleSourceCtxKey struct{}
 
 // bundleSourceOwnDomain and bundleSourceFederatedDomain are the trust domains
-// the canned JWT sources in this file cover.
+// the canned JWT sources and X.509 sets in this file cover.
 var (
 	bundleSourceOwnDomain       = spiffeid.RequireTrustDomainFromString("example.org")
 	bundleSourceFederatedDomain = spiffeid.RequireTrustDomainFromString("other.org")
@@ -84,6 +86,46 @@ func bundleSourceSet() *jwtbundle.Set {
 		bundleSourceOwnBundle(),
 		jwtbundle.FromJWTAuthorities(bundleSourceFederatedDomain, map[string]crypto.PublicKey{"federated-kid": bundleSourceFederatedKey}),
 	)
+}
+
+// bundleSourceCert stands in for an X.509 authority. The fake never parses one,
+// and go-spiffe tells certificates apart by Raw, so Raw is all it carries.
+func bundleSourceCert(der string) *x509.Certificate {
+	return &x509.Certificate{Raw: []byte(der)}
+}
+
+// bundleSourceOwnX509Set builds a fresh set holding only an own-domain bundle
+// with own-authority-der.
+func bundleSourceOwnX509Set() *x509bundle.Set {
+	return x509bundle.NewSet(x509bundle.FromX509Authorities(bundleSourceOwnDomain, []*x509.Certificate{bundleSourceCert("own-authority-der")}))
+}
+
+// bundleSourceX509Set builds a fresh set of the own bundle and a federated bundle
+// holding two authorities.
+func bundleSourceX509Set() *x509bundle.Set {
+	set := bundleSourceOwnX509Set()
+	set.Add(x509bundle.FromX509Authorities(bundleSourceFederatedDomain, []*x509.Certificate{
+		bundleSourceCert("federated-authority-der"), bundleSourceCert("federated-authority-der-2"),
+	}))
+	return set
+}
+
+// bundleSourceX509DER reads a set down to each trust domain's authorities as DER
+// in the order the bundle holds them, nil for a nil set, so an assertion compares
+// both what a set holds and its order.
+func bundleSourceX509DER(set *x509bundle.Set) map[string][][]byte {
+	if set == nil {
+		return nil
+	}
+	out := make(map[string][][]byte, set.Len())
+	for _, bundle := range set.Bundles() {
+		authorities := [][]byte{}
+		for _, certificate := range bundle.X509Authorities() {
+			authorities = append(authorities, certificate.Raw)
+		}
+		out[bundle.TrustDomain().Name()] = authorities
+	}
+	return out
 }
 
 // bundleSourceAuthorities reads td's authorities out of source the way
@@ -178,22 +220,22 @@ func TestBundleSourceOwnTrustDomain_CannedBehaviour_ReturnsThatBehaviourForAnyWo
 	testCases := []struct {
 		name        string
 		source      *BundleSource
-		expected    string
+		expected    spiffeid.TrustDomain
 		expectedErr error
 	}{
 		{
-			name:     "zero value returns the empty trust domain",
+			name:     "zero value returns the zero trust domain",
 			source:   &BundleSource{},
-			expected: "",
+			expected: spiffeid.TrustDomain{},
 		},
 		{
 			name:     "canned trust domain is returned",
-			source:   &BundleSource{TrustDomain: "example.org"},
-			expected: "example.org",
+			source:   &BundleSource{TrustDomain: bundleSourceOwnDomain},
+			expected: bundleSourceOwnDomain,
 		},
 		{
 			name:        "canned error wins over the canned trust domain",
-			source:      &BundleSource{TrustDomain: "example.org", OwnTrustDomainErr: cannedErr},
+			source:      &BundleSource{TrustDomain: bundleSourceOwnDomain, OwnTrustDomainErr: cannedErr},
 			expectedErr: cannedErr,
 		},
 	}
@@ -221,30 +263,32 @@ func TestBundleSourceOwnTrustDomain_CannedBehaviour_ReturnsThatBehaviourForAnyWo
 
 func TestBundleSourceX509Bundles_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
 	cannedErr := errors.New("bundle unavailable")
-	canned := map[string][][]byte{
+	canned := bundleSourceX509Set()
+	cannedDER := map[string][][]byte{
 		"example.org": {[]byte("own-authority-der")},
 		"other.org":   {[]byte("federated-authority-der"), []byte("federated-authority-der-2")},
 	}
 
 	testCases := []struct {
-		name        string
-		source      *BundleSource
+		name   string
+		source *BundleSource
+		// expected is the returned set as bundleSourceX509DER reads it.
 		expected    map[string][][]byte
 		expectedErr error
 	}{
 		{
-			name:     "zero value returns a nil map and no error",
+			name:     "zero value returns a nil set and no error",
 			source:   &BundleSource{},
 			expected: nil,
 		},
 		{
 			name:     "canned bundles are returned",
 			source:   &BundleSource{X509: canned},
-			expected: canned,
+			expected: cannedDER,
 		},
 		{
-			name:     "empty canned bundles stay distinguishable from nil",
-			source:   &BundleSource{X509: map[string][][]byte{}},
+			name:     "empty canned set stays distinguishable from nil",
+			source:   &BundleSource{X509: x509bundle.NewSet()},
 			expected: map[string][][]byte{},
 		},
 		{
@@ -257,8 +301,9 @@ func TestBundleSourceX509Bundles_CannedBehaviour_ReturnsThatBehaviour(t *testing
 			source: &BundleSource{
 				X509:    canned,
 				X509Err: cannedErr,
-				X509Func: func(_ context.Context, _ *workloadidentity.Workload) (map[string][][]byte, error) {
-					return map[string][][]byte{"func.org": {[]byte("func-der")}}, nil
+				X509Func: func(_ context.Context, _ *workloadidentity.Workload) (*x509bundle.Set, error) {
+					funcDomain := spiffeid.RequireTrustDomainFromString("func.org")
+					return x509bundle.NewSet(x509bundle.FromX509Authorities(funcDomain, []*x509.Certificate{bundleSourceCert("func-der")})), nil
 				},
 			},
 			expected: map[string][][]byte{"func.org": {[]byte("func-der")}},
@@ -279,7 +324,7 @@ func TestBundleSourceX509Bundles_CannedBehaviour_ReturnsThatBehaviour(t *testing
 				if tc.expected == nil {
 					g.Expect(got).To(BeNil())
 				} else {
-					g.Expect(got).To(Equal(tc.expected))
+					g.Expect(bundleSourceX509DER(got)).To(Equal(tc.expected))
 				}
 			}
 			bundleSourceExpectOnlyCalls(g, tc.source, "X509Bundles", 1)
@@ -504,50 +549,141 @@ func TestBundleSourceJWTSource_CannedSourceChangedEitherSide_ReturnedSourceStays
 	}
 }
 
-func TestBundleSourceX509Bundles_ReturnedMapMutated_NextCallIsUnaffected(t *testing.T) {
+func TestBundleSourceX509Bundles_ReturnedSetMutated_NextCallIsUnaffected(t *testing.T) {
+	expected := map[string][][]byte{
+		"example.org": {[]byte("own-authority-der")},
+		"other.org":   {[]byte("federated-authority-der"), []byte("federated-authority-der-2")},
+	}
+	// bundle finds td's bundle in a returned set, so a case can change it.
+	bundle := func(g *WithT, set *x509bundle.Set, td spiffeid.TrustDomain) *x509bundle.Bundle {
+		found, ok := set.Get(td)
+		g.Expect(ok).To(BeTrue(), "the set holds %s", td)
+		return found
+	}
+
+	// Each case changes what the caller got at one level it can reach: the set,
+	// or a bundle in it.
+	testCases := []struct {
+		name   string
+		mutate func(g *WithT, got *x509bundle.Set)
+	}{
+		{
+			name: "bundle added to the set",
+			mutate: func(_ *WithT, got *x509bundle.Set) {
+				injected := spiffeid.RequireTrustDomainFromString("injected.org")
+				got.Add(x509bundle.FromX509Authorities(injected, []*x509.Certificate{bundleSourceCert("injected-der")}))
+			},
+		},
+		{
+			name:   "bundle replaced in the set",
+			mutate: func(_ *WithT, got *x509bundle.Set) { got.Add(x509bundle.New(bundleSourceOwnDomain)) },
+		},
+		{
+			name:   "bundle removed from the set",
+			mutate: func(_ *WithT, got *x509bundle.Set) { got.Remove(bundleSourceOwnDomain) },
+		},
+		{
+			name: "authority added to a bundle",
+			mutate: func(g *WithT, got *x509bundle.Set) {
+				bundle(g, got, bundleSourceOwnDomain).AddX509Authority(bundleSourceCert("appended-der"))
+			},
+		},
+		{
+			name: "authority removed from a bundle",
+			mutate: func(g *WithT, got *x509bundle.Set) {
+				bundle(g, got, bundleSourceFederatedDomain).RemoveX509Authority(bundleSourceCert("federated-authority-der"))
+			},
+		},
+		{
+			name: "authorities replaced in a bundle",
+			mutate: func(g *WithT, got *x509bundle.Set) {
+				bundle(g, got, bundleSourceFederatedDomain).SetX509Authorities([]*x509.Certificate{bundleSourceCert("replaced-der")})
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			source := &BundleSource{X509: bundleSourceX509Set()}
+
+			got, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
+			g.Expect(err).To(Not(HaveOccurred()))
+			g.Expect(bundleSourceX509DER(got)).To(Equal(expected))
+
+			tc.mutate(g, got)
+			g.Expect(bundleSourceX509DER(got)).To(Not(Equal(expected)), "the mutation changed what the caller got")
+
+			again, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
+			g.Expect(err).To(Not(HaveOccurred()))
+			g.Expect(bundleSourceX509DER(again)).To(Equal(expected))
+			g.Expect(bundleSourceX509DER(source.X509)).To(Equal(expected))
+			g.Expect(source.X509BundlesCalls()).To(Equal(2))
+		})
+	}
+}
+
+func TestBundleSourceX509Bundles_CannedSetChanged_ReturnedSetStaysPointInTime(t *testing.T) {
 	g := NewWithT(t)
 
-	der := []byte("own-authority-der")
-	source := &BundleSource{X509: map[string][][]byte{"example.org": {der}}}
-	expected := map[string][][]byte{"example.org": {[]byte("own-authority-der")}}
+	canned := bundleSourceOwnX509Set()
+	source := &BundleSource{}
+	source.SetX509Bundles(canned, nil)
+	own := map[string][][]byte{"example.org": {[]byte("own-authority-der")}}
+	rotated := map[string][][]byte{"example.org": {[]byte("own-authority-der"), []byte("rotated-der")}}
 
-	got, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
+	before, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(got).To(Equal(expected))
 
-	// Mutate every level the caller can reach: the map, the per-domain slice, and
-	// the authority bytes.
-	got["injected.org"] = [][]byte{[]byte("injected-der")}
-	got["example.org"] = append(got["example.org"], []byte("appended-der"))
-	got["example.org"][0][0] = 'X'
+	// Rotating the canned set reaches the next call but not a copy already
+	// handed out.
+	cannedOwn, _ := canned.Get(bundleSourceOwnDomain)
+	cannedOwn.AddX509Authority(bundleSourceCert("rotated-der"))
+	g.Expect(bundleSourceX509DER(before)).To(Equal(own))
 
-	again, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
+	after, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(again).To(Equal(expected))
-	g.Expect(source.X509).To(Equal(expected))
-	g.Expect(der).To(Equal([]byte("own-authority-der")))
+	g.Expect(bundleSourceX509DER(after)).To(Equal(rotated))
+
+	// The copy stops at the bundle: the certificates are the canned ones.
+	afterOwn, _ := after.Get(bundleSourceOwnDomain)
+	cannedCerts, afterCerts := cannedOwn.X509Authorities(), afterOwn.X509Authorities()
+	g.Expect(afterCerts).To(HaveLen(len(cannedCerts)))
+	for i := range cannedCerts {
+		g.Expect(afterCerts[i]).To(BeIdenticalTo(cannedCerts[i]))
+	}
 	g.Expect(source.X509BundlesCalls()).To(Equal(2))
 }
 
-func TestBundleSourceX509Bundles_DomainWithNilAuthorities_KeepsNilApartFromEmpty(t *testing.T) {
+func TestBundleSourceX509Bundles_EmptySetOrBundle_StaysApartFromAbsent(t *testing.T) {
 	g := NewWithT(t)
 
-	// A trust domain the agent knows about but holds no authority for is a
-	// different state from one holding an empty set, and the copy has to keep the
-	// two apart or a test cannot assert on either.
-	source := &BundleSource{X509: map[string][][]byte{
-		"nil.example.org":   nil,
-		"empty.example.org": {},
-	}}
+	// A trust domain the set holds an empty bundle for is a different state from
+	// one it holds nothing for, as an empty set is from no set at all. The copy
+	// has to keep each pair apart or a test cannot assert on either.
+	empty := spiffeid.RequireTrustDomainFromString("empty.example.org")
+	absent := spiffeid.RequireTrustDomainFromString("absent.example.org")
+	source := &BundleSource{X509: x509bundle.NewSet(x509bundle.New(empty))}
 
 	got, err := source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(got).To(HaveLen(2))
-	g.Expect(got).To(HaveKey("nil.example.org"))
-	g.Expect(got["nil.example.org"]).To(BeNil())
-	g.Expect(got["empty.example.org"]).ToNot(BeNil())
-	g.Expect(got["empty.example.org"]).To(BeEmpty())
-	g.Expect(source.X509BundlesCalls()).To(Equal(1))
+	g.Expect(got.Len()).To(Equal(1))
+	g.Expect(got.Has(absent)).To(BeFalse())
+	emptyBundle, ok := got.Get(empty)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(emptyBundle.Empty()).To(BeTrue())
+
+	source.SetX509Bundles(x509bundle.NewSet(), nil)
+	got, err = source.X509Bundles(context.Background(), bundleSourceWorkload)
+	g.Expect(err).To(Not(HaveOccurred()))
+	g.Expect(got).To(Not(BeNil()))
+	g.Expect(got.Len()).To(BeZero())
+
+	source.SetX509Bundles(nil, nil)
+	got, err = source.X509Bundles(context.Background(), bundleSourceWorkload)
+	g.Expect(err).To(Not(HaveOccurred()))
+	g.Expect(got).To(BeNil())
+	g.Expect(source.X509BundlesCalls()).To(Equal(3))
 }
 
 func TestBundleSourceJWTBundles_ReturnedMapMutated_NextCallIsUnaffected(t *testing.T) {
@@ -583,10 +719,10 @@ func TestBundleSourceSetters_CalledWhileLive_ReplaceCannedBehaviour(t *testing.T
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(x509Bundles).To(BeNil())
 
-	source.SetX509Bundles(map[string][][]byte{"example.org": {[]byte("own-authority-der")}}, nil)
+	source.SetX509Bundles(bundleSourceOwnX509Set(), nil)
 	x509Bundles, err = source.X509Bundles(context.Background(), bundleSourceWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
-	g.Expect(x509Bundles).To(Equal(map[string][][]byte{"example.org": {[]byte("own-authority-der")}}))
+	g.Expect(bundleSourceX509DER(x509Bundles)).To(Equal(map[string][][]byte{"example.org": {[]byte("own-authority-der")}}))
 
 	source.SetX509Bundles(nil, x509Err)
 	x509Bundles, err = source.X509Bundles(context.Background(), bundleSourceWorkload)
@@ -615,25 +751,26 @@ func TestBundleSourceSetTrustDomain_CalledWhileLive_ChangesTheNextOwnTrustDomain
 	g := NewWithT(t)
 
 	cannedErr := errors.New("bundle unavailable")
-	source := &BundleSource{TrustDomain: "example.org"}
-	ownTrustDomain := func() (string, error) {
+	rotated := spiffeid.RequireTrustDomainFromString("rotated.org")
+	source := &BundleSource{TrustDomain: bundleSourceOwnDomain}
+	ownTrustDomain := func() (spiffeid.TrustDomain, error) {
 		return source.OwnTrustDomain(context.Background(), bundleSourceWorkload)
 	}
 
-	g.Expect(ownTrustDomain()).To(Equal("example.org"))
+	g.Expect(ownTrustDomain()).To(Equal(bundleSourceOwnDomain))
 
-	source.SetTrustDomain("rotated.org", nil)
-	g.Expect(ownTrustDomain()).To(Equal("rotated.org"))
+	source.SetTrustDomain(rotated, nil)
+	g.Expect(ownTrustDomain()).To(Equal(rotated))
 
 	// A canned error set alongside a domain wins over that domain.
-	source.SetTrustDomain("rotated.org", cannedErr)
+	source.SetTrustDomain(rotated, cannedErr)
 	domain, err := ownTrustDomain()
 	g.Expect(err).To(MatchError(cannedErr))
-	g.Expect(domain).To(BeEmpty())
+	g.Expect(domain).To(BeZero())
 
 	// Clearing the error puts the domain back in charge.
-	source.SetTrustDomain("rotated.org", nil)
-	g.Expect(ownTrustDomain()).To(Equal("rotated.org"))
+	source.SetTrustDomain(rotated, nil)
+	g.Expect(ownTrustDomain()).To(Equal(rotated))
 
 	g.Expect(source.OwnTrustDomainCalls()).To(Equal(4))
 }
@@ -690,7 +827,7 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 		{
 			name: "SetTrustDomain against OwnTrustDomain",
 			set: func(s *BundleSource, i int) {
-				s.SetTrustDomain(fmt.Sprintf("domain-%d.org", i), nil)
+				s.SetTrustDomain(spiffeid.RequireTrustDomainFromString(fmt.Sprintf("domain-%d.org", i)), nil)
 			},
 			read: func(s *BundleSource) error {
 				// Every value the writers set, and the value the fake started
@@ -699,7 +836,7 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 				switch {
 				case err != nil:
 					return err
-				case domain == "example.org", strings.HasPrefix(domain, "domain-"):
+				case domain == bundleSourceOwnDomain, strings.HasPrefix(domain.Name(), "domain-"):
 					return nil
 				default:
 					return fmt.Errorf("OwnTrustDomain returned %q, which no writer set", domain)
@@ -761,7 +898,7 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 			g := NewWithT(t)
 
 			source := &BundleSource{
-				TrustDomain:     "example.org",
+				TrustDomain:     bundleSourceOwnDomain,
 				JWTSourceResult: bundleSourceSet(),
 			}
 
@@ -803,7 +940,7 @@ func TestBundleSourceSetters_CalledConcurrentlyWithTheirReader_CountEveryRead(t 
 
 func TestBundleSourceGatedMethods_GateBlocked_ParkUntilReleasedThenAnswer(t *testing.T) {
 	expected := map[string]any{
-		"OwnTrustDomain": "example.org",
+		"OwnTrustDomain": bundleSourceOwnDomain,
 		"X509Bundles":    map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
 		"JWTBundles":     map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
 	}
@@ -813,8 +950,8 @@ func TestBundleSourceGatedMethods_GateBlocked_ParkUntilReleasedThenAnswer(t *tes
 			g := NewWithT(t)
 
 			source := &BundleSource{
-				TrustDomain:     "example.org",
-				X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+				TrustDomain:     bundleSourceOwnDomain,
+				X509:            bundleSourceOwnX509Set(),
 				JWT:             map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
 				JWTSourceResult: bundleSourceOwnBundle(),
 			}
@@ -849,6 +986,10 @@ func TestBundleSourceGatedMethods_GateBlocked_ParkUntilReleasedThenAnswer(t *tes
 			}
 
 			g.Expect(got.err).To(Not(HaveOccurred()))
+			// A set is compared by what it holds, in order.
+			if set, ok := got.value.(*x509bundle.Set); ok {
+				got.value = bundleSourceX509DER(set)
+			}
 			if want, ok := expected[method.name]; ok {
 				g.Expect(got.value).To(Equal(want))
 			} else {
@@ -868,8 +1009,8 @@ func TestBundleSourceGatedMethods_ParkedCallContextCancelled_ReturnContextError(
 			g := NewWithT(t)
 
 			source := &BundleSource{
-				TrustDomain:     "example.org",
-				X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+				TrustDomain:     bundleSourceOwnDomain,
+				X509:            bundleSourceOwnX509Set(),
 				JWT:             map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
 				JWTSourceResult: bundleSourceOwnBundle(),
 			}
@@ -913,8 +1054,8 @@ func TestBundleSourceGatedMethods_ContextAlreadyDone_ReturnContextErrorWithoutPa
 	g := NewWithT(t)
 
 	source := &BundleSource{
-		TrustDomain:     "example.org",
-		X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		TrustDomain:     bundleSourceOwnDomain,
+		X509:            bundleSourceOwnX509Set(),
 		JWT:             map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
 		JWTSourceResult: bundleSourceOwnBundle(),
 	}
@@ -938,8 +1079,8 @@ func TestBundleSourceCannedValues_DifferentWorkloads_AllGetTheSameAnswer(t *test
 	g := NewWithT(t)
 
 	source := &BundleSource{
-		TrustDomain:     "example.org",
-		X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		TrustDomain:     bundleSourceOwnDomain,
+		X509:            bundleSourceOwnX509Set(),
 		JWT:             map[string][]byte{"example.org": []byte(`{"keys":[{"kid":"own"}]}`)},
 		JWTSourceResult: bundleSourceSet(),
 	}
@@ -952,11 +1093,11 @@ func TestBundleSourceCannedValues_DifferentWorkloads_AllGetTheSameAnswer(t *test
 	for _, w := range workloads {
 		domain, err := source.OwnTrustDomain(context.Background(), w)
 		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
-		g.Expect(domain).To(Equal("example.org"), "workload %v", w)
+		g.Expect(domain).To(Equal(bundleSourceOwnDomain), "workload %v", w)
 
 		x509Bundles, err := source.X509Bundles(context.Background(), w)
 		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
-		g.Expect(x509Bundles).To(Equal(source.X509), "workload %v", w)
+		g.Expect(bundleSourceX509DER(x509Bundles)).To(Equal(bundleSourceX509DER(source.X509)), "workload %v", w)
 
 		jwtBundles, err := source.JWTBundles(context.Background(), w)
 		g.Expect(err).To(Not(HaveOccurred()), "workload %v", w)
@@ -1001,17 +1142,21 @@ func TestBundleSourceFuncs_Set_ReceiveTheCallersCtxAndWorkload(t *testing.T) {
 		{
 			name: "X509Func",
 			install: func(s *BundleSource, record func(bundleSourceFuncCall)) {
-				s.X509Func = func(ctx context.Context, w *workloadidentity.Workload) (map[string][][]byte, error) {
+				s.X509Func = func(ctx context.Context, w *workloadidentity.Workload) (*x509bundle.Set, error) {
 					record(bundleSourceFuncCall{
 						ctxValue:         ctx.Value(bundleSourceCtxKey{}),
 						workload:         w,
 						workloadRequests: s.WorkloadRequests(),
 					})
-					return map[string][][]byte{"example.org": {[]byte(w.PodUID)}}, nil
+					return x509bundle.NewSet(x509bundle.FromX509Authorities(bundleSourceOwnDomain, []*x509.Certificate{bundleSourceCert(w.PodUID)})), nil
 				}
 			},
 			call: func(ctx context.Context, s *BundleSource, w *workloadidentity.Workload) (any, error) {
-				return s.X509Bundles(ctx, w)
+				set, err := s.X509Bundles(ctx, w)
+				if err != nil {
+					return nil, err
+				}
+				return bundleSourceX509DER(set), nil
 			},
 			expected: func(w *workloadidentity.Workload) any {
 				return map[string][][]byte{"example.org": {[]byte(w.PodUID)}}
@@ -1112,7 +1257,7 @@ func TestBundleSourceWorkloadRequests_CallsAcrossMethods_RecordsEveryCountedCall
 	jwtSourceErr := errors.New("jwt source unavailable")
 	leaseErr := errors.New("lease refused")
 	source := &BundleSource{
-		TrustDomain:  "example.org",
+		TrustDomain:  bundleSourceOwnDomain,
 		X509Err:      x509Err,
 		JWT:          map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
 		JWTSourceErr: jwtSourceErr,
@@ -1208,8 +1353,8 @@ func TestBundleSourceWorkloadRequests_ConcurrentCallersAndReaders_RecordEveryCal
 	)
 
 	source := &BundleSource{
-		TrustDomain:     "example.org",
-		X509:            map[string][][]byte{"example.org": {[]byte("own-authority-der")}},
+		TrustDomain:     bundleSourceOwnDomain,
+		X509:            bundleSourceOwnX509Set(),
 		JWT:             map[string][]byte{"example.org": []byte(`{"keys":[]}`)},
 		JWTSourceResult: bundleSourceSet(),
 	}

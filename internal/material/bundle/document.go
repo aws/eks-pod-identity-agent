@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
 	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 )
 
@@ -22,10 +24,11 @@ import (
 // serves them. It is immutable once built, which is what lets a snapshot be read
 // without a lock.
 type domainBundle struct {
-	// x509Authorities holds the x509-svid authorities as DER, sorted and without duplicates,
-	// so the same set always serves the same bytes and two sets compare as
-	// slices. Order means nothing to a verifier.
-	x509Authorities [][]byte
+	// x509Authorities holds the x509-svid authorities sorted by DER and without
+	// duplicates, so the same set always serves the same bytes and go-spiffe's
+	// order-sensitive Equal compares two as sets. Order means nothing to a
+	// verifier. It is never nil, and a reader gets a Clone, never this bundle.
+	x509Authorities *x509bundle.Bundle
 	// jwtAuthorities holds the jwt-svid authorities by key ID.
 	jwtAuthorities *jwtbundle.Bundle
 	// jwks is the standard JWK Set FetchJWTBundles serves; see jwtSet.
@@ -61,11 +64,13 @@ func parseDocument(trustDomain spiffeid.TrustDomain, document string) (*domainBu
 	if err != nil {
 		return nil, err
 	}
-	out := &domainBundle{jwtAuthorities: jwt, jwks: jwks}
-	for _, certificate := range certificates {
-		out.x509Authorities = append(out.x509Authorities, certificate.Raw)
+	// spiffebundle.Parse has already dropped a repeated certificate.
+	slices.SortFunc(certificates, func(a, b *x509.Certificate) int { return bytes.Compare(a.Raw, b.Raw) })
+	out := &domainBundle{
+		x509Authorities: x509bundle.FromX509Authorities(trustDomain, certificates),
+		jwtAuthorities:  jwt,
+		jwks:            jwks,
 	}
-	slices.SortFunc(out.x509Authorities, bytes.Compare)
 	if hint, ok := parsed.RefreshHint(); ok && hint > 0 {
 		out.refreshHint = hint
 	}
@@ -103,7 +108,10 @@ func jwtSet(authorities map[string]crypto.PublicKey) ([]byte, error) {
 // authorities. They are sorted at parse time, so this is a set comparison. A nil
 // domain holds none.
 func (d *domainBundle) sameX509Authorities(other *domainBundle) bool {
-	return slices.EqualFunc(d.x509(), other.x509(), bytes.Equal)
+	if d.noX509() || other.noX509() {
+		return d.noX509() == other.noX509()
+	}
+	return d.x509Authorities.Equal(other.x509Authorities)
 }
 
 // sameJWTAuthorities reports whether two parsed domains hold the same jwt-svid
@@ -115,11 +123,8 @@ func (d *domainBundle) sameJWTAuthorities(other *domainBundle) bool {
 	return d.jwtAuthorities.Equal(other.jwtAuthorities)
 }
 
-func (d *domainBundle) x509() [][]byte {
-	if d == nil {
-		return nil
-	}
-	return d.x509Authorities
+func (d *domainBundle) noX509() bool {
+	return d == nil || d.x509Authorities.Empty()
 }
 
 func (d *domainBundle) noJWT() bool {

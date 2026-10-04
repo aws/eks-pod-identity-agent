@@ -13,6 +13,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
@@ -59,7 +60,7 @@ type providerSource struct {
 // stored.
 type snapshot struct {
 	// ownDomain is the trust domain of the provider's own entry.
-	ownDomain string
+	ownDomain spiffeid.TrustDomain
 	// domains holds every entry the response carried, by trust domain.
 	domains map[string]*domainBundle
 	// jwtSource is the JWT authorities in the form go-spiffe validates against.
@@ -101,31 +102,28 @@ func newProviderSource(providerArn string, opts Opts) *providerSource {
 
 // OwnTrustDomain returns the provider's own trust domain, fetching if nothing is
 // cached yet.
-func (s *providerSource) OwnTrustDomain(ctx context.Context, sign signFunc) (string, error) {
+func (s *providerSource) OwnTrustDomain(ctx context.Context, sign signFunc) (spiffeid.TrustDomain, error) {
 	snap, err := s.load(ctx, sign)
 	if err != nil {
-		return "", err
+		return spiffeid.TrustDomain{}, err
 	}
 	return snap.ownDomain, nil
 }
 
-// X509Bundles returns every trust domain's X.509 authorities as DER. A domain
-// whose document carried no x509-svid key is absent. The result is a copy.
-func (s *providerSource) X509Bundles(ctx context.Context, sign signFunc) (map[string][][]byte, error) {
+// X509Bundles returns every trust domain's X.509 authorities as a set. A domain
+// whose document carried no x509-svid key is absent. The set and its bundles are
+// fresh clones; the certificates are the snapshot's.
+func (s *providerSource) X509Bundles(ctx context.Context, sign signFunc) (*x509bundle.Set, error) {
 	snap, err := s.load(ctx, sign)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string][][]byte, len(snap.domains))
-	for domain, parsed := range snap.domains {
-		if len(parsed.x509Authorities) == 0 {
+	out := x509bundle.NewSet()
+	for _, parsed := range snap.domains {
+		if parsed.x509Authorities.Empty() {
 			continue
 		}
-		authorities := make([][]byte, len(parsed.x509Authorities))
-		for i, der := range parsed.x509Authorities {
-			authorities[i] = slices.Clone(der)
-		}
-		out[domain] = authorities
+		out.Add(parsed.x509Authorities.Clone())
 	}
 	return out, nil
 }
@@ -408,7 +406,7 @@ func parseResponse(entries []sts.TrustBundle) (*snapshot, error) {
 			return nil, fmt.Errorf("trust domain %q: %w", name, err)
 		}
 		if i == 0 {
-			nextSnapshot.ownDomain = name
+			nextSnapshot.ownDomain = trustDomain
 		}
 		nextSnapshot.domains[name] = parsed
 		if !parsed.jwtAuthorities.Empty() {

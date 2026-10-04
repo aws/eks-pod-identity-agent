@@ -118,13 +118,19 @@ func TestParseDocument_ServedMaterial_IsWhatGoSpiffeParses(t *testing.T) {
 	g.Expect(jwt.JWTAuthorities()).To(HaveLen(2))
 	g.Expect(jwt.Equal(parsed.jwtAuthorities)).To(BeTrue(), "a workload trusts exactly the keys the agent trusts")
 	var rawDER []byte
-	for _, der := range parsed.x509Authorities {
+	for _, der := range rawAuthorities(parsed.x509Authorities) {
 		rawDER = append(rawDER, der...)
 	}
 	x509Authorities, err := x509bundle.ParseRaw(trustDomain, rawDER)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(x509Authorities.X509Authorities()).To(HaveLen(2))
-	g.Expect(parsed.x509Authorities).To(Equal(sortedDER(caA.der, caB.der)), "every authority, sorted")
+	g.Expect(x509Authorities.Equal(parsed.x509Authorities)).To(BeTrue(), "a workload trusts exactly the CAs the agent trusts")
+	g.Expect(rawAuthorities(parsed.x509Authorities)).To(Equal(sortedDER(caA.der, caB.der)), "every authority, sorted")
+	pem, err := parsed.x509Authorities.Marshal()
+	g.Expect(err).ToNot(HaveOccurred())
+	envoyAuthorities, err := x509bundle.Parse(trustDomain, pem)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(envoyAuthorities.Equal(parsed.x509Authorities)).To(BeTrue(), "Envoy's PEM holds the same CAs in the same order")
 
 	var set struct {
 		Keys []map[string]any `json:"keys"`
@@ -165,8 +171,11 @@ func TestParseDocument_SameX509SetInAnyOrder_ServesTheSameBytes(t *testing.T) {
 	second, err := parseDocument(trustDomain, bundleDoc(t, 0, x509Key(t, c), x509Key(t, a), x509Key(t, b)))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(first.x509Authorities).To(Equal(sortedDER(a.der, b.der, c.der)))
-	g.Expect(second.x509Authorities).To(Equal(first.x509Authorities))
+	g.Expect(rawAuthorities(first.x509Authorities)).To(Equal(sortedDER(a.der, b.der, c.der)))
+	g.Expect(rawAuthorities(second.x509Authorities)).To(Equal(rawAuthorities(first.x509Authorities)))
+	firstPEM, err := first.x509Authorities.Marshal()
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(second.x509Authorities.Marshal()).To(Equal(firstPEM))
 	g.Expect(second.sameX509Authorities(first)).To(BeTrue())
 	g.Expect(second.sameJWTAuthorities(first)).To(BeTrue())
 }
@@ -213,7 +222,7 @@ func TestParseDocument_RepeatedX509Authority_IsServedOnce(t *testing.T) {
 	parsed, err := parseDocument(spiffeid.RequireTrustDomainFromString(testDomain), bundleDoc(t, 0, x509Key(t, ca), x509Key(t, ca)))
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(parsed.x509Authorities).To(Equal([][]byte{ca.der}))
+	g.Expect(rawAuthorities(parsed.x509Authorities)).To(Equal([][]byte{ca.der}))
 }
 
 func TestParseDocument_OnlyX509Keys_ServesAnEmptyJWTSet(t *testing.T) {
@@ -252,6 +261,21 @@ func TestParseResponse_TrustDomainGivenAsASPIFFEID_IsKeyedByItsName(t *testing.T
 	parsed, err := parseResponse([]sts.TrustBundle{{TrustDomain: "spiffe://" + testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}})
 
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(parsed.ownDomain).To(Equal(testDomain))
+	g.Expect(parsed.ownDomain).To(Equal(testTrustDomain))
 	g.Expect(parsed.domains).To(HaveKey(testDomain))
+}
+
+func TestDomainBundle_NoX509Authority_ComparesAsAnAbsentDomain(t *testing.T) {
+	g := NewWithT(t)
+	jwtOnly, err := parseDocument(testTrustDomain, bundleDoc(t, 0, jwtECKey(t, "k1", newECKey(t))))
+	g.Expect(err).ToNot(HaveOccurred())
+	withCA, err := parseDocument(testTrustDomain, bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca"))))
+	g.Expect(err).ToNot(HaveOccurred())
+	var absent *domainBundle
+
+	g.Expect(absent.sameX509Authorities(jwtOnly)).To(BeTrue(), "a domain arriving with no CA changes no X.509 trust")
+	g.Expect(jwtOnly.sameX509Authorities(absent)).To(BeTrue())
+	g.Expect(absent.sameX509Authorities(absent)).To(BeTrue())
+	g.Expect(absent.sameX509Authorities(withCA)).To(BeFalse())
+	g.Expect(withCA.sameX509Authorities(jwtOnly)).To(BeFalse())
 }

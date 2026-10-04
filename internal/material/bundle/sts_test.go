@@ -58,7 +58,7 @@ func TestRegistry_OverTheSTSClient_FetchesSignedWithTheWorkloadSession(t *testin
 
 	x509Bundles, err := registry.X509Bundles(context.Background(), ownPod)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(x509Bundles).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
+	g.Expect(rawBundles(x509Bundles)).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
 	jwt, err := registry.JWTSource(context.Background(), ownPod)
 	g.Expect(err).ToNot(HaveOccurred())
 	bundle, err := jwt.GetJWTBundleForTrustDomain(spiffeid.RequireTrustDomainFromString(testDomain))
@@ -66,7 +66,7 @@ func TestRegistry_OverTheSTSClient_FetchesSignedWithTheWorkloadSession(t *testin
 	authority, found := bundle.FindJWTAuthority("k1")
 	g.Expect(found).To(BeTrue())
 	g.Expect(jwtKey.PublicKey.Equal(authority)).To(BeTrue())
-	g.Expect(registry.OwnTrustDomain(context.Background(), ownPod)).To(Equal(testDomain))
+	g.Expect(registry.OwnTrustDomain(context.Background(), ownPod)).To(Equal(testTrustDomain))
 
 	mu.Lock()
 	defer mu.Unlock()
