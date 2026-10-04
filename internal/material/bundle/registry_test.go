@@ -271,10 +271,10 @@ func TestRegistry_TwoProviders_AreFetchedAndServedApart(t *testing.T) {
 	ownSource, err := registry.JWTSource(ctx, ownPod)
 	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(ownX509).To(Equal(map[string][][]byte{testDomain: {ownCA.der}}))
-	g.Expect(otherX509).To(Equal(map[string][][]byte{peerDomain: {otherCA.der}}))
-	g.Expect(own).To(Equal(testDomain))
-	g.Expect(other).To(Equal(peerDomain))
+	g.Expect(rawBundles(ownX509)).To(Equal(map[string][][]byte{testDomain: {ownCA.der}}))
+	g.Expect(rawBundles(otherX509)).To(Equal(map[string][][]byte{peerDomain: {otherCA.der}}))
+	g.Expect(own).To(Equal(testTrustDomain))
+	g.Expect(other).To(Equal(peerTrustDomain))
 	_, err = ownSource.GetJWTBundleForTrustDomain(spiffeid.RequireTrustDomainFromString(peerDomain))
 	g.Expect(err).To(HaveOccurred(), "one provider's bundles never answer for another's")
 	g.Expect(fetcher.Signers(testProviderArn)).To(Equal([]string{"AKID-own-pod"}))
@@ -600,7 +600,7 @@ func TestRegistry_WithoutWorkloadSessions_ServesFromTheResolverAndTheSigner(t *t
 	bundles, err := registry.X509Bundles(context.Background(), ownPod)
 
 	g.Expect(err).ToNot(HaveOccurred(), "nothing in the tier needs a workload session")
-	g.Expect(bundles).To(HaveKey(testDomain))
+	g.Expect(rawBundles(bundles)).To(HaveKey(testDomain))
 	g.Expect(fetcher.arns).To(Equal([]string{testProviderArn}))
 	g.Expect(fetcher.creds[0].AccessKeyID).To(Equal("AKID-signer"))
 }

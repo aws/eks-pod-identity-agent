@@ -19,6 +19,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/go-jose/go-jose/v4"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 )
@@ -29,10 +31,18 @@ const (
 	peerDomain      = "peer.example.org"
 )
 
-// authority is an x509-svid CA: its DER and its public key.
+// testTrustDomain and peerTrustDomain are testDomain and peerDomain parsed.
+var (
+	testTrustDomain = spiffeid.RequireTrustDomainFromString(testDomain)
+	peerTrustDomain = spiffeid.RequireTrustDomainFromString(peerDomain)
+)
+
+// authority is an x509-svid CA: its certificate, that certificate's DER, and its
+// key.
 type authority struct {
-	der []byte
-	key *ecdsa.PrivateKey
+	cert *x509.Certificate
+	der  []byte
+	key  *ecdsa.PrivateKey
 }
 
 // newAuthority mints a self-signed CA certificate to stand in for an x509-svid
@@ -56,7 +66,11 @@ func newAuthority(t *testing.T, name string) authority {
 	if err != nil {
 		t.Fatalf("creating a CA certificate: %v", err)
 	}
-	return authority{der: der, key: key}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parsing a CA certificate: %v", err)
+	}
+	return authority{cert: cert, der: der, key: key}
 }
 
 // newECKey generates a P-256 key to stand in for a jwt-svid authority.
@@ -86,6 +100,29 @@ func sortedDER(authorities ...[]byte) [][]byte {
 	return out
 }
 
+// rawAuthorities reads a bundle's X.509 authorities as DER, in the order the
+// bundle holds them.
+func rawAuthorities(bundle *x509bundle.Bundle) [][]byte {
+	var out [][]byte
+	for _, certificate := range bundle.X509Authorities() {
+		out = append(out, certificate.Raw)
+	}
+	return out
+}
+
+// rawBundles reads a set down to each trust domain's rawAuthorities, by name, and
+// a nil set to a nil map.
+func rawBundles(set *x509bundle.Set) map[string][][]byte {
+	if set == nil {
+		return nil
+	}
+	out := make(map[string][][]byte, set.Len())
+	for _, bundle := range set.Bundles() {
+		out[bundle.TrustDomain().Name()] = rawAuthorities(bundle)
+	}
+	return out
+}
+
 // The SPIFFE bundle key uses the test documents route on.
 const (
 	useX509SVID = "x509-svid"
@@ -110,11 +147,7 @@ func jwkMembers(key jose.JSONWebKey) map[string]any {
 // public key parameters, as SPIFFE bundles do.
 func x509Key(t *testing.T, a authority) map[string]any {
 	t.Helper()
-	cert, err := x509.ParseCertificate(a.der)
-	if err != nil {
-		t.Fatalf("parsing a CA certificate: %v", err)
-	}
-	return jwkMembers(jose.JSONWebKey{Key: &a.key.PublicKey, Certificates: []*x509.Certificate{cert}, Use: useX509SVID})
+	return jwkMembers(jose.JSONWebKey{Key: &a.key.PublicKey, Certificates: []*x509.Certificate{a.cert}, Use: useX509SVID})
 }
 
 // jwtECKey is a jwt-svid JWK for an EC key.

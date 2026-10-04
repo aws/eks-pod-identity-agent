@@ -3,6 +3,7 @@ package bundle
 import (
 	"context"
 	"crypto"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/aws/smithy-go"
 	. "github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
@@ -66,16 +68,16 @@ func TestSource_Fetch_ReturnsAuthoritiesKeyedByTrustDomain(t *testing.T) {
 
 	// every entry passes through under its own domain, and neither domain's
 	// authorities are visible under the other
-	g.Expect(x509Bundles).To(Equal(map[string][][]byte{testDomain: {own.der}, peerDomain: {peer.der}}))
+	g.Expect(rawBundles(x509Bundles)).To(Equal(map[string][][]byte{testDomain: {own.der}, peerDomain: {peer.der}}))
 	g.Expect(jwtBundles).To(HaveLen(2))
 	g.Expect(served(t, jwtBundles[testDomain])).To(ConsistOf(HaveKeyWithValue("kid", "own-1")))
 	g.Expect(served(t, jwtBundles[peerDomain])).To(ConsistOf(HaveKeyWithValue("kid", "peer-1")))
-	g.Expect(ownDomain(t, source)).To(Equal(testDomain), "the first entry is the provider's own domain")
+	g.Expect(ownDomain(t, source)).To(Equal(testTrustDomain), "the first entry is the provider's own domain")
 	g.Expect(jwtAuthority(t, source, peerDomain, "own-1")).To(BeNil(), "neither domain's keys answer for the other")
 }
 
 // ownDomain reads the source's own trust domain, failing the test on an error.
-func ownDomain(t *testing.T, source *providerSource) string {
+func ownDomain(t *testing.T, source *providerSource) spiffeid.TrustDomain {
 	t.Helper()
 	domain, err := source.OwnTrustDomain(context.Background(), signTest)
 	if err != nil {
@@ -119,7 +121,7 @@ func TestSource_OneFetch_BacksAllFourMethods(t *testing.T) {
 	own, ownErr := source.OwnTrustDomain(ctx, signTest)
 
 	g.Expect([]error{x509Err, jwtErr, sourceErr, ownErr}).To(HaveEach(BeNil()))
-	g.Expect(own).To(Equal(testDomain))
+	g.Expect(own).To(Equal(testTrustDomain))
 	g.Expect(fetcher.Calls()).To(Equal(1))
 	g.Expect(fetcher.creds).To(Equal([]aws.Credentials{testCreds}), "the fetch is signed with the reader's credentials")
 }
@@ -136,7 +138,7 @@ func TestSource_DocumentWithBothKinds_RoutesEachKeyByUse(t *testing.T) {
 
 	x509Bundles, err := source.X509Bundles(ctx, signTest)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(x509Bundles[testDomain]).To(Equal([][]byte{ca.der}), "the x509-svid key's x5c, decoded to DER")
+	g.Expect(rawBundles(x509Bundles)[testDomain]).To(Equal([][]byte{ca.der}), "the x509-svid key's x5c certificate")
 
 	jwtBundles, err := source.JWTBundles(ctx, signTest)
 	g.Expect(err).ToNot(HaveOccurred())
@@ -191,11 +193,13 @@ func TestSource_Refresh_ReorderedOrReformattedAuthorities_DoNotSignal(t *testing
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
 	servedBefore, _ := source.JWTBundles(ctx, signTest)
 	x509Before, _ := source.X509Bundles(ctx, signTest)
-	g.Expect(x509Before[testDomain]).To(Equal(sortedDER(caA.der, caB.der)), "every authority is served, not only the newest")
+	g.Expect(rawBundles(x509Before)[testDomain]).To(Equal(sortedDER(caA.der, caB.der)), "every authority is served, not only the newest, sorted by DER")
+	x509Again, _ := source.X509Bundles(ctx, signTest)
+	g.Expect(rawBundles(x509Again)).To(Equal(rawBundles(x509Before)), "every read serves the same order")
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
 	x509After, _ := source.X509Bundles(ctx, signTest)
-	g.Expect(x509After[testDomain]).To(Equal(x509Before[testDomain]), "an unchanged set keeps serving the bytes it already served")
+	g.Expect(rawBundles(x509After)).To(Equal(rawBundles(x509Before)), "an unchanged set keeps serving the order it already served")
 
 	g.Expect(fetcher.Calls()).To(Equal(3))
 	g.Expect(notified(notifier)).To(Equal(notifications{}))
@@ -255,7 +259,7 @@ func TestSource_Refresh_ChangedDomainSet_Signals(t *testing.T) {
 	// workload's own, which only the X.509 streams split on
 	g.Expect(refreshOnce(source, ctx)).To(Succeed())
 	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}))
-	g.Expect(ownDomain(t, source)).To(Equal(peerDomain))
+	g.Expect(ownDomain(t, source)).To(Equal(peerTrustDomain))
 }
 
 func TestSource_FailedRefresh_KeepsServingTheLastGoodBundle(t *testing.T) {
@@ -286,9 +290,9 @@ func TestSource_FailedRefresh_KeepsServingTheLastGoodBundle(t *testing.T) {
 				To(Equal(failuresBefore + 1))
 			x509Bundles, err := source.X509Bundles(ctx, signTest)
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(x509Bundles).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
+			g.Expect(rawBundles(x509Bundles)).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
 			g.Expect(key.PublicKey.Equal(jwtAuthority(t, source, testDomain, "k1"))).To(BeTrue())
-			g.Expect(ownDomain(t, source)).To(Equal(testDomain))
+			g.Expect(ownDomain(t, source)).To(Equal(testTrustDomain))
 			g.Expect(notified(notifier)).To(Equal(notifications{}))
 			g.Expect(fetcher.Calls()).To(Equal(2), "the served value came from the cache, not a new fetch")
 		})
@@ -331,7 +335,7 @@ func TestSource_FirstReadFailure_IsAnErrorNotAnEmptyBundle(t *testing.T) {
 			clock = clock.Add(retryMaxDelay)
 			bundles, err = source.X509Bundles(context.Background(), signTest)
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(bundles).To(HaveKey(testDomain))
+			g.Expect(rawBundles(bundles)).To(HaveKey(testDomain))
 			g.Expect(fetcher.Calls()).To(Equal(2))
 		})
 	}
@@ -541,21 +545,42 @@ func TestSource_ReaderWaitingOnAFetch_GivesUpWithItsContext(t *testing.T) {
 
 func TestSource_ReturnedValues_AreCopies(t *testing.T) {
 	g := NewWithT(t)
-	ca := newAuthority(t, "ca")
+	ca, other := newAuthority(t, "ca"), newAuthority(t, "other")
 	source, _ := newTestSource(t, &fakeFetcher{respond: fixed(sts.TrustBundle{
 		TrustDomain: testDomain,
 		Bundle:      bundleDoc(t, 0, x509Key(t, ca), jwtECKey(t, "k1", newECKey(t))),
 	})})
 	ctx := context.Background()
+	expected := map[string][][]byte{testDomain: {ca.der}}
+	own := func(set *x509bundle.Set) *x509bundle.Bundle {
+		bundle, found := set.Get(testTrustDomain)
+		g.Expect(found).To(BeTrue())
+		return bundle
+	}
 
-	x509Bundles, _ := source.X509Bundles(ctx, signTest)
-	x509Bundles[testDomain][0][0] ^= 0xff
-	x509Bundles[peerDomain] = nil
+	// every change a caller can make to the set or a bundle in it
+	for name, mutate := range map[string]func(*x509bundle.Set){
+		"bundle added": func(set *x509bundle.Set) {
+			set.Add(x509bundle.FromX509Authorities(peerTrustDomain, []*x509.Certificate{other.cert}))
+		},
+		"bundle replaced":      func(set *x509bundle.Set) { set.Add(x509bundle.New(testTrustDomain)) },
+		"bundle removed":       func(set *x509bundle.Set) { set.Remove(testTrustDomain) },
+		"authority added":      func(set *x509bundle.Set) { own(set).AddX509Authority(other.cert) },
+		"authority removed":    func(set *x509bundle.Set) { own(set).RemoveX509Authority(ca.cert) },
+		"authorities replaced": func(set *x509bundle.Set) { own(set).SetX509Authorities([]*x509.Certificate{other.cert}) },
+	} {
+		x509Bundles, err := source.X509Bundles(ctx, signTest)
+		g.Expect(err).ToNot(HaveOccurred())
+		mutate(x509Bundles)
+		g.Expect(rawBundles(x509Bundles)).ToNot(Equal(expected), "%s changed what the caller got", name)
+
+		again, err := source.X509Bundles(ctx, signTest)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(rawBundles(again)).To(Equal(expected), "%s did not reach the tier", name)
+	}
+
 	jwtBundles, _ := source.JWTBundles(ctx, signTest)
 	jwtBundles[testDomain][0] = 'X'
-
-	again, _ := source.X509Bundles(ctx, signTest)
-	g.Expect(again).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
 	jwtAgain, _ := source.JWTBundles(ctx, signTest)
 	g.Expect(served(t, jwtAgain[testDomain])).To(HaveLen(1))
 }
@@ -714,8 +739,8 @@ func TestSource_X509Bundles_OmitsADomainWithNoX509Authority(t *testing.T) {
 	jwtBundles, err := source.JWTBundles(context.Background(), signTest)
 	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(x509Bundles).To(HaveKey(testDomain))
-	g.Expect(x509Bundles).ToNot(HaveKey(peerDomain))
+	g.Expect(rawBundles(x509Bundles)).To(HaveKey(testDomain))
+	g.Expect(rawBundles(x509Bundles)).ToNot(HaveKey(peerDomain))
 	g.Expect(jwtBundles).To(HaveKey(peerDomain))
 	g.Expect(jwtBundles).ToNot(HaveKey(testDomain))
 }
@@ -861,6 +886,6 @@ func TestSource_Refresh_ItsOwnCancellation_IsNotServedToALiveReader(t *testing.T
 	bundles, err := source.X509Bundles(context.Background(), signTest)
 
 	g.Expect(err).ToNot(HaveOccurred(), "a live reader fetches for itself rather than being handed the cancellation")
-	g.Expect(bundles).To(HaveKey(testDomain))
+	g.Expect(rawBundles(bundles)).To(HaveKey(testDomain))
 	g.Expect(fetcher.Calls()).To(Equal(2))
 }

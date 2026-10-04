@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -22,20 +24,21 @@ type BundleSource struct {
 	Gate
 
 	// TrustDomain is returned by OwnTrustDomain when OwnTrustDomainErr is nil.
-	TrustDomain string
+	TrustDomain spiffeid.TrustDomain
 	// OwnTrustDomainErr, when non-nil, is returned by OwnTrustDomain together
-	// with the empty domain.
+	// with the zero domain.
 	OwnTrustDomainErr error
 
 	// X509 is returned by X509Bundles when X509Func and X509Err are nil, as a
-	// copy the caller cannot use to mutate the fake.
-	X509 map[string][][]byte
+	// copy taken at call time that the caller cannot use to mutate the fake.
+	// The certificates are shared, as the real one shares them.
+	X509 *x509bundle.Set
 	// X509Err, when non-nil and X509Func is nil, is returned by X509Bundles
-	// together with a nil map.
+	// together with a nil set.
 	X509Err error
 	// X509Func, when non-nil, wins over X509 and X509Err: X509Bundles hands it
 	// the call's ctx and workload and returns whatever it returns, uncopied.
-	X509Func func(ctx context.Context, w *workloadidentity.Workload) (map[string][][]byte, error)
+	X509Func func(ctx context.Context, w *workloadidentity.Workload) (*x509bundle.Set, error)
 
 	// JWT is returned by JWTBundles when JWTFunc and JWTErr are nil, as a copy
 	// the caller cannot use to mutate the fake.
@@ -90,13 +93,13 @@ type bundleLease struct {
 	stop func() bool
 }
 
-// OwnTrustDomain passes the Gate, then returns OwnTrustDomainErr with the empty
+// OwnTrustDomain passes the Gate, then returns OwnTrustDomainErr with the zero
 // domain, or TrustDomain. A call its ctx turns away is not counted or recorded;
 // a released one is counted when next scheduled, maybe after Release returns, so
 // wait for it to return before reading OwnTrustDomainCalls or WorkloadRequests.
-func (s *BundleSource) OwnTrustDomain(ctx context.Context, w *workloadidentity.Workload) (string, error) {
+func (s *BundleSource) OwnTrustDomain(ctx context.Context, w *workloadidentity.Workload) (spiffeid.TrustDomain, error) {
 	if err := s.enter(ctx); err != nil {
-		return "", err
+		return spiffeid.TrustDomain{}, err
 	}
 
 	s.mu.Lock()
@@ -104,23 +107,23 @@ func (s *BundleSource) OwnTrustDomain(ctx context.Context, w *workloadidentity.W
 	s.ownTrustDomainCalls++
 	s.workloadRequests = append(s.workloadRequests, w)
 	if s.OwnTrustDomainErr != nil {
-		return "", s.OwnTrustDomainErr
+		return spiffeid.TrustDomain{}, s.OwnTrustDomainErr
 	}
 	return s.TrustDomain, nil
 }
 
 // X509Bundles passes the Gate, then returns X509Func's result, X509Err or a
-// deep copy of X509. A call its ctx turns away is not counted or recorded; a
-// released one is counted when next scheduled, maybe after Release returns, so
-// wait for it to return before reading X509BundlesCalls or WorkloadRequests.
-func (s *BundleSource) X509Bundles(ctx context.Context, w *workloadidentity.Workload) (map[string][][]byte, error) {
+// copy of X509. A call its ctx turns away is not counted or recorded; a released
+// one is counted when next scheduled, maybe after Release returns, so wait for
+// it to return before reading X509BundlesCalls or WorkloadRequests.
+func (s *BundleSource) X509Bundles(ctx context.Context, w *workloadidentity.Workload) (*x509bundle.Set, error) {
 	if err := s.enter(ctx); err != nil {
 		return nil, err
 	}
 
 	var (
-		fn      func(context.Context, *workloadidentity.Workload) (map[string][][]byte, error)
-		bundles map[string][][]byte
+		fn      func(context.Context, *workloadidentity.Workload) (*x509bundle.Set, error)
+		bundles *x509bundle.Set
 		err     error
 	)
 	func() {
@@ -130,7 +133,7 @@ func (s *BundleSource) X509Bundles(ctx context.Context, w *workloadidentity.Work
 		s.workloadRequests = append(s.workloadRequests, w)
 		fn, bundles, err = s.X509Func, s.X509, s.X509Err
 		if fn == nil && err == nil {
-			bundles = copyX509Bundles(bundles)
+			bundles = copyX509Set(bundles)
 		}
 	}()
 
@@ -369,17 +372,17 @@ func (s *BundleSource) WorkloadRequests() []*workloadidentity.Workload {
 
 // SetTrustDomain replaces the domain and error OwnTrustDomain returns while the
 // fake is live.
-func (s *BundleSource) SetTrustDomain(domain string, err error) {
+func (s *BundleSource) SetTrustDomain(domain spiffeid.TrustDomain, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.TrustDomain = domain
 	s.OwnTrustDomainErr = err
 }
 
-// SetX509Bundles replaces the canned X.509 authorities and error while the fake
-// is live. The map is not copied on the way in, so the caller must not keep
-// mutating it.
-func (s *BundleSource) SetX509Bundles(bundles map[string][][]byte, err error) {
+// SetX509Bundles replaces the canned X.509 bundle set and error while the fake
+// is live. The set is not copied on the way in, so a change made to it afterwards
+// reaches later calls but not a copy X509Bundles has already returned.
+func (s *BundleSource) SetX509Bundles(bundles *x509bundle.Set, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.X509 = bundles
@@ -414,26 +417,18 @@ func (s *BundleSource) SetLease(err error) {
 	s.LeaseErr = err
 }
 
-// copyX509Bundles copies a trust domain keyed set of DER authorities down to the
-// bytes. A nil map copies to a nil map, so an unset canned value stays
-// distinguishable from an empty one.
-func copyX509Bundles(in map[string][][]byte) map[string][][]byte {
+// copyX509Set copies a set down to each bundle's authority slice; the
+// certificates themselves are shared. A nil set copies to a nil set, so an unset
+// canned value stays distinguishable from an empty one.
+func copyX509Set(in *x509bundle.Set) *x509bundle.Set {
 	if in == nil {
 		return nil
 	}
-	out := make(map[string][][]byte, len(in))
-	for domain, authorities := range in {
-		if authorities == nil {
-			out[domain] = nil
-			continue
-		}
-		copied := make([][]byte, len(authorities))
-		for i, der := range authorities {
-			copied[i] = slices.Clone(der)
-		}
-		out[domain] = copied
+	bundles := in.Bundles()
+	for i, bundle := range bundles {
+		bundles[i] = bundle.Clone()
 	}
-	return out
+	return x509bundle.NewSet(bundles...)
 }
 
 // copyJWTBundles copies a trust domain keyed set of JWK Set documents down to the

@@ -17,6 +17,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -202,17 +204,17 @@ func (r *Registry) Lease(ctx context.Context, w *workloadidentity.Workload) (fun
 }
 
 // OwnTrustDomain returns the workload's provider's own trust domain.
-func (r *Registry) OwnTrustDomain(ctx context.Context, w *workloadidentity.Workload) (string, error) {
+func (r *Registry) OwnTrustDomain(ctx context.Context, w *workloadidentity.Workload) (spiffeid.TrustDomain, error) {
 	source, sign, err := r.read(ctx, w)
 	if err != nil {
-		return "", err
+		return spiffeid.TrustDomain{}, err
 	}
 	return source.OwnTrustDomain(ctx, sign)
 }
 
-// X509Bundles returns the workload's provider's X.509 authorities as DER, keyed by
-// trust domain.
-func (r *Registry) X509Bundles(ctx context.Context, w *workloadidentity.Workload) (map[string][][]byte, error) {
+// X509Bundles returns the workload's provider's X.509 authorities, one bundle per
+// trust domain that has any.
+func (r *Registry) X509Bundles(ctx context.Context, w *workloadidentity.Workload) (*x509bundle.Set, error) {
 	source, sign, err := r.read(ctx, w)
 	if err != nil {
 		return nil, err

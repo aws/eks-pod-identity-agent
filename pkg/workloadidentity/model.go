@@ -22,6 +22,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
@@ -129,27 +132,16 @@ type CertSource interface {
 // TokenSource yields JWT-SVIDs for a workload. Audiences is plural because
 // FetchJWTSVID takes a repeated audience field.
 //
-// The STS call underneath also takes a list but permits only one entry, so an
-// implementation fans out: one call per requested audience, and one cache entry
-// each. A caller asking for three audiences costs three issuances.
+// The implementation fans out to one STS call and one cache entry per audience
+// because the Workload API returns independently renewable JWT-SVIDs. A token
+// carrying several audiences would couple their cache and renewal lifecycles.
+//
+// It yields go-spiffe's jwtsvid.SVID, which keeps the token unexported: only
+// jwtsvid.ParseInsecure or ParseAndValidate build one whose Marshal returns it,
+// and both check exp, iat and nbf against the wall clock. Hint is never set.
 type TokenSource interface {
 	// JWTSVIDs returns one JWT-SVID per requested audience.
-	JWTSVIDs(ctx context.Context, w *Workload, audiences []string) ([]*JWTSVID, error)
-}
-
-// JWTSVID tracks the Workload API JWTSVID message.
-type JWTSVID struct {
-	// SpiffeID is the SPIFFE ID asserted by the token's subject.
-	SpiffeID string
-	// Token is the serialized JWT-SVID.
-	Token string
-	// Hint is on the wire and nothing populates it, for the same reason as on
-	// X509SVID: WISE issues one SVID per workload, so there is never a set to
-	// disambiguate.
-	Hint string
-	// ExpiresAt is agent-internal, parsed from the token's exp claim and used
-	// to schedule renewal.
-	ExpiresAt time.Time
+	JWTSVIDs(ctx context.Context, w *Workload, audiences []string) ([]*jwtsvid.SVID, error)
 }
 
 // BundleSource yields trust material per workload identity provider, not per
@@ -170,12 +162,13 @@ type BundleSource interface {
 	// OwnTrustDomain is the provider's own domain, which is the workload's. The
 	// Workload API presents its authorities inline on each X509SVID and every
 	// other entry under federated_bundles, so the handler has to know which.
-	OwnTrustDomain(ctx context.Context, w *Workload) (string, error)
+	OwnTrustDomain(ctx context.Context, w *Workload) (spiffeid.TrustDomain, error)
 
-	// X509Bundles mirrors FetchX509Bundles: authorities as DER, keyed by trust
-	// domain, decoded from each JWK's x5c member. Envoy wants these
-	// PEM-encoded, which the SDS handler does at the edge.
-	X509Bundles(ctx context.Context, w *Workload) (map[string][][]byte, error)
+	// X509Bundles mirrors FetchX509Bundles: one bundle per trust domain that has
+	// x509-svid authorities, kept in a fixed order so an unchanged set marshals to
+	// the same bytes. The set and its bundles are the caller's copy; the
+	// certificates are shared and must not be modified. Envoy's PEM is Marshal.
+	X509Bundles(ctx context.Context, w *Workload) (*x509bundle.Set, error)
 
 	// JWTBundles mirrors FetchJWTBundles: per trust domain, a JWK Set of the
 	// jwt-svid keys only, which the RPC returns as is. x509-svid entries are
