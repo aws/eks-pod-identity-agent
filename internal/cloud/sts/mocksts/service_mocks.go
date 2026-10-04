@@ -67,3 +67,18 @@ func (mr *MockIfaceMockRecorder) GetTrustBundles(ctx, creds, providerArn any) *g
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTrustBundles", reflect.TypeOf((*MockIface)(nil).GetTrustBundles), ctx, creds, providerArn)
 }
+
+// GetWorkloadIdentityCertificate mocks base method.
+func (m *MockIface) GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetWorkloadIdentityCertificate", ctx, creds, req)
+	ret0, _ := ret[0].(*sts.IssuedCertificate)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetWorkloadIdentityCertificate indicates an expected call of GetWorkloadIdentityCertificate.
+func (mr *MockIfaceMockRecorder) GetWorkloadIdentityCertificate(ctx, creds, req any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkloadIdentityCertificate", reflect.TypeOf((*MockIface)(nil).GetWorkloadIdentityCertificate), ctx, creds, req)
+}

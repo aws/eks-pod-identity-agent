@@ -3,11 +3,15 @@ package fake
 import (
 	"context"
 	"crypto/ed25519"
+	cryptox509 "crypto/x509"
 	"errors"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -31,32 +35,35 @@ var certSourceTestWorkload = &workloadidentity.Workload{
 // certSourceX509SVIDResult is what a X509SVIDs call running in another goroutine
 // hands back to the test.
 type certSourceX509SVIDResult struct {
-	svids []*workloadidentity.X509SVID
+	svids []*x509svid.SVID
 	err   error
 }
 
 // certSourceSVID builds a fully populated X.509-SVID, so every field is
 // available to assert on.
-func certSourceSVID(id string) *workloadidentity.X509SVID {
-	return &workloadidentity.X509SVID{
-		SpiffeID:     id,
-		Certificates: [][]byte{[]byte(id + "/leaf-der"), []byte(id + "/intermediate-der")},
-		PrivateKey:   certSourceTestKey,
-		Hint:         id + "/hint",
-		NotBefore:    time.Date(2026, 3, 27, 7, 45, 23, 0, time.UTC),
-		NotAfter:     time.Date(2026, 3, 28, 7, 45, 23, 0, time.UTC),
+//
+// The certificates are placeholders rather than signed ones. This fake only passes
+// values through, so nothing here parses them, and the validity window the real tier
+// reads off a leaf is tested where that happens instead.
+func certSourceSVID(id string) *x509svid.SVID {
+	return &x509svid.SVID{
+		ID: spiffeid.RequireFromString(id),
+		Certificates: []*cryptox509.Certificate{
+			{Raw: []byte(id + "/leaf-der")},
+			{Raw: []byte(id + "/intermediate-der")},
+		},
+		PrivateKey: certSourceTestKey,
+		Hint:       id + "/hint",
 	}
 }
 
 // certSourceExpectSVID asserts every field of a returned X.509-SVID.
-func certSourceExpectSVID(g *WithT, got, want *workloadidentity.X509SVID) {
+func certSourceExpectSVID(g *WithT, got, want *x509svid.SVID) {
 	g.Expect(got).To(Not(BeNil()))
-	g.Expect(got.SpiffeID).To(Equal(want.SpiffeID))
+	g.Expect(got.ID).To(Equal(want.ID))
 	g.Expect(got.Certificates).To(Equal(want.Certificates))
 	g.Expect(got.PrivateKey).To(Equal(want.PrivateKey))
 	g.Expect(got.Hint).To(Equal(want.Hint))
-	g.Expect(got.NotBefore).To(Equal(want.NotBefore))
-	g.Expect(got.NotAfter).To(Equal(want.NotAfter))
 }
 
 func TestCertSourceX509SVIDs_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) {
@@ -67,7 +74,7 @@ func TestCertSourceX509SVIDs_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) 
 	testCases := []struct {
 		name        string
 		source      *CertSource
-		expected    []*workloadidentity.X509SVID
+		expected    []*x509svid.SVID
 		expectedErr error
 	}{
 		{
@@ -77,24 +84,24 @@ func TestCertSourceX509SVIDs_CannedBehaviour_ReturnsThatBehaviour(t *testing.T) 
 		},
 		{
 			name:     "canned result is returned",
-			source:   &CertSource{Result: []*workloadidentity.X509SVID{first, second}},
-			expected: []*workloadidentity.X509SVID{first, second},
+			source:   &CertSource{Result: []*x509svid.SVID{first, second}},
+			expected: []*x509svid.SVID{first, second},
 		},
 		{
 			name:        "canned error wins over canned result",
-			source:      &CertSource{Result: []*workloadidentity.X509SVID{first}, Err: cannedErr},
+			source:      &CertSource{Result: []*x509svid.SVID{first}, Err: cannedErr},
 			expectedErr: cannedErr,
 		},
 		{
 			name: "func wins over canned result and canned error",
 			source: &CertSource{
-				Result: []*workloadidentity.X509SVID{first},
+				Result: []*x509svid.SVID{first},
 				Err:    cannedErr,
-				Func: func(_ context.Context, _ *workloadidentity.Workload) ([]*workloadidentity.X509SVID, error) {
-					return []*workloadidentity.X509SVID{second}, nil
+				Func: func(_ context.Context, _ *workloadidentity.Workload) ([]*x509svid.SVID, error) {
+					return []*x509svid.SVID{second}, nil
 				},
 			},
-			expected: []*workloadidentity.X509SVID{second},
+			expected: []*x509svid.SVID{second},
 		},
 	}
 
@@ -132,7 +139,7 @@ func TestCertSourceX509SVIDs_CalledRepeatedly_CountsCallsAndRecordsWorkloads(t *
 		ServiceAccount: "other-service-account",
 		NodeName:       "my-node",
 	}
-	source := &CertSource{Result: []*workloadidentity.X509SVID{certSourceSVID("spiffe://example.org/first")}}
+	source := &CertSource{Result: []*x509svid.SVID{certSourceSVID("spiffe://example.org/first")}}
 
 	g.Expect(source.Calls()).To(Equal(0))
 	g.Expect(source.Workloads()).To(BeEmpty())
@@ -155,7 +162,7 @@ func TestCertSourceX509SVIDs_ReturnedSliceMutated_NextCallIsUnaffected(t *testin
 	g := NewWithT(t)
 
 	canned := certSourceSVID("spiffe://example.org/first")
-	source := &CertSource{Result: []*workloadidentity.X509SVID{canned}}
+	source := &CertSource{Result: []*x509svid.SVID{canned}}
 
 	got, err := source.X509SVIDs(context.Background(), certSourceTestWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
@@ -178,14 +185,14 @@ func TestCertSourceSetResult_CalledWhileLive_ReplacesCannedBehaviour(t *testing.
 	first := certSourceSVID("spiffe://example.org/first")
 	second := certSourceSVID("spiffe://example.org/second")
 	cannedErr := errors.New("cert source unavailable")
-	source := &CertSource{Result: []*workloadidentity.X509SVID{first}}
+	source := &CertSource{Result: []*x509svid.SVID{first}}
 
 	got, err := source.X509SVIDs(context.Background(), certSourceTestWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(HaveLen(1))
 	certSourceExpectSVID(g, got[0], first)
 
-	source.SetResult([]*workloadidentity.X509SVID{second}, nil)
+	source.SetResult([]*x509svid.SVID{second}, nil)
 	got, err = source.X509SVIDs(context.Background(), certSourceTestWorkload)
 	g.Expect(err).To(Not(HaveOccurred()))
 	g.Expect(got).To(HaveLen(1))
@@ -203,7 +210,7 @@ func TestCertSourceX509SVIDs_GateBlocked_ReturnsCannedResultAfterRelease(t *test
 	g := NewWithT(t)
 
 	canned := certSourceSVID("spiffe://example.org/first")
-	source := &CertSource{Result: []*workloadidentity.X509SVID{canned}}
+	source := &CertSource{Result: []*x509svid.SVID{canned}}
 	source.Block()
 
 	ctx, cancel := context.WithTimeout(context.Background(), certSourceTestTimeout)
@@ -241,7 +248,7 @@ func TestCertSourceX509SVIDs_GateBlocked_ReturnsCannedResultAfterRelease(t *test
 func TestCertSourceX509SVIDs_ParkedCallContextCancelled_ReturnsContextError(t *testing.T) {
 	g := NewWithT(t)
 
-	source := &CertSource{Result: []*workloadidentity.X509SVID{certSourceSVID("spiffe://example.org/first")}}
+	source := &CertSource{Result: []*x509svid.SVID{certSourceSVID("spiffe://example.org/first")}}
 	source.Block()
 
 	waitCtx, cancelWait := context.WithTimeout(context.Background(), certSourceTestTimeout)
@@ -275,7 +282,7 @@ func TestCertSourceX509SVIDs_ParkedCallContextCancelled_ReturnsContextError(t *t
 func TestCertSourceX509SVIDs_ContextAlreadyDone_ReturnsContextErrorWithoutParking(t *testing.T) {
 	g := NewWithT(t)
 
-	source := &CertSource{Result: []*workloadidentity.X509SVID{certSourceSVID("spiffe://example.org/first")}}
+	source := &CertSource{Result: []*x509svid.SVID{certSourceSVID("spiffe://example.org/first")}}
 	source.Block()
 
 	ctx, cancel := context.WithCancel(context.Background())

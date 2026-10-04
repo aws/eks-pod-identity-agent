@@ -34,6 +34,8 @@ const (
 	KindSessionRefused
 	// KindBundleRefused is the kind of ErrBundleRefused.
 	KindBundleRefused
+	// KindIssuanceRefused is the kind of ErrIssuanceRefused.
+	KindIssuanceRefused
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -195,6 +197,12 @@ var (
 	// distinct from ErrBundleUnavailable so a workload role missing
 	// sts:GetTrustBundles does not read as an STS outage.
 	ErrBundleRefused = newWorkloadIdentityError(KindBundleRefused, "bundle_refused", false)
+
+	// ErrIssuanceRefused is produced by the certificate source (T7) and the token
+	// source (T8) when STS refuses issuance for a reason a repeat cannot change, such
+	// as a Provider with no outbound signer. Not retryable, which is what separates it
+	// from ErrIssuanceFailed.
+	ErrIssuanceRefused = newWorkloadIdentityError(KindIssuanceRefused, "issuance_refused", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -254,5 +262,6 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrInvalidAudience,
 		ErrSessionRefused,
 		ErrBundleRefused,
+		ErrIssuanceRefused,
 	}
 }

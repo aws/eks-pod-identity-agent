@@ -44,6 +44,12 @@ type Iface interface {
 	// identity provider, one entry per trust domain, in response order, signing
 	// the request with creds.
 	GetTrustBundles(ctx context.Context, creds aws.Credentials, providerArn string) ([]TrustBundle, error)
+
+	// GetWorkloadIdentityCertificate mints an X.509-SVID for the workload identity
+	// that creds already carries. Unlike GetTrustBundles, which names its provider in
+	// the request, this call names no identity: STS takes it from whoever signed, so
+	// creds have to be the workload's own.
+	GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req CertificateRequest) (*IssuedCertificate, error)
 }
 
 const (
