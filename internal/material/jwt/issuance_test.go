@@ -15,6 +15,32 @@ import (
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
+func TestIssuanceCleansUpAfterRecoveredStorePanic(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	issuer := successfulIssuer(t, &now, time.Hour)
+	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source.draw = func() float64 {
+		panic("renewal point failed")
+	}
+	recovered := make(chan any, 1)
+	go func() {
+		defer func() { recovered <- recover() }()
+		_, _ = source.issueAndStore(context.Background(), workload(testPodUID), []string{"payments.example"}, false)
+	}()
+
+	select {
+	case value := <-recovered:
+		require.Equal(t, "renewal point failed", value)
+	case <-time.After(time.Second):
+		t.Fatal("issuance cleanup blocked while unwinding a store panic")
+	}
+
+	require.Equal(t, 1, issuer.calls())
+	require.Empty(t, source.pending)
+	require.Empty(t, source.states)
+	require.Empty(t, source.cache.Items())
+}
+
 func TestMultipleAudiencesUseOneTokenAndRenewTogether(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second).Add(-6 * time.Minute)
 	issuer := successfulIssuer(t, &now, 10*time.Minute)

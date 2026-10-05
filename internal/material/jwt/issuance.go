@@ -39,11 +39,11 @@ func (s *Source) issueAndStore(
 	svid, issuedAt, err := s.issue(ctx, w, audiences)
 	if err == nil {
 		s.stateMu.Lock()
+		defer s.stateMu.Unlock()
 		err = s.checkPodLocked(w.PodUID)
 		if err == nil {
-			s.store(w, audiences, svid, issuedAt)
+			s.storeLocked(w, audiences, svid, issuedAt)
 		}
-		s.stateMu.Unlock()
 	}
 	s.metrics.observeIssuance(err, time.Since(startedAt).Seconds(), renewal)
 

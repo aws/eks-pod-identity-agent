@@ -30,7 +30,7 @@ type podIssueState struct {
 	invalidated bool
 }
 
-func (s *Source) store(w *workloadidentity.Workload, audiences []string, svid *jwtsvid.SVID, issuedAt time.Time) {
+func (s *Source) storeLocked(w *workloadidentity.Workload, audiences []string, svid *jwtsvid.SVID, issuedAt time.Time) {
 	now := s.now()
 	renewAt := renewalPoint(issuedAt, svid.Expiry, s.renewalFraction, s.renewalJitter, s.draw)
 	workloadCopy := *w
@@ -53,8 +53,8 @@ func (s *Source) Invalidate(podUID string) {
 		return
 	}
 	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	s.invalidateLocked(podUID)
-	s.stateMu.Unlock()
 }
 
 func (s *Source) invalidateLocked(podUID string) {
@@ -106,8 +106,8 @@ func (s *Source) reserveAudienceSet(key cacheKey) error {
 
 func (s *Source) releaseAudienceSet(key cacheKey) {
 	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
 	delete(s.pending, key)
-	s.quotaMu.Unlock()
 }
 
 func (s *Source) beginUse(podUID string) error {

@@ -13,7 +13,7 @@
 //  2. cache.go: checkPod and beginUse check local pod presence and track active
 //     work against deletion. Invalidate evicts every audience set for a pod and
 //     invalidates its in-flight work. reserveAudienceSet bounds per-pod cache
-//     growth. store saves an owned audience snapshot and the token's deadlines.
+//     growth. storeLocked saves an owned audience snapshot and the token's deadlines.
 //  3. issuance.go: issueAndStore reserves an audience set, calls issue, and rechecks
 //     pod presence before storing. issue obtains the workload session, checks
 //     presence again, and calls STS with those credentials. classify translates
@@ -37,7 +37,7 @@
 //	  fresh cached token -> return
 //	  cache miss or renewal due -> issueAndStore
 //	    issue -> Session -> GetWebIdentityToken -> parseIssuedToken
-//	    store -> renewalPoint / renewalDelay
+//	    storeLocked -> renewalPoint / renewalDelay
 //	    observeIssuance -> return
 //
 // Background renewal enters through onRefresh. Pod deletion enters through

@@ -140,7 +140,7 @@ func TestFailedRenewalFallsBackToCurrentCacheEntry(t *testing.T) {
 			upstream := errors.New("STS unavailable")
 			issuer.respond = func(int, sts.WebIdentityTokenRequest) (*sts.IssuedWebIdentityToken, error) {
 				if tc.replace {
-					source.store(w, audiences, expected, now)
+					source.storeLocked(w, audiences, expected, now)
 				}
 				if tc.evict {
 					source.cache.Delete(key)

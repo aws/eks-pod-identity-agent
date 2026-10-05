@@ -14,6 +14,24 @@ import (
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
+func TestInvalidateUnlocksAfterRecoveredEvictionPanic(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 10)
+	_, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"payments.example"})
+	require.NoError(t, err)
+	source.cache.OnEvicted(func(cacheKey, *entry) {
+		panic("eviction failed")
+	})
+
+	require.PanicsWithValue(t, "eviction failed", func() {
+		source.Invalidate(testPodUID)
+	})
+
+	require.True(t, source.stateMu.TryLock(), "invalidation must not leave the state mutex locked")
+	defer source.stateMu.Unlock()
+	require.Empty(t, source.cache.Items())
+}
+
 func TestPodDeletionEvictsEveryAudienceSetAndBlocksInflightStore(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	watcher := &fakePodStore{}
@@ -273,7 +291,7 @@ func TestAudienceSetLimitDoesNotDoubleCountAStoredReservation(t *testing.T) {
 	key := makeCacheKey(testPodUID, audiences)
 	require.NoError(t, source.reserveAudienceSet(key))
 	defer source.releaseAudienceSet(key)
-	source.store(workload(testPodUID), audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
+	source.storeLocked(workload(testPodUID), audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
 
 	other := makeCacheKey(testPodUID, []string{"payments.example"})
 	require.NoError(t, source.reserveAudienceSet(other))
@@ -285,7 +303,7 @@ func TestAudienceSetReservationSurvivesCacheExpiryDuringRenewal(t *testing.T) {
 	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 1)
 	audiences := []string{"ledger.example", "payments.example"}
 	key := makeCacheKey(testPodUID, audiences)
-	source.store(workload(testPodUID), audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
+	source.storeLocked(workload(testPodUID), audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
 	require.NoError(t, source.reserveAudienceSet(key))
 
 	_, updated := source.cache.TouchWithExpire(key, time.Nanosecond)
@@ -307,14 +325,14 @@ func TestExpiredAudienceSetCannotBypassTheCap(t *testing.T) {
 	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 1)
 	w := workload(testPodUID)
 	expired := makeCacheKey(testPodUID, []string{"ledger.example"})
-	source.store(w, []string{"ledger.example"}, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
+	source.storeLocked(w, []string{"ledger.example"}, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
 	_, updated := source.cache.TouchWithExpire(expired, time.Nanosecond)
 	require.True(t, updated)
 	require.Eventually(t, func() bool {
 		_, stale, ok := source.cache.GetStale(expired)
 		return ok && stale
 	}, time.Second, time.Millisecond)
-	source.store(w, []string{"payments.example"}, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
+	source.storeLocked(w, []string{"payments.example"}, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
 
 	require.ErrorIs(t, source.reserveAudienceSet(expired), wierrors.ErrInvalidAudience)
 	require.Empty(t, source.pending)
@@ -326,7 +344,7 @@ func TestCacheStoresWorkloadAndAudienceSnapshots(t *testing.T) {
 	w := workload(testPodUID)
 	audiences := []string{"ledger.example", "payments.example"}
 	key := makeCacheKey(testPodUID, audiences)
-	source.store(w, audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
+	source.storeLocked(w, audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
 
 	w.ServiceAccount = "changed"
 	audiences[0] = "changed"
