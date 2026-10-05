@@ -1,279 +1,282 @@
 // Package workloadapi serves the SPIFFE Workload API on the workload identity
-// socket. It is the launch interface for applications that use a SPIFFE library:
-// the library finds the socket through the SPIFFE_ENDPOINT_SOCKET environment
-// variable the Pod Identity webhook injects, opens a stream, and expects the
-// agent to keep it current.
+// socket, to applications whose SPIFFE library finds it through the
+// SPIFFE_ENDPOINT_SOCKET variable the Pod Identity webhook injects. It composes the
+// tiers and fetches nothing: it attests the caller, reads the tiers, translates onto
+// the wire types, and re-reads on every notification to keep each stream current.
 //
-// This package composes the tiers and does not fetch: it attests the caller,
-// reads what it was given, translates onto the wire types, and keeps each stream
-// current by re-reading on every notification. It has to work with libraries
-// nobody at AWS wrote, so the specified behaviour wins over anything more
-// convenient.
-//
-// Skeleton. Every method has its final signature, and the three streaming RPCs
-// carry their real subscription lifecycle and send loop, which is where the
-// notification tier's contract shows up. Assembling the responses, the error
-// mapping and the two unary RPCs are PLACEHOLDER(T10).
+// The bundle-only RPCs and ValidateJWTSVID serve any attested caller whose session
+// names a provider, whether or not it holds an SVID, and refuse one that is not
+// enrolled, which matches SPIRE's default of denying unregistered callers.
 package workloadapi
 
 import (
 	"context"
+	"encoding/json"
+	"slices"
+	"time"
 
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
+	"k8s.io/apimachinery/pkg/util/wait"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // Opts are the tiers the handler composes. Every field is required, and each is
-// an interface so the handler's tests drive it with pkg/workloadidentity/fake
-// rather than a cluster. No socket path and no AWS config: this package serves
-// what it is given and builds no client.
+// an interface so the tests drive the handler with pkg/workloadidentity/fake. No
+// socket path, no AWS config and no session: nothing here signs a request.
 type Opts struct {
-	// Attestor resolves the process behind a connection. The handler attests on
-	// every RPC, since a Workload API request carries no identity.
+	// Attestor resolves the process behind a connection. Every RPC attests,
+	// since a Workload API request carries no identity.
 	Attestor workloadidentity.Attestor
-	// Certs yields the workload's X.509-SVIDs, minting or renewing as needed.
+	// Certs yields the workload's X.509-SVIDs.
 	Certs workloadidentity.CertSource
 	// Tokens yields JWT-SVIDs for the audiences a caller asks for.
 	Tokens workloadidentity.TokenSource
-	// Bundles yields trust material, which is per provider rather than per pod.
+	// Bundles yields trust material for the workload's provider, and leases it
+	// for as long as a stream is open.
 	Bundles workloadidentity.BundleSource
-	// Subs is how a stream learns its material changed. Each streaming RPC
-	// subscribes with the attested caller and releases on end. One Subscriber
-	// serves all three streams, so they share one RPC metric label; a field per
-	// RPC would be a wiring change only.
-	Subs workloadidentity.Subscriber
+	// X509SVIDSubscriber, X509BundlesSubscriber and JWTBundlesSubscriber are each
+	// stream's own Subscriber, built with Hub.ForRPC and that RPC's constant, so
+	// the subscription metrics spell the RPC as the RPC metrics do.
+	X509SVIDSubscriber    workloadidentity.Subscriber
+	X509BundlesSubscriber workloadidentity.Subscriber
+	JWTBundlesSubscriber  workloadidentity.Subscriber
 }
 
 // Handler implements the SPIFFE Workload API.
 //
 // UnimplementedSpiffeWorkloadAPIServer is embedded by value because the generated
-// code requires it: the interface has an unexported method only that struct
-// provides, and registration panics on a nil pointer embed. It also answers the
-// two WIT methods the agent does not serve, which is why they are not declared
-// below.
+// code requires it, and it answers the two WIT methods the agent does not serve.
 type Handler struct {
 	workload.UnimplementedSpiffeWorkloadAPIServer
 
 	opts Opts
+	// backoff paces a stream's retries of its own steps, attesting, subscribing,
+	// leasing and reading the tiers, after a retryable failure. A failed send to
+	// the workload is not retried: the stream ends and the client reconnects. Each
+	// stream starts from a copy, so one stream's failures never slow another.
+	backoff wait.Backoff
+}
+
+// retryBackoff paces those retries from one second doubling to thirty, go-spiffe's
+// own client backoff, so a blocked stream polls the tiers no harder than the
+// library would poll the agent.
+var retryBackoff = wait.Backoff{
+	Duration: time.Second,
+	Factor:   2,
+	Jitter:   0.1,
+	Steps:    1 << 30,
+	Cap:      30 * time.Second,
 }
 
 // New returns a Handler over the given tiers.
 func New(opts Opts) *Handler {
-	return &Handler{opts: opts}
+	return &Handler{opts: opts, backoff: retryBackoff}
 }
 
 // Register attaches the handler to a gRPC server. It is what the wiring site
-// passes as grpcserver.Opts.Register, in place of the stub this replaces.
+// passes as grpcserver.Opts.Register.
 func (h *Handler) Register(registrar grpc.ServiceRegistrar) {
 	workload.RegisterSpiffeWorkloadAPIServer(registrar, h)
 }
 
-// FetchX509SVID streams the caller's X.509-SVIDs with its provider's trust
-// bundle, and sends a fresh response whenever either changes. Embedding the
-// bundle is not redundant: the workload gets its identity and the means to verify
-// peers in one message, so it never correlates two streams.
-//
-// One subscription carries both reasons to wake. The stream is deliberately not
-// deduplicated, matching SPIRE and left open in T10: a rotation re-sends the
-// response even though the certificate did not change.
+// FetchX509SVID streams the caller's X.509-SVIDs, each with its trust domain's
+// bundle and the federated bundles beside them, so a workload gets its identity
+// and the means to verify peers in one message. It is woken by its pod's
+// credential changes and its provider's X.509 changes, and dedupes on everything
+// but the private key.
 func (h *Handler) FetchX509SVID(_ *workload.X509SVIDRequest, stream grpc.ServerStreamingServer[workload.X509SVIDResponse]) error {
-	ctx := stream.Context()
-
-	caller, err := h.caller(ctx)
-	if err != nil {
-		return err
-	}
-
-	signals, release, err := h.opts.Subs.SubscribeToWorkloadMaterial(ctx, caller)
-	if err != nil {
-		return statusError(err)
-	}
-	defer release()
-
-	// PLACEHOLDER(T10): take BundleSource.Lease(ctx, caller) and defer its
-	// release beside this one, so T6 does not evict a provider whose only reader
-	// is waiting on a signal.
-
-	return serveStream(ctx, signals, func() error {
-		response, err := h.buildX509SVIDResponse(ctx, caller)
-		if err != nil {
-			return err
-		}
-		return stream.Send(response)
+	return serve(h, stream.Context(), streamSpec[*workload.X509SVIDResponse]{
+		rpc:       workloadidentity.RPCFetchX509SVID,
+		subscribe: h.opts.X509SVIDSubscriber.SubscribeToWorkloadMaterial,
+		build:     h.buildX509SVIDResponse,
+		view:      x509SVIDView,
+		send:      stream.Send,
 	})
 }
 
-// FetchX509Bundles streams trust material only, for a caller that verifies peers
-// without an identity of its own. Its request carries no fields, so the attested
-// caller names the provider. It subscribes through SubscribeToCertBundles, so an
-// SVID renewal never wakes it, and deduplicates as SPIRE's bundle streams do.
+// FetchX509Bundles streams the X.509 authorities only, for a caller that verifies
+// peers without an identity of its own. Its request carries no fields, so the
+// attested caller names the provider, and an SVID renewal never wakes it.
 func (h *Handler) FetchX509Bundles(_ *workload.X509BundlesRequest, stream grpc.ServerStreamingServer[workload.X509BundlesResponse]) error {
-	ctx := stream.Context()
-
-	caller, err := h.caller(ctx)
-	if err != nil {
-		return err
-	}
-
-	signals, release, err := h.opts.Subs.SubscribeToCertBundles(ctx, caller)
-	if err != nil {
-		return statusError(err)
-	}
-	defer release()
-
-	// PLACEHOLDER(T10): take the bundle lease, as in FetchX509SVID.
-
-	var last *workload.X509BundlesResponse
-	return serveStream(ctx, signals, func() error {
-		response, err := h.buildX509BundlesResponse(ctx, caller)
-		if err != nil {
-			return err
-		}
-		if proto.Equal(response, last) {
-			return nil
-		}
-		if err := stream.Send(response); err != nil {
-			return err
-		}
-		last = response
-		return nil
+	return serve(h, stream.Context(), streamSpec[*workload.X509BundlesResponse]{
+		rpc:       workloadidentity.RPCFetchX509Bundles,
+		subscribe: h.opts.X509BundlesSubscriber.SubscribeToCertBundles,
+		build:     h.buildX509BundlesResponse,
+		send:      stream.Send,
 	})
 }
 
-// FetchJWTSVID returns JWT-SVIDs covering all requested audiences. It is unary, takes no
-// bundle lease, and subscribes to nothing.
-//
-// PLACEHOLDER(T10): attest, then read TokenSource for the requested audiences.
-func (h *Handler) FetchJWTSVID(_ context.Context, _ *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "FetchJWTSVID is not implemented yet")
-}
-
-// FetchJWTBundles streams the JWT authorities as JWK Set documents keyed by trust
-// domain. Like FetchX509Bundles its request carries no fields.
-//
-// The only stream a JWT key roll reaches, which is why a roll does not wake every
-// SVID stream on the node. Deduplicates as FetchX509Bundles does.
+// FetchJWTBundles streams the JWT authorities as JWK Sets keyed by trust domain.
+// It is the only stream a JWT key roll reaches.
 func (h *Handler) FetchJWTBundles(_ *workload.JWTBundlesRequest, stream grpc.ServerStreamingServer[workload.JWTBundlesResponse]) error {
-	ctx := stream.Context()
-
-	caller, err := h.caller(ctx)
-	if err != nil {
-		return err
-	}
-
-	signals, release, err := h.opts.Subs.SubscribeToJWTBundles(ctx, caller)
-	if err != nil {
-		return statusError(err)
-	}
-	defer release()
-
-	// PLACEHOLDER(T10): take the bundle lease, as in FetchX509SVID.
-
-	var last *workload.JWTBundlesResponse
-	return serveStream(ctx, signals, func() error {
-		response, err := h.buildJWTBundlesResponse(ctx, caller)
-		if err != nil {
-			return err
-		}
-		if proto.Equal(response, last) {
-			return nil
-		}
-		if err := stream.Send(response); err != nil {
-			return err
-		}
-		last = response
-		return nil
+	return serve(h, stream.Context(), streamSpec[*workload.JWTBundlesResponse]{
+		rpc:       workloadidentity.RPCFetchJWTBundles,
+		subscribe: h.opts.JWTBundlesSubscriber.SubscribeToJWTBundles,
+		build:     h.buildJWTBundlesResponse,
+		send:      stream.Send,
 	})
 }
 
-// ValidateJWTSVID verifies someone else's token and returns its SPIFFE ID and
-// claims, so it needs the bundle and not an SVID of the caller's own.
-// PLACEHOLDER(T10): get BundleSource.JWTSource(ctx, caller) before
-// jwtsvid.ParseAndValidate, so a bundle outage is Unavailable, not a bad token.
-func (h *Handler) ValidateJWTSVID(_ context.Context, _ *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ValidateJWTSVID is not implemented yet")
-}
-
-// serveStream is the wait-then-send loop every streaming RPC runs. One function
-// rather than three copies, since only sendCurrent differs.
-//
-// No special case for the initial response: the channel arrives primed, so the
-// first pass is the initial send and every pass after it is a change. Each pass
-// sends the state it reads now, never what the signal carried, which is what
-// stops a slow stream from being handed a superseded credential.
-//
-// sendCurrent decides whether to send at all, which is where deduplication
-// belongs: only the handler knows what it last put on this stream.
-//
-// A client disconnect and a server shutdown both arrive as a done context.
-// Returning its status code keeps a disconnect reported as Canceled, not Unknown.
-func serveStream(ctx context.Context, signals <-chan struct{}, sendCurrent func() error) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return status.FromContextError(ctx.Err()).Err()
-		case <-signals:
-		}
-
-		if err := sendCurrent(); err != nil {
-			return err
-		}
+// FetchJWTSVID returns the caller's JWT-SVIDs, each carrying every requested
+// audience, keeping only those for the requested SPIFFE ID when the caller names
+// one. It takes no lease and subscribes to nothing.
+func (h *Handler) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
+	start := time.Now()
+	resp, err := h.fetchJWTSVID(ctx, req)
+	if err != nil {
+		return nil, failUnary(ctx, workloadidentity.RPCFetchJWTSVID, start, err)
 	}
+	handlers.ObserveRPC(workloadidentity.RPCFetchJWTSVID, nil, time.Since(start))
+	return resp, nil
 }
 
-// caller attests the process on the other end of the stream. The connection
-// comes from the server's transport credentials, the only route to it. Every
-// tier the handler reads takes the attested workload; none of them needs more.
-func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, error) {
+func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
+	audiences := req.GetAudience()
+	if len(audiences) == 0 || slices.Contains(audiences, "") {
+		return nil, wierrors.ErrInvalidAudience.Wrapf(nil, "at least one audience must be specified, and none may be empty")
+	}
+	var want spiffeid.ID
+	if raw := req.GetSpiffeId(); raw != "" {
+		id, err := spiffeid.FromString(raw)
+		if err != nil {
+			return nil, wierrors.ErrInvalidRequest.Wrapf(nil, "the requested SPIFFE ID is invalid: %v", err)
+		}
+		want = id
+	}
+
+	caller, err := h.attest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svids, err := h.opts.Tokens.JWTSVIDs(ctx, caller, audiences)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &workload.JWTSVIDResponse{}
+	for _, svid := range svids {
+		if svid == nil || (!want.IsZero() && svid.ID != want) {
+			continue
+		}
+		resp.Svids = append(resp.Svids, &workload.JWTSVID{SpiffeId: svid.ID.String(), Svid: svid.Marshal(), Hint: svid.Hint})
+	}
+	if len(resp.Svids) == 0 {
+		return nil, wierrors.ErrNoIdentity.Wrapf(nil, "no identity issued")
+	}
+	return resp, nil
+}
+
+// ValidateJWTSVID verifies a token the caller presents against its provider's JWT
+// authorities and returns the token's SPIFFE ID and claims. It needs the bundle and
+// not an SVID of the caller's own, and it sees only its own provider's trust
+// domains, so a token from another provider fails even on a shared node.
+func (h *Handler) ValidateJWTSVID(ctx context.Context, req *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
+	start := time.Now()
+	resp, err := h.validateJWTSVID(ctx, req)
+	if err != nil {
+		return nil, failUnary(ctx, workloadidentity.RPCValidateJWTSVID, start, err)
+	}
+	handlers.ObserveRPC(workloadidentity.RPCValidateJWTSVID, nil, time.Since(start))
+	return resp, nil
+}
+
+func (h *Handler) validateJWTSVID(ctx context.Context, req *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
+	if req.GetAudience() == "" {
+		return nil, wierrors.ErrInvalidAudience.Wrapf(nil, "an audience must be specified")
+	}
+	if req.GetSvid() == "" {
+		return nil, wierrors.ErrInvalidRequest.Wrapf(nil, "a JWT-SVID must be specified")
+	}
+
+	caller, err := h.attest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Taken first and mapped like any tier error: ParseAndValidate turns a
+	// source error into its own invalid token error, which would report an STS
+	// outage as a bad token. The source is point-in-time and fetches nothing.
+	source, err := h.opts.Bundles.JWTSource(ctx, caller)
+	if err != nil {
+		return nil, err
+	}
+
+	svid, err := jwtsvid.ParseAndValidate(req.GetSvid(), source, []string{req.GetAudience()})
+	if err != nil {
+		// In the message, since a caller sees no cause: go-spiffe's errors describe
+		// the token's header and claims, never the token itself.
+		return nil, wierrors.ErrInvalidToken.Wrapf(nil, "%v", err)
+	}
+	claims, err := claimsStruct(svid.Claims)
+	if err != nil {
+		return nil, err
+	}
+	return &workload.ValidateJWTSVIDResponse{SpiffeId: svid.ID.String(), Claims: claims}, nil
+}
+
+// claimsStruct converts the token's claims through JSON, as SPIRE does, so any
+// value go-jose decoded, such as a json.Number, converts rather than failing.
+func claimsStruct(claims map[string]any) (*structpb.Struct, error) {
+	raw, err := json.Marshal(claims)
+	if err != nil {
+		return nil, err
+	}
+	out := &structpb.Struct{}
+	if err := protojson.Unmarshal(raw, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// attest resolves the caller from the connection the server's transport
+// credentials put in ctx, the only route to it. A missing connection is a wiring
+// bug, and refusing is still the only safe answer.
+func (h *Handler) attest(ctx context.Context) (*workloadidentity.Workload, error) {
 	conn, ok := grpcserver.ConnFromContext(ctx)
 	if !ok {
-		// The server was built without the conn-carrying credentials, so nobody
-		// on this socket can be attested. A wiring bug, but refusing is still the
-		// only safe answer.
-		return nil, status.Error(codes.PermissionDenied, "the caller's connection is not available, so it cannot be attested")
+		return nil, wierrors.ErrUnattestable.Wrapf(nil, "the caller's connection is not available, so it cannot be attested")
 	}
-
 	caller, err := h.opts.Attestor.Attest(ctx, conn)
 	if err != nil {
-		return nil, statusError(err)
+		return nil, err
+	}
+	if caller == nil {
+		return nil, wierrors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
 	}
 	return caller, nil
 }
 
-// statusError maps a tier error onto a gRPC status.
-//
-// PLACEHOLDER(T10): the real mapping is total over the pkg/errors taxonomy.
-// Everything is Internal for now, which is wrong for most of it.
-func statusError(err error) error {
-	return status.Error(codes.Internal, err.Error())
+// failUnary ends a unary call that failed: it records the failure, logs it and
+// maps the error onto a status. A call whose client left is not recorded: the
+// agent gave it no answer, and the tier error would only say the wait was cut short.
+func failUnary(ctx context.Context, rpc string, start time.Time, err error) error {
+	if ctx.Err() != nil {
+		return handlers.StatusErrorFromContext(ctx)
+	}
+	handlers.ObserveRPC(rpc, err, time.Since(start))
+	logFailure(ctx, rpc, err)
+	return handlers.StatusError(err)
 }
 
-// buildX509SVIDResponse assembles the current X.509-SVID response for the caller.
-//
-// PLACEHOLDER(T10): read CertSource and BundleSource, translate onto the wire
-// types.
-func (h *Handler) buildX509SVIDResponse(_ context.Context, _ *workloadidentity.Workload) (*workload.X509SVIDResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "building an X509SVIDResponse is not implemented yet")
-}
-
-// buildX509BundlesResponse assembles the current X.509 trust bundle response.
-//
-// PLACEHOLDER(T10): read BundleSource.X509Bundles with the caller.
-func (h *Handler) buildX509BundlesResponse(_ context.Context, _ *workloadidentity.Workload) (*workload.X509BundlesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "building an X509BundlesResponse is not implemented yet")
-}
-
-// buildJWTBundlesResponse assembles the current JWT trust bundle response.
-//
-// PLACEHOLDER(T10): read BundleSource.JWTBundles with the caller.
-func (h *Handler) buildJWTBundlesResponse(_ context.Context, _ *workloadidentity.Workload) (*workload.JWTBundlesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "building a JWTBundlesResponse is not implemented yet")
+// logFailure logs an error the handler answers with. One it maps to Internal is
+// unexpected and logged as an error; the rest are refusals a caller can act on.
+func logFailure(ctx context.Context, rpc string, err error) {
+	log := logger.FromContext(ctx).WithField("rpc", rpc)
+	if handlers.StatusCode(err) == codes.Internal {
+		log.Errorf("Unexpected error serving the Workload API: %v", err)
+		return
+	}
+	log.Infof("Refusing the Workload API call: %v", err)
 }
 
 var _ workload.SpiffeWorkloadAPIServer = (*Handler)(nil)

@@ -126,6 +126,27 @@ func taxonomyCases() []taxonomyCase {
 			expectedLabel:     "issuance_refused",
 			expectedRetryable: false,
 		},
+		{
+			name:              "invalid token",
+			err:               ErrInvalidToken,
+			expectedKind:      KindInvalidToken,
+			expectedLabel:     "invalid_token",
+			expectedRetryable: false,
+		},
+		{
+			name:              "invalid request",
+			err:               ErrInvalidRequest,
+			expectedKind:      KindInvalidRequest,
+			expectedLabel:     "invalid_request",
+			expectedRetryable: false,
+		},
+		{
+			name:              "no identity",
+			err:               ErrNoIdentity,
+			expectedKind:      KindNoIdentity,
+			expectedLabel:     "no_identity",
+			expectedRetryable: false,
+		},
 	}
 }
 
@@ -332,14 +353,14 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 	g := NewWithT(t)
 	taxonomy := WorkloadIdentityTaxonomy()
 
-	g.Expect(taxonomy).To(HaveLen(12))
+	g.Expect(taxonomy).To(HaveLen(15))
 
 	seenKinds := make(map[Kind]bool, len(taxonomy))
 	seenLabels := make(map[string]bool, len(taxonomy))
 	for i, member := range taxonomy {
 		g.Expect(member).ToNot(BeNil())
 
-		// kinds are contiguous 1..12 in slice order, so there is no gap and no
+		// kinds are contiguous 1..15 in slice order, so there is no gap and no
 		// duplicate
 		g.Expect(member.Kind()).To(Equal(Kind(i + 1)))
 		g.Expect(seenKinds).ToNot(HaveKey(member.Kind()))
@@ -354,8 +375,8 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		g.Expect(MetricLabel(member)).ToNot(Equal(MetricLabelUnknown))
 	}
 
-	g.Expect(seenKinds).To(HaveLen(12))
-	g.Expect(seenLabels).To(HaveLen(12))
+	g.Expect(seenKinds).To(HaveLen(15))
+	g.Expect(seenLabels).To(HaveLen(15))
 
 	// every sentinel declared in the package is reachable from the taxonomy
 	g.Expect(taxonomy).To(ConsistOf(
@@ -371,6 +392,9 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		ErrSessionRefused,
 		ErrBundleRefused,
 		ErrIssuanceRefused,
+		ErrInvalidToken,
+		ErrInvalidRequest,
+		ErrNoIdentity,
 	))
 }
 
@@ -601,4 +625,19 @@ func TestError_BareSentinel_RendersNonEmptyText(t *testing.T) {
 			g.Expect(tc.err.Error()).ToNot(BeEmpty())
 		})
 	}
+}
+
+// TestMessage_LeavesTheCauseOut pins what a handler shows a caller: the annotation,
+// or the sentinel's own text, and never the cause, which Error still carries.
+func TestMessage_LeavesTheCauseOut(t *testing.T) {
+	g := NewWithT(t)
+
+	cause := errors.New("AccessDenied for another pod's role")
+	annotated := ErrBundleRefused.Wrapf(cause, "GetTrustBundles for %s was refused", "arn")
+
+	g.Expect(annotated.Message()).To(Equal("GetTrustBundles for arn was refused"))
+	g.Expect(annotated.Error()).To(Equal("GetTrustBundles for arn was refused: AccessDenied for another pod's role"))
+	g.Expect(ErrBundleRefused.Wrapf(cause, "").Message()).To(Equal("bundle refused"))
+	g.Expect(ErrNotEnrolled.Message()).To(Equal(ErrNotEnrolled.Error()))
+	g.Expect((&WorkloadIdentityError{}).Message()).To(Equal("workload identity error"))
 }

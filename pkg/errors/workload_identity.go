@@ -36,6 +36,12 @@ const (
 	KindBundleRefused
 	// KindIssuanceRefused is the kind of ErrIssuanceRefused.
 	KindIssuanceRefused
+	// KindInvalidToken is the kind of ErrInvalidToken.
+	KindInvalidToken
+	// KindInvalidRequest is the kind of ErrInvalidRequest.
+	KindInvalidRequest
+	// KindNoIdentity is the kind of ErrNoIdentity.
+	KindNoIdentity
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -64,17 +70,23 @@ type WorkloadIdentityError struct {
 // sentinel carries no message of its own and renders human-readable text derived
 // from its metric label, so the result is never empty.
 func (e *WorkloadIdentityError) Error() string {
-	msg := e.message
-	if msg == "" {
-		msg = strings.ReplaceAll(e.label, "_", " ")
-	}
-	if msg == "" {
-		msg = "workload identity error"
-	}
 	if e.cause != nil {
-		return fmt.Sprintf("%s: %v", msg, e.cause)
+		return fmt.Sprintf("%s: %v", e.Message(), e.cause)
 	}
-	return msg
+	return e.Message()
+}
+
+// Message returns e's text without its cause, which is what a handler can show a
+// caller: a cause can carry a remote service's reply to another workload's
+// request, such as an STS refusal naming that workload's role.
+func (e *WorkloadIdentityError) Message() string {
+	if e.message != "" {
+		return e.message
+	}
+	if e.label != "" {
+		return strings.ReplaceAll(e.label, "_", " ")
+	}
+	return "workload identity error"
 }
 
 // Unwrap returns the cause e was annotated with, or nil for a bare sentinel.
@@ -203,6 +215,21 @@ var (
 	// as a Provider with no outbound signer. Not retryable, which is what separates it
 	// from ErrIssuanceFailed.
 	ErrIssuanceRefused = newWorkloadIdentityError(KindIssuanceRefused, "issuance_refused", false)
+
+	// ErrInvalidToken is produced by the Workload API handler (T10) for a JWT-SVID
+	// a caller presents to ValidateJWTSVID that fails validation against its
+	// provider's authorities. Not retryable: the same token fails the same way.
+	ErrInvalidToken = newWorkloadIdentityError(KindInvalidToken, "invalid_token", false)
+
+	// ErrInvalidRequest is produced by the Workload API handler (T10) for a
+	// request missing a required field or carrying a malformed one, such as an
+	// unparsable SPIFFE ID. Not retryable: the same request is malformed again.
+	ErrInvalidRequest = newWorkloadIdentityError(KindInvalidRequest, "invalid_request", false)
+
+	// ErrNoIdentity is produced by the Workload API handler (T10) when an attested
+	// caller holds no SVID matching its request, which is SPIRE's "no identity
+	// issued". Not retryable: a repeat of the same request matches nothing again.
+	ErrNoIdentity = newWorkloadIdentityError(KindNoIdentity, "no_identity", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -263,5 +290,8 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrSessionRefused,
 		ErrBundleRefused,
 		ErrIssuanceRefused,
+		ErrInvalidToken,
+		ErrInvalidRequest,
+		ErrNoIdentity,
 	}
 }

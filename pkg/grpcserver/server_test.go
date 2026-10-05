@@ -27,10 +27,8 @@ import (
 )
 
 // TestNew_ServesTheStubServicesOverTheSocket is the definition of done in one test:
-// the server binds the socket, serves what the wiring site registers, and a client
-// reaches it over the socket. It registers what cmd registers, so the production
-// wiring is what is covered rather than only the hand-written stub the other tests
-// here use.
+// the server binds the socket, serves the stub services, and a client reaches them
+// over the socket. cmd/workload_identity_test.go covers what cmd registers.
 //
 // Every method answers Unimplemented for now, which is the point: the request
 // travels the whole path, through the credentials and the interceptor chain, and
