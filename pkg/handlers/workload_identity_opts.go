@@ -51,9 +51,8 @@ type WorkloadIdentityServerOpts struct {
 	// renewal schedule is derived from the issued NotBefore and NotAfter rather
 	// than from this value.
 	X509SVIDDuration time.Duration
-	// JWTSVIDDuration is the lifetime requested on every JWT-SVID issuance, with
-	// the same ceiling-not-grant semantics as X509SVIDDuration. The renewal
-	// schedule comes from the issued token's exp claim.
+	// JWTSVIDDuration is the lifetime requested on each JWT-SVID issuance.
+	// Renewal uses the issued token's iat and exp, not the requested duration.
 	JWTSVIDDuration time.Duration
 	// SVIDRenewalFraction is the fraction of an SVID's issued lifetime at which
 	// renewal starts. It is a fraction rather than a fixed offset because a
@@ -111,15 +110,7 @@ func (e durationEnvelope) validate(d time.Duration) error {
 // The two SVID lifetime envelopes, confirmed against the STS API model rather
 // than inferred from the defaults.
 //
-// For X.509 the model and the architecture spec disagree at the top, and the
-// envelope is the intersection, so a value that passes here is one both sources
-// accept: the model caps MaxDurationSeconds at 43200 while the spec's prose says
-// 24 hours.
-//
-// Both formats carry the same range. That is a decision recorded here rather
-// than a coincidence: a JWT-SVID and an X.509-SVID are renewed by the same
-// fraction-of-lifetime policy, so a narrower JWT range would put the two formats
-// on different renewal cadences for no reason the agent can act on.
+// Each format has its own API limits; certificate limits do not apply to JWTs.
 var (
 	// x509SVIDDurationEnvelope bounds --x509-svid-duration.
 	x509SVIDDurationEnvelope = durationEnvelope{
@@ -134,9 +125,9 @@ var (
 	jwtSVIDDurationEnvelope = durationEnvelope{
 		flag:   FlagJWTSVIDDuration,
 		format: "JWT-SVID",
-		min:    time.Hour,
-		max:    12 * time.Hour,
-		source: "a JWT-SVID lifetime is bounded to the same 1 to 12 hour range as an X.509-SVID",
+		min:    time.Minute,
+		max:    time.Hour,
+		source: "sts:GetWebIdentityToken DurationSeconds accepts 60 to 3600",
 	}
 )
 

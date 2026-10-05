@@ -285,12 +285,12 @@ func init() {
 	serverCmd.Flags().DurationVar(&x509SVIDDuration, handlers.FlagX509SVIDDuration, 12*time.Hour,
 		fmt.Sprintf("Lifetime requested for each X.509-SVID, between %s and %s", x509Lower, x509Upper))
 	jwtLower, jwtUpper := handlers.JWTSVIDDurationBounds()
-	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, 6*time.Hour,
+	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, time.Hour,
 		fmt.Sprintf("Lifetime requested for each JWT-SVID, between %s and %s", jwtLower, jwtUpper))
 	serverCmd.Flags().Float64Var(&svidRenewalFraction, handlers.FlagSVIDRenewalFraction, 0.5,
 		"Fraction of an SVID's issued lifetime at which renewal starts")
 	serverCmd.Flags().StringVar(&svidKeyType, handlers.FlagSVIDKeyType, string(workloadidentity.DefaultKeyType),
 		fmt.Sprintf("Key type generated for each X.509-SVID, one of %s", workloadidentity.KeyTypeList()))
 	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
-		"Jitter applied to the renewal point, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
+		"Jitter applied to X.509-SVID and JWT-SVID renewal points, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
 }
