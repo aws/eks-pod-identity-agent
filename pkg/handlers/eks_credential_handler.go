@@ -13,6 +13,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podwatcher"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 
@@ -67,6 +68,15 @@ func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandle
 		}
 		if tv != nil {
 			retrieverOpts.TokenValidator = tv
+		}
+		// Watch pods on this node so the retriever can skip renewing credentials
+		// for pods that no longer exist and evict them promptly. If the watcher
+		// cannot be built (missing NODE_NAME, no in-cluster config, or missing
+		// RBAC), fail open: renewal proceeds for every entry as before.
+		if watcher, werr := podwatcher.New(context.Background()); werr != nil {
+			logger.FromContext(context.Background()).Infof("pod watcher unavailable, renewals will not check pod liveness: %v", werr)
+		} else {
+			retrieverOpts.PodChecker = watcher
 		}
 		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
 	}

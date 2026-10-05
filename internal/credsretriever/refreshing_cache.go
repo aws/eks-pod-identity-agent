@@ -57,6 +57,31 @@ type cachedCredentialRetriever struct {
 	// refreshRateLimiter slows down refreshes to avoid getting throttled by EKS Auth
 	// in case there is some sort of backlog of creds waiting to be refreshed
 	refreshRateLimiter *rate.Limiter
+	// podChecker, when set, is consulted before renewing credentials so the agent
+	// does not renew (and can evict) credentials for pods that no longer exist on
+	// the node. When nil, renewal proceeds for every cached entry (prior behavior).
+	podChecker podPresenceChecker
+}
+
+// podPresenceChecker reports whether a pod is still present on this node. It lets
+// the renewal path skip and evict credentials for pods that no longer exist;
+// otherwise such credentials keep getting renewed until their service account
+// token expires (up to 24h), wasting AssumeRoleForPodIdentity calls.
+type podPresenceChecker interface {
+	// IsPresent reports whether a pod with the given UID is still present on this
+	// node. The second return value, known, reports whether the checker has enough
+	// information to answer. When known is false (for example, a pod informer that
+	// has not synced yet), callers MUST assume the pod is present and proceed with
+	// renewal, so credentials for live pods are never evicted.
+	IsPresent(podUID string) (present bool, known bool)
+}
+
+// podDeletionNotifier is an optional capability of a podPresenceChecker. When a
+// checker implements it, the retriever registers a callback so credentials for a
+// pod are evicted immediately when the pod is deleted, rather than waiting for
+// the next scheduled renewal to notice the pod is gone.
+type podDeletionNotifier interface {
+	SetOnPodDeleted(func(podUID string))
 }
 
 type cacheEntry struct {
@@ -110,6 +135,9 @@ type CachedCredentialRetrieverOpts struct {
 	MaxCacheSize          int
 	RefreshQPS            int
 	CleanupInterval       time.Duration
+	// PodChecker, when non-nil, gates credential renewal on pod liveness so the
+	// agent stops renewing credentials for pods that no longer exist on the node.
+	PodChecker podPresenceChecker
 }
 
 // NewCachedCredentialRetriever creates a credential retriever that caches
@@ -148,9 +176,15 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 		maxRetryJitter:             defaultMaxRetryJitter,
 		now:                        time.Now,
 		refreshRateLimiter:         rate.NewLimiter(rate.Limit(opts.RefreshQPS), opts.RefreshQPS),
+		podChecker:                 opts.PodChecker,
 	}
 	if opts.TokenValidator != nil {
 		retriever.tokenValidator.Store(opts.TokenValidator)
+	}
+	// If the pod checker can notify us of deletions, evict the pod's cached
+	// credentials immediately instead of waiting for the next scheduled renewal.
+	if notifier, ok := opts.PodChecker.(podDeletionNotifier); ok {
+		notifier.SetOnPodDeleted(retriever.evictDeletedPod)
 	}
 	internalCache.OnRefresh(retriever.onCredentialRenewal)
 	internalCache.OnEvicted(retriever.onCredentialEviction)
@@ -343,6 +377,21 @@ func (r *cachedCredentialRetriever) onCredentialRenewal(key string, entry cacheE
 		logger.ContextWithField(entry.requestLogCtx, "from", "renewal-thread"), renewalTimeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
+
+	// key is the pod UID (the cache is keyed by pod UID). Skip and evict renewals
+	// for pods that no longer exist on this node, so the agent stops calling
+	// AssumeRoleForPodIdentity for them. If the checker cannot determine presence
+	// yet (known == false), assume the pod is alive and proceed with renewal, so
+	// credentials for live pods are never evicted.
+	if r.podChecker != nil {
+		if present, known := r.podChecker.IsPresent(key); known && !present {
+			log.Infof("Pod %s no longer present on node; evicting cached credentials instead of renewing", key)
+			promCacheState.WithLabelValues("pod_not_found").Inc()
+			r.internalCache.Delete(key)
+			return
+		}
+	}
+
 	if r.refreshRateLimiter.Allow() {
 		err := r.refreshRateLimiter.Wait(ctx)
 		if err != nil {
@@ -392,6 +441,22 @@ func (r *cachedCredentialRetriever) onCredentialEviction(key string, entry cache
 	log := logger.FromContext(entry.requestLogCtx)
 	log.Infof("Credentials evicted")
 	promCacheState.WithLabelValues("evicted").Inc()
+}
+
+// evictDeletedPod is registered with the pod watcher and invoked with a pod UID
+// when a pod on this node is deleted. The cache is keyed by pod UID, so it
+// removes that pod's cached credentials immediately rather than waiting for the
+// next scheduled renewal to notice the pod is gone. The pod_deleted metric is
+// incremented only when an entry was actually removed, so it reflects ghost
+// credentials cleaned up rather than every pod deletion observed on the node.
+func (r *cachedCredentialRetriever) evictDeletedPod(podUID string) {
+	log := logger.FromContext(context.Background())
+	if r.internalCache.Delete(podUID) {
+		promCacheState.WithLabelValues("pod_deleted").Inc()
+		log.Infof("Evicted cached credentials for deleted pod %s", podUID)
+		return
+	}
+	log.Tracef("Pod %s deleted; no cached credentials to evict", podUID)
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {
