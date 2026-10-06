@@ -139,6 +139,38 @@ func TestReadCredential(t *testing.T) {
 			body:    "",
 			wantErr: "credential not found in IMDS",
 		},
+		{
+			name:    "empty object is rejected",
+			status:  200,
+			body:    "{}",
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			name:    "expiration-only payload is rejected",
+			status:  200,
+			body:    `{"Expiration":"2099-01-01T00:00:00Z"}`,
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			name:    "missing secret key is rejected",
+			status:  200,
+			body:    `{"AccessKeyId":"AKIA","Token":"tok","Expiration":"2099-01-01T00:00:00Z"}`,
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			name:    "missing token is rejected",
+			status:  200,
+			body:    `{"AccessKeyId":"AKIA","SecretAccessKey":"secret","Expiration":"2099-01-01T00:00:00Z"}`,
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			// Static-stability: a well-formed but expired credential must still pass
+			// validation (expiry is enforced by the cache, not readCredential).
+			name:      "valid but expired credential is accepted",
+			status:    200,
+			body:      expiredCredJSON(),
+			wantKeyId: "AKIA",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -566,6 +598,14 @@ func TestGetIamCredentials(t *testing.T) {
 			credCode: 404,
 			podUID:   "pod-1",
 			wantErr:  ErrCredentialNotFound,
+		},
+		{
+			name:     "invalid credential payload is rejected",
+			mapping:  map[string]string{"pod-1": "1"},
+			credBody: "{}",
+			credCode: 200,
+			podUID:   "pod-1",
+			wantErr:  ErrInvalidCredential,
 		},
 		{
 			name:      "expired credential still returned",

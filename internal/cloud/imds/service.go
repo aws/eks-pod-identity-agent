@@ -298,6 +298,7 @@ func (s *service) readNamespaceInfo(ctx context.Context, namespace string) (*cre
 // readCredential reads and parses a pod's credential file from IMDS.
 func (s *service) readCredential(ctx context.Context, namespace, podUID string) (*credentials.EksCredentialsResponse, error) {
 	path := iamEKSPrefix + namespace + "/security-credentials/" + podUID
+	// Get the credential from IMDS
 	data, err := s.getMetadata(ctx, path)
 	if err != nil {
 		if isNotFound(err) {
@@ -308,6 +309,10 @@ func (s *service) readCredential(ctx context.Context, namespace, podUID string) 
 	var cred credentials.EksCredentialsResponse
 	if err := json.Unmarshal(data, &cred); err != nil {
 		return nil, fmt.Errorf("parsing credential %s/%s: %w", namespace, podUID, err)
+	}
+	// Validate that the credential is well-formed
+	if cred.AccessKeyId == "" || cred.SecretAccessKey == "" || cred.Token == "" {
+		return nil, fmt.Errorf("credential %s/%s: %w", namespace, podUID, ErrInvalidCredential)
 	}
 	return &cred, nil
 }
