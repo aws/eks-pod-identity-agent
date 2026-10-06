@@ -808,3 +808,57 @@ func TestProbeIMDS_TransportError_ReturnsFalse(t *testing.T) {
 	})
 	assert.False(t, result)
 }
+
+// --- Operation timeout tests ---
+
+// blockUntilCtxDone returns a handler that blocks until the request context is
+// cancelled, then returns its error. It lets a test drive an IMDS call that
+// "hangs" so an operation deadline — not the per-attempt HTTP timeout — is what
+// ends it.
+func blockUntilCtxDone() func(*http.Request) (*http.Response, error) {
+	return func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}
+}
+
+// TestGetIamCredentials_ForegroundTimeout verifies that a slow IMDS read is
+// bounded by syncOpTimeout rather than running up to the SDK's much larger
+// default, so the chained retriever retains budget for the EKS Auth fallback.
+func TestGetIamCredentials_ForegroundTimeout(t *testing.T) {
+	svc := newTestService(blockUntilCtxDone())
+	svc.storeMapping(map[string]string{"pod-1": "1"})
+
+	start := time.Now()
+	_, _, err := svc.GetIamCredentials(testCtx(), fakeRequest(t, "pod-1"))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	// Must be bounded by our 1s operation budget, well under the SDK default (5s).
+	assert.Less(t, elapsed, syncOpTimeout+2*time.Second,
+		"foreground read should be bounded by syncOpTimeout, took %v", elapsed)
+}
+
+// TestBuildNamespaceMapping_RefreshBudget verifies that a build whose namespace
+// read hangs is bounded by refreshOpTimeout rather than blocking indefinitely.
+func TestBuildNamespaceMapping_RefreshBudget(t *testing.T) {
+	// Root listing returns quickly; the per-namespace info read blocks on context.
+	svc := newTestService(func(req *http.Request) (*http.Response, error) {
+		path := req.URL.Path
+		if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
+			return httpResponse(200, "iam-eks-1"), nil
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+
+	start := time.Now()
+	err := svc.buildNamespaceMapping(testCtx())
+	elapsed := time.Since(start)
+
+	// The build still "succeeds" (a failed read is retained, not fatal), but it
+	// must return bounded by refreshOpTimeout rather than hanging on the stuck read.
+	require.NoError(t, err)
+	assert.Less(t, elapsed, refreshOpTimeout+2*time.Second,
+		"build should be bounded by refreshOpTimeout, took %v", elapsed)
+}

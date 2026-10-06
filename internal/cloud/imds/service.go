@@ -73,6 +73,8 @@ const (
 	defaultRefreshInterval = 60 * time.Second
 	// iamEKSPrefix is the IMDS namespace prefix for EKS pod credentials.
 	iamEKSPrefix = "iam-eks-"
+	syncOpTimeout = 1 * time.Second
+	refreshOpTimeout = 5 * time.Second
 )
 
 type service struct {
@@ -172,14 +174,17 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 		return nil, nil, ErrPodNotInMapping
 	}
 
-	cred, err := s.readCredential(ctx, ns, podUID)
+	// Bound the read so the agent still has time to call eksauth if necessary
+	readCtx, cancel := context.WithTimeout(ctx, syncOpTimeout)
+	defer cancel()
+	cred, err := s.readCredential(readCtx, ns, podUID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("IMDS delegate: %w", err)
 	}
 
 	log.WithFields(logrus.Fields{
 		"source":    credentials.SourceIMDS,
-		"namespace": ns,
+		"podUID":    podUID,
 	}).Info("Fetched credentials from IMDS")
 
 	return cred, credentials.CredentialMetadata{CredSource: credentials.SourceIMDS}, nil
@@ -209,6 +214,10 @@ func (s *service) startBackgroundRefresh(ctx context.Context, interval time.Dura
 // podUID → namespace mapping.
 func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	log := logger.FromContext(ctx)
+
+	// Bound the reads from IMDS - failures will preserve the old mapping
+	ctx, cancel := context.WithTimeout(ctx, refreshOpTimeout)
+	defer cancel()
 
 	namespaces, err := s.discoverNamespaces(ctx)
 	if err != nil {
