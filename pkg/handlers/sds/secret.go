@@ -33,6 +33,13 @@ import (
 // names plus trust-domain URIs, so a customer migrating off self-managed SPIRE
 // keeps their existing Envoy configuration unchanged, which is the point of
 // serving SDS at all.
+//
+// On the SPIRE side these are its default_svid_name and default_bundle_name,
+// documented with their defaults of "default" and "ROOTCA" under SDS
+// Configuration in
+// https://github.com/spiffe/spire/blob/main/doc/spire_agent.md
+// Note that they are configurable there and fixed here: a migrating customer who
+// overrode either one has to name the resource the same way again on this agent.
 const (
 	// ResourceNameTLSCertificate is the workload's own X.509-SVID: the chain and
 	// private key Envoy presents in a handshake.
@@ -49,10 +56,14 @@ const (
 	TrustDomainPrefix = "spiffe://"
 )
 
-// SPIRE also serves "ALL", every federated bundle packed into one resource.
-// Deliberately not served here: federation is outside the launch scope, so there
-// is no second trust domain for it to return. It is additive, so adding it later
-// breaks no deployed configuration.
+// SPIRE also serves "ALL", its default_all_bundles_name, which packs the agent's
+// own trust domain's authorities together with every federated one into a single
+// resource. Deliberately not served here: federation is outside the launch scope,
+// so there is no second trust domain for it to return. It is additive, so adding
+// it later breaks no deployed configuration. Note that "ALL" additionally needs
+// the SPIFFE Certificate Validator extension and Envoy 1.18 or newer, so it is
+// not a name every sidecar could consume anyway. Same reference as above:
+// https://github.com/spiffe/spire/blob/main/doc/spire_agent.md
 
 // SecretTypeURL is the type URL Envoy expects on each resource in a
 // DiscoveryResponse. Declared so a test can pin it against a literal: the value
