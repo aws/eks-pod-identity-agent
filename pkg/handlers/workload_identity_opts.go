@@ -14,11 +14,12 @@ import (
 // the struct the flags fill, so a validation error can name the flag an operator
 // has to change and cannot drift from the name cmd registers.
 const (
-	FlagX509SVIDDuration    = "x509-svid-duration"
-	FlagJWTSVIDDuration     = "jwt-svid-duration"
-	FlagSVIDRenewalFraction = "svid-renewal-fraction"
-	FlagSVIDRenewalJitter   = "svid-renewal-jitter"
-	FlagSVIDKeyType         = "svid-key-type"
+	FlagEnableWorkloadIdentity = "enable-workload-identity"
+	FlagX509SVIDDuration       = "x509-svid-duration"
+	FlagJWTSVIDDuration        = "jwt-svid-duration"
+	FlagSVIDRenewalFraction    = "svid-renewal-fraction"
+	FlagSVIDRenewalJitter      = "svid-renewal-jitter"
+	FlagSVIDKeyType            = "svid-key-type"
 )
 
 // WorkloadIdentityServerOpts carries configuration from the command line into
@@ -33,6 +34,10 @@ const (
 // than a field, and the wiring site passes it to the server the way an HTTP
 // server is given its addr today.
 type WorkloadIdentityServerOpts struct {
+	// Enabled is whether the agent serves the workload identity socket at all.
+	// Off, it builds no workload identity tier, so boot needs neither the API
+	// server nor the kubelet's kubeconfig. Validate does not read it.
+	Enabled bool
 	// Cfg is the AWS configuration the STS and EKS Auth clients are built from.
 	Cfg aws.Config
 	// ClusterName is the EKS cluster the agent runs in.

@@ -7,12 +7,22 @@ package credsretriever
 import (
 	"context"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// SessionProviderOpts configures NewSessionProvider.
-type SessionProviderOpts struct{}
+// SessionProviderOpts configures NewSessionProvider. The fields are the session
+// tier's, so the wiring can pass them now; the placeholder reads none of them.
+type SessionProviderOpts struct {
+	// ClusterName is the EKS cluster the agent runs in.
+	ClusterName string
+	// Minter obtains the projected token each exchange presents.
+	Minter workloadidentity.TokenMinter
+	// Cache is the retriever NewCachedCredentialRetriever returned. The session
+	// tier stores into it and exchanges through its delegate.
+	Cache credentials.CredentialRetriever
+}
 
 // SessionProvider is the workloadidentity.SessionProvider the agent uses.
 type SessionProvider struct{}

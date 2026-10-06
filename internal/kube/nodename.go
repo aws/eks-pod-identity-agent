@@ -21,6 +21,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -39,6 +40,10 @@ import (
 // hold; that is a startup failure, not a value to strip blindly.
 const nodeUsernamePrefix = "system:node:"
 
+// errNotANode marks an authenticated identity that is not a node, which no retry
+// can change: a ServiceAccount, anonymous, or system:node: with an empty name.
+var errNotANode = errors.New("not a node identity")
+
 // ResolveNodeName asks the API server for the node name the client
 // authenticates as. It requires no RBAC: create on selfsubjectreviews is in the
 // system:basic-user ClusterRole, bound to system:authenticated, so any
@@ -52,13 +57,13 @@ func ResolveNodeName(ctx context.Context, clientset kubernetes.Interface) (strin
 
 	username := res.Status.UserInfo.Username
 	if !strings.HasPrefix(username, nodeUsernamePrefix) {
-		return "", fmt.Errorf("authenticated as %q, which is not a node identity (%s...): the agent must present the node credential",
-			username, nodeUsernamePrefix)
+		return "", fmt.Errorf("authenticated as %q, which is %w (%s...): the agent must present the node credential",
+			username, errNotANode, nodeUsernamePrefix)
 	}
 
 	nodeName := strings.TrimPrefix(username, nodeUsernamePrefix)
 	if nodeName == "" {
-		return "", fmt.Errorf("authenticated as %q, which carries an empty node name", username)
+		return "", fmt.Errorf("authenticated as %q, which carries an empty node name, so it is %w", username, errNotANode)
 	}
 	return nodeName, nil
 }
@@ -75,9 +80,9 @@ var nodeNameBackoff = wait.Backoff{
 }
 
 // ResolveNodeNameWithRetry resolves the node name, retrying transient failures
-// with backoff until it succeeds or ctx is done. A username that is present but
-// not a node identity is not transient and stops the retry immediately: retrying
-// cannot turn a ServiceAccount into a node.
+// with backoff until it succeeds or ctx is done. An identity that is not a node,
+// an empty node name included, stops the retry immediately: retrying cannot turn
+// a ServiceAccount into a node.
 func ResolveNodeNameWithRetry(ctx context.Context, clientset kubernetes.Interface) (string, error) {
 	log := logger.FromContext(ctx)
 
@@ -86,7 +91,7 @@ func ResolveNodeNameWithRetry(ctx context.Context, clientset kubernetes.Interfac
 		name, err := ResolveNodeName(ctx, clientset)
 		if err != nil {
 			// A non-node identity is a hard configuration error; stop retrying.
-			if strings.Contains(err.Error(), "not a node identity") {
+			if errors.Is(err, errNotANode) {
 				return false, err
 			}
 			log.Warnf("resolving node name, will retry: %v", err)

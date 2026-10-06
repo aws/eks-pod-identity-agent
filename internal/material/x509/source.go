@@ -424,9 +424,13 @@ func workloadGone(err error) bool {
 		errors.Is(err, wierrors.ErrSessionRefused)
 }
 
-// onEvicted is where the entry, and the pod's private key inside it, becomes garbage
-// and is collected. It records nothing; metrics.go explains why.
-func (s *Source) onEvicted(_ string, _ entry) {}
+// onEvicted wakes the pod's streams, so one still holding the evicted certificate,
+// expired or dropped, re-reads and waits for a new one instead of being left on the
+// old one with nothing to wake it. The entry, and the key inside it, is then garbage.
+// It records nothing; metrics.go explains why.
+func (s *Source) onEvicted(uid string, _ entry) {
+	s.notifier.NotifyWorkloadChange(uid)
+}
 
 // checkIdentity confirms STS reported an identity and that it matches the certificate. An
 // empty subject fails, because STS always reports one, so its absence means the call

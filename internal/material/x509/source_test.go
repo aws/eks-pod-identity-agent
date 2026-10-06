@@ -559,6 +559,26 @@ func TestSessionFailurePropagatesUnchanged(t *testing.T) {
 	assert.Equal(t, 0, issuer.calls(), "no certificate is requested without a session")
 }
 
+// TestEvictionWakesThePodsStreams covers a certificate leaving the cache by any
+// route: the pod's streams are woken, or one holding the evicted certificate, such
+// as one expired while STS was failing, would never re-read.
+func TestEvictionWakesThePodsStreams(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+	}}
+	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
+	notifier := source.notifier.(*fake.Subscriber)
+
+	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+	require.NoError(t, err)
+	require.Equal(t, []string{testPodUID}, notifier.WorkloadChanges(), "issuance notifies once")
+
+	source.Invalidate(testPodUID)
+	assert.Equal(t, []string{testPodUID, testPodUID}, notifier.WorkloadChanges(), "eviction notifies the pod")
+}
+
 func TestInvalidateDropsTheEntryAndItsKey(t *testing.T) {
 	ca := newTestCA(t)
 	now := time.Now()

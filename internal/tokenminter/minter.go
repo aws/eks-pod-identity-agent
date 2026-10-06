@@ -83,7 +83,7 @@ func (m *apiMinter) Mint(ctx context.Context, w *workloadidentity.Workload) (*wo
 				w.Namespace, w.ServiceAccount)
 		}
 		return nil, wierrors.ErrTokenMintFailed.Wrapf(err,
-			"TokenRequest for %s/%s", w.Namespace, w.ServiceAccount)
+			"TokenRequest for %s/%s failed", w.Namespace, w.ServiceAccount)
 	}
 
 	if out.Status.Token == "" {

@@ -2,11 +2,15 @@ package kube
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -69,4 +73,69 @@ func TestResolveNodeName_RejectsNonNodeIdentity(t *testing.T) {
 			g.Expect(err).To(HaveOccurred())
 		})
 	}
+}
+
+// countingClient answers SelfSubjectReview with username, failing the first
+// failures calls with a transient error, and counts every call.
+func countingClient(username string, failures int32) (*fake.Clientset, *atomic.Int32) {
+	var calls atomic.Int32
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("create", "selfsubjectreviews",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			if calls.Add(1) <= failures {
+				return true, nil, errors.New("connection refused")
+			}
+			return true, &authenticationv1.SelfSubjectReview{
+				Status: authenticationv1.SelfSubjectReviewStatus{
+					UserInfo: authenticationv1.UserInfo{Username: username},
+				},
+			}, nil
+		})
+	return client, &calls
+}
+
+// fastNodeNameBackoff shortens the startup retry for the test and restores it.
+func fastNodeNameBackoff(t *testing.T) {
+	saved := nodeNameBackoff
+	nodeNameBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 2, Steps: 8, Cap: 10 * time.Millisecond}
+	t.Cleanup(func() { nodeNameBackoff = saved })
+}
+
+// TestResolveNodeNameWithRetry_ANonNodeIdentity_FailsWithoutRetrying proves every
+// identity that is not a node stops the retry at once, the empty node name
+// included, since no retry can turn it into one. The real backoff is kept, so a
+// retry would show as a second call.
+func TestResolveNodeNameWithRetry_ANonNodeIdentity_FailsWithoutRetrying(t *testing.T) {
+	for _, username := range []string{
+		"system:serviceaccount:kube-system:pod-identity-agent",
+		"system:node:",
+		"system:anonymous",
+	} {
+		t.Run(username, func(t *testing.T) {
+			g := NewWithT(t)
+			client, calls := countingClient(username, 0)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			_, err := ResolveNodeNameWithRetry(ctx, client)
+
+			g.Expect(err).To(MatchError(errNotANode))
+			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the retry waited for the deadline instead of failing")
+			g.Expect(calls.Load()).To(BeEquivalentTo(1))
+		})
+	}
+}
+
+// TestResolveNodeNameWithRetry_ATransientFailure_IsRetried proves an API server
+// that cannot be reached yet is waited out rather than failing the boot.
+func TestResolveNodeNameWithRetry_ATransientFailure_IsRetried(t *testing.T) {
+	g := NewWithT(t)
+	fastNodeNameBackoff(t)
+	client, calls := countingClient("system:node:"+testNode, 2)
+
+	name, err := ResolveNodeNameWithRetry(context.Background(), client)
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(name).To(Equal(testNode))
+	g.Expect(calls.Load()).To(BeEquivalentTo(3))
 }

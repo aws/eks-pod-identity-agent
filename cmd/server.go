@@ -13,11 +13,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/eksauth"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/notify"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
@@ -41,11 +39,12 @@ var (
 	// Workload identity tunables. The values the workload identity path shares
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
 	// package configuration and deliberately not flags.
-	x509SVIDDuration    time.Duration
-	jwtSVIDDuration     time.Duration
-	svidRenewalFraction float64
-	svidRenewalJitter   float64
-	svidKeyType         string
+	enableWorkloadIdentity bool
+	x509SVIDDuration       time.Duration
+	jwtSVIDDuration        time.Duration
+	svidRenewalFraction    float64
+	svidRenewalJitter      float64
+	svidKeyType            string
 )
 
 var serverCmd = &cobra.Command{
@@ -75,19 +74,21 @@ var serverCmd = &cobra.Command{
 
 		// Fail the boot on a bad workload identity value rather than every pod on
 		// the node. An out-of-envelope SVID lifetime is rejected by STS on every
-		// issuance, and a renewal band outside the credential's life renews at
-		// the wrong time for every workload.
-		if err := newWorkloadIdentityServerOpts(cfg).Validate(); err != nil {
-			log.Fatalf("Invalid workload identity configuration: %v", err)
+		// issuance. With the feature off the values are unused, so they are not
+		// checked.
+		if opts := newWorkloadIdentityServerOpts(cfg); opts.Enabled {
+			if err := opts.Validate(); err != nil {
+				log.Fatalf("Invalid workload identity configuration: %v", err)
+			}
 		}
 
 		startServers(ctx, cfg)
 	},
 }
 
-// runnable is a server that startServers can drive. The HTTP servers in pkg/server
-// and the workload identity gRPC server in pkg/grpcserver both satisfy it
-// unchanged, which is the only thing they have in common.
+// runnable is anything startServers drives until shutdown: the HTTP servers in
+// pkg/server and the workload identity gRPC server in pkg/grpcserver satisfy it
+// unchanged, and backgroundLoop adapts a loop such as the trust bundle refresh.
 //
 // It is declared here because this is the only place that consumes it. Putting it
 // in pkg/server would hand the HTTP package an abstraction it does not use and
@@ -98,7 +99,8 @@ type runnable interface {
 	// makes the WaitGroup below a shutdown barrier rather than a formality.
 	ListenUntilContextCancelled(ctx context.Context)
 	// Addr names what the server is bound to: host and port for the HTTP servers,
-	// the socket path for the gRPC server. It is a log field, not an identity.
+	// the socket path for the gRPC server, a name for a loop. It is a log field,
+	// not an identity.
 	Addr() string
 }
 
@@ -108,7 +110,7 @@ var (
 )
 
 func startServers(pCtx context.Context, cfg aws.Config) {
-	servers, err := createServers(cfg)
+	servers, err := createServers(pCtx, cfg)
 	if err != nil {
 		// Nothing is left half-started: createServers binds the workload identity
 		// socket after building every other server and before any of them serve.
@@ -148,7 +150,7 @@ func runServersUntilShutdown(pCtx context.Context, servers []runnable) {
 	wg.Wait()
 }
 
-func createServers(cfg aws.Config) ([]runnable, error) {
+func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	servers := make([]runnable, len(bindHosts))
 	// listen on all bindHosts
 	for i, ip := range bindHosts {
@@ -167,49 +169,13 @@ func createServers(cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 
-	// The change notification tier, built once because the handlers subscribe
-	// through it and the bundle and SVID tiers publish to it. It owns no goroutine.
-	// PLACEHOLDER(T10): pass the bundle tier's ProviderArnResolver once T5 is
-	// wired; nothing subscribes before the handlers replace the stub services.
-	notificationHub := notify.NewHub(nil)
-
-	// The workload identity socket is bound here, last, so a socket that cannot be
-	// bound fails the boot before anything is serving. The path is the constant
-	// rather than a flag because it is a contract with the Pod Identity webhook and
-	// the CSI driver; see configuration.WorkloadIdentitySocketPath.
-	workloadIdentityServer, err := grpcserver.New(grpcserver.Opts{
-		SocketPath: configuration.WorkloadIdentitySocketPath,
-		// The shutdown budget is left to the package: this server's streams are held
-		// open by design, so its drain is bounded by a few seconds rather than by the
-		// HTTP servers' request timeout. See grpcserver.DefaultShutdownWait.
-		Register: registerWorkloadIdentityServices(notificationHub),
-	})
+	// Last, so a node the agent cannot attest on, or a socket that cannot be
+	// bound, fails the boot before anything is serving.
+	workloadIdentity, err := workloadIdentityServers(ctx, newWorkloadIdentityServerOpts(cfg))
 	if err != nil {
 		return nil, err
 	}
-	// A socket file outlives the process that bound it, and the agent's servers report
-	// a failure they cannot serve through with log.Fatalf, which exits without running
-	// any deferred function. logrus runs its exit handlers on a fatal entry from any
-	// logger, so this is what keeps a crash in one of the HTTP servers from leaving the
-	// workload identity socket on disk. The gRPC server's own shutdown path defers the
-	// same call.
-	logrus.RegisterExitHandler(workloadIdentityServer.RemoveSocket)
-	servers = append(servers, workloadIdentityServer)
-
-	return servers, nil
-}
-
-// registerWorkloadIdentityServices returns the registration the workload identity
-// gRPC server runs before it accepts anything. The hub is threaded in here
-// because this is where the handlers that subscribe to it are registered, each
-// taking its own hub.ForRPC(<its label>).
-//
-// PLACEHOLDER(T10): the stubs answer every method with Unimplemented. The Workload
-// API and SDS handlers replace one stub each here and nothing else changes.
-func registerWorkloadIdentityServices(hub *notify.Hub) func(registrar grpc.ServiceRegistrar) {
-	return func(registrar grpc.ServiceRegistrar) {
-		grpcserver.RegisterStubServices(registrar)
-	}
+	return append(servers, workloadIdentity...), nil
 }
 
 // newWorkloadIdentityServerOpts collects the workload identity flag values into
@@ -222,6 +188,7 @@ func registerWorkloadIdentityServices(hub *notify.Hub) func(registrar grpc.Servi
 // server is given its addr.
 func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServerOpts {
 	return handlers.WorkloadIdentityServerOpts{
+		Enabled:             enableWorkloadIdentity,
 		Cfg:                 cfg,
 		ClusterName:         clusterName,
 		MaxCacheSize:        maxCacheSize,
@@ -271,6 +238,9 @@ func init() {
 		[]string{configuration.DefaultIpv4TargetHost, "[" + configuration.DefaultIpv6TargetHost + "]"}, "Hosts to bind server to")
 	serverCmd.Flags().BoolVar(&rotateCredentials, "rotate-credentials", false, "Enable credentials rotation from shared credentials file")
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
+
+	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, true,
+		"Serve SPIFFE workload identity on its socket. Set false to turn it off, and boot needs neither the API server nor the kubelet's kubeconfig")
 
 	// Workload identity. Each requested SVID lifetime is a ceiling and not a
 	// grant: STS issues the least of what is asked for and what it allows, and
