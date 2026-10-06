@@ -9,6 +9,7 @@ import (
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,11 +32,6 @@ type Opts struct {
 	// opens.
 	Attestor workloadidentity.Attestor
 
-	// Sessions exchanges the attested workload for an AWS session. The session
-	// names the provider, which is what SubscribeToWorkloadMaterial routes on.
-	// There is no node-level fallback.
-	Sessions workloadidentity.SessionProvider
-
 	// Certs yields the workload's X.509-SVID, served as the "default" resource.
 	Certs workloadidentity.CertSource
 
@@ -43,11 +39,21 @@ type Opts struct {
 	// spiffe://<trust-domain> resources.
 	Bundles workloadidentity.BundleSource
 
-	// Subs is how an open stream learns its material changed. It should be the
-	// per-RPC view, hub.ForRPC(workloadidentity.RPCStreamSecrets), so the
-	// subscription metrics carry this RPC's label.
-	Subs workloadidentity.Subscriber
+	// StreamSecretsSubscriber is how an open StreamSecrets learns its material
+	// changed. It should be built with Hub.ForRPC and
+	// workloadidentity.RPCStreamSecrets, so the subscription metrics spell the
+	// RPC as the RPC metrics do.
+	//
+	// There is no subscriber for FetchSecrets: a unary call answers once and has
+	// no stream to wake.
+	StreamSecretsSubscriber workloadidentity.Subscriber
 }
+
+// No SessionProvider here, matching workloadapi.Opts: nothing in this package
+// signs a request, and the provider a subscription routes on is resolved inside
+// the notification tier from the attested workload. The enrollment refusal a
+// session used to carry now arrives from whichever tier resolves that provider,
+// which is what keeps it identical on both interfaces.
 
 // Handler implements the Envoy Secret Discovery Service.
 //
@@ -104,19 +110,20 @@ func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsSer
 func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
 	log := logger.FromContext(ctx)
 
-	// Attested and the session read exactly as the stream does. Nothing here
-	// consumes the session, since there is no subscription to route on, but
-	// reading it is what makes a workload refused on the stream refused here
-	// too: a method that skipped it would be a way around enrollment.
-	caller, _, err := h.caller(ctx)
+	caller, err := h.caller(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Taken for the call rather than skipped. A one-shot read is still a read of
-	// the provider's bundles, and on the first interest in a provider the lease
-	// is what starts it being fetched and refreshed at all; without one, a cold
-	// provider would answer this call and every retry of it the same way.
+	// Taken for the call rather than skipped, and it carries the enrollment
+	// refusal: the lease resolves the caller's provider, so a workload that names
+	// none is turned away here with the code the stream gives it, rather than
+	// being served a certificate the unary method found a way to reach.
+	//
+	// It also earns its keep on a cold provider. A one-shot read is still a read
+	// of that provider's bundles, and the first interest in one is what starts it
+	// being fetched and refreshed; without a lease, this call and every retry of
+	// it would answer the same way forever.
 	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
 	if err != nil {
 		return nil, handlers.StatusError(err)
@@ -167,15 +174,15 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 // StreamSecrets serves an Envoy sidecar its certificate and its validation
 // context, and pushes replacements on the same stream when either changes.
 //
-// The caller is attested and its session read once, when the stream opens, and
-// the provider that session names is what every subsequent read and the lease are
-// bound to. A session that returns ErrNotEnrolled refuses the stream with the
-// same code the Workload API uses for it.
+// The caller is attested once, when the stream opens, and every subsequent read,
+// the lease and the subscription are bound to that workload. A workload whose
+// provider cannot be named is ErrNotEnrolled from the subscription, which refuses
+// the stream with the code the Workload API uses for it.
 func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecretsServer) error {
 	ctx := stream.Context()
 	log := logger.FromContext(ctx)
 
-	caller, session, err := h.caller(ctx)
+	caller, err := h.caller(ctx)
 	if err != nil {
 		return err
 	}
@@ -199,7 +206,10 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 	//
 	// SubscribeToJWTBundles is never called from here. Envoy does not consume JWT
 	// authorities, so a JWT key roll must not wake this stream at all.
-	signals, releaseSub := h.opts.Subs.SubscribeToWorkloadMaterial(ctx, caller, session.ProviderArn)
+	signals, releaseSub, err := h.opts.StreamSecretsSubscriber.SubscribeToWorkloadMaterial(ctx, caller)
+	if err != nil {
+		return handlers.StatusError(err)
+	}
 	defer releaseSub()
 
 	s := &streamState{
@@ -250,30 +260,24 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 	}
 }
 
-// caller attests the process on the other end of the stream and reads its AWS
-// session. Identical to the Workload API handler's, deliberately: a workload
-// refused on one interface and served on the other would be the customer's to
-// reverse engineer.
-func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, *workloadidentity.WorkloadSession, error) {
+// caller attests the process on the other end of the connection. Identical to the
+// Workload API handler's, deliberately: a workload refused on one interface and
+// served on the other would be the customer's to reverse engineer.
+func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, error) {
 	conn, ok := grpcserver.ConnFromContext(ctx)
 	if !ok {
 		// The server was built without the conn-carrying credentials, so nobody
 		// on this socket can be attested. A wiring bug, but refusing is still
 		// the only safe answer.
-		return nil, nil, status.Error(codes.PermissionDenied, "the caller's connection is not available, so it cannot be attested")
+		return nil, status.Error(codes.PermissionDenied, "the caller's connection is not available, so it cannot be attested")
 	}
 
 	caller, err := h.opts.Attestor.Attest(ctx, conn)
 	if err != nil {
-		return nil, nil, handlers.StatusError(err)
+		return nil, handlers.StatusError(err)
 	}
 
-	session, err := h.opts.Sessions.Session(ctx, caller)
-	if err != nil {
-		return nil, nil, handlers.StatusError(err)
-	}
-
-	return caller, session, nil
+	return caller, nil
 }
 
 // received is one result from the receive side of the stream.
@@ -471,11 +475,11 @@ func (h *Handler) buildSecret(ctx context.Context, caller *workloadidentity.Work
 		return secret, nil
 
 	case kindValidationContext:
-		anchors, err := h.validationAnchors(ctx, caller, r)
+		bundle, err := h.validationBundle(ctx, caller, r)
 		if err != nil {
 			return nil, err
 		}
-		secret, err := validationContextSecret(r.name, anchors)
+		secret, err := validationContextSecret(r.name, bundle)
 		if err != nil {
 			return nil, handlers.StatusError(err)
 		}
@@ -488,43 +492,49 @@ func (h *Handler) buildSecret(ctx context.Context, caller *workloadidentity.Work
 	}
 }
 
-// validationAnchors resolves the trust anchors for one validation context
+// validationBundle resolves the trust anchors for one validation context
 // resource.
-func (h *Handler) validationAnchors(ctx context.Context, caller *workloadidentity.Workload, r resource) ([][]byte, error) {
+func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity.Workload, r resource) (*x509bundle.Bundle, error) {
 	bundles, err := h.opts.Bundles.X509Bundles(ctx, caller)
 	if err != nil {
 		return nil, handlers.StatusError(err)
 	}
+	if bundles == nil {
+		// A tier answering with neither a set nor an error, which the lookup
+		// below would otherwise panic on. Read as an empty set, so it falls to
+		// the NotFound at the end of this function.
+		bundles = x509bundle.NewSet()
+	}
 
 	domain := r.trustDomain
 
-	if domain == "" {
+	if domain.IsZero() {
 		// The ROOTCA case: the caller's own domain, which only the bundle tier
 		// knows.
 		domain, err = h.opts.Bundles.OwnTrustDomain(ctx, caller)
 		if err != nil {
 			return nil, handlers.StatusError(err)
 		}
-		if domain == "" {
-			// The tier answers the empty string until a bundle for the provider
-			// has been fetched, and a lease does not wait for one. Unavailable
-			// rather than blocking: Envoy retries on it, and a cold start is
-			// over in one fetch.
+		if domain.IsZero() {
+			// The tier answers the zero trust domain until a bundle for the
+			// provider has been fetched, and a lease does not wait for one.
+			// Unavailable rather than blocking: Envoy retries on it, and a cold
+			// start is over in one fetch.
 			return nil, status.Errorf(codes.Unavailable,
 				"the trust domain for %q is not known yet, because no trust bundle has been fetched for this workload's provider", r.name)
 		}
 	}
 
-	anchors, ok := bundles[domain]
-	if !ok || len(anchors) == 0 {
+	bundle, ok := bundles.Get(domain)
+	if !ok || len(bundle.X509Authorities()) == 0 {
 		// A name the customer wrote that this provider has no anchors for.
 		// NotFound rather than Unavailable: no retry produces a trust domain the
 		// provider does not federate with.
 		return nil, status.Errorf(codes.NotFound,
-			"no trust anchors for trust domain %q", domain)
+			"no trust anchors for trust domain %q", domain.Name())
 	}
 
-	return anchors, nil
+	return bundle, nil
 }
 
 // parseRequestedResources parses every name on a request, rejecting the whole

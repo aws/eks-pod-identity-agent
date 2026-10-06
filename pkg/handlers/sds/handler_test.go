@@ -15,6 +15,9 @@ import (
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,6 +37,25 @@ const (
 	testOtherTrustDomain = "other.example"
 )
 
+// The same two domains as go-spiffe values, which is what the bundle tier and the
+// parsed resource names carry.
+var (
+	testTrustDomainID      = spiffeid.RequireTrustDomainFromString(testTrustDomain)
+	testOtherTrustDomainID = spiffeid.RequireTrustDomainFromString(testOtherTrustDomain)
+)
+
+// bundleSet builds what the bundle tier serves from X509Bundles: one bundle per
+// trust domain, each holding the given authority.
+func bundleSet(t *testing.T, authorities map[string]testCertificate) *x509bundle.Set {
+	t.Helper()
+
+	set := x509bundle.NewSet()
+	for domain, authority := range authorities {
+		set.Add(testBundle(t, domain, authority))
+	}
+	return set
+}
+
 // settleFor is how long an assertion that nothing happens waits. Long enough that
 // a send the handler was going to make would have arrived, short enough not to
 // dominate the suite.
@@ -45,10 +67,14 @@ const settleFor = 250 * time.Millisecond
 // is the same code an Envoy-side control plane library would use.
 type harness struct {
 	attestor *fake.Attestor
-	sessions *fake.SessionProvider
 	certs    *fake.CertSource
 	bundles  *fake.BundleSource
 	subs     *fake.Subscriber
+
+	// providers is the subscriber's resolver, which is where a provider ARN now
+	// comes from and where the enrollment refusal originates. The handler no
+	// longer reads a session, so this is the only thing that names a provider.
+	providers *fake.ProviderArnResolver
 
 	client secretv3.SecretDiscoveryServiceClient
 }
@@ -61,22 +87,21 @@ func newHarness(t *testing.T) *harness {
 	anchor := newTestCertificate(t, "authority")
 
 	h := &harness{
-		attestor: &fake.Attestor{Result: testWorkload("pod-one")},
-		sessions: &fake.SessionProvider{Result: &workloadidentity.WorkloadSession{ProviderArn: testProviderArn}},
-		certs:    &fake.CertSource{Result: []*workloadidentity.X509SVID{newTestSVID(t, "spiffe://example.org/workload")}},
-		bundles:  &fake.BundleSource{},
-		subs:     &fake.Subscriber{},
+		attestor:  &fake.Attestor{Result: testWorkload("pod-one")},
+		certs:     &fake.CertSource{Result: []*x509svid.SVID{newTestSVID(t, "spiffe://example.org/workload")}},
+		bundles:   &fake.BundleSource{},
+		providers: &fake.ProviderArnResolver{Arn: testProviderArn},
 	}
+	h.subs = &fake.Subscriber{Providers: h.providers}
 
-	h.bundles.SetTrustDomain(testTrustDomain, nil)
-	h.bundles.SetX509Bundles(map[string][][]byte{testTrustDomain: {anchor.der}}, nil)
+	h.bundles.SetTrustDomain(testTrustDomainID, nil)
+	h.bundles.SetX509Bundles(bundleSet(t, map[string]testCertificate{testTrustDomain: anchor}), nil)
 
 	handler := New(Opts{
-		Attestor: h.attestor,
-		Sessions: h.sessions,
-		Certs:    h.certs,
-		Bundles:  h.bundles,
-		Subs:     h.subs,
+		Attestor:                h.attestor,
+		Certs:                   h.certs,
+		Bundles:                 h.bundles,
+		StreamSecretsSubscriber: h.subs,
 	})
 
 	h.client = serve(t, handler)
@@ -352,11 +377,15 @@ func TestStreamSecrets_ValidationContextOnly(t *testing.T) {
 // TestStreamSecrets_NotEnrolledIsRefused pins the enrollment refusal on the code
 // the Workload API uses, which is SPIRE's PermissionDenied for a workload with no
 // identity.
+//
+// The refusal arrives from the subscription now rather than from a session: the
+// notification tier resolves the caller's provider, so a workload that names none
+// cannot subscribe, which is the same gate FetchX509SVID passes through.
 func TestStreamSecrets_NotEnrolledIsRefused(t *testing.T) {
 	g := NewWithT(t)
 
 	h := newHarness(t)
-	h.sessions.SetResult(nil, pkgerrors.ErrNotEnrolled)
+	h.providers.Err = pkgerrors.ErrNotEnrolled
 
 	ts := h.open(t)
 	ts.request(t, []string{ResourceNameOwnValidationContext}, "")
@@ -389,7 +418,7 @@ func TestStreamSecrets_ColdStartRootCAIsUnavailable(t *testing.T) {
 	g := NewWithT(t)
 
 	h := newHarness(t)
-	h.bundles.SetTrustDomain("", nil)
+	h.bundles.SetTrustDomain(spiffeid.TrustDomain{}, nil)
 
 	ts := h.open(t)
 	ts.request(t, []string{ResourceNameOwnValidationContext}, "")
@@ -449,7 +478,7 @@ func TestStreamSecrets_CertificateRenewalIsPushed(t *testing.T) {
 
 	// A renewal in the certificate tier, then the notification that tier would
 	// publish.
-	h.certs.SetResult([]*workloadidentity.X509SVID{newTestSVID(t, "spiffe://example.org/workload")}, nil)
+	h.certs.SetResult([]*x509svid.SVID{newTestSVID(t, "spiffe://example.org/workload")}, nil)
 	g.Eventually(func() int {
 		return h.subs.NotifyWorkload("pod-one")
 	}).Should(Equal(1))
@@ -486,7 +515,7 @@ func TestStreamSecrets_CertificateAddedMidStreamIsThenPushed(t *testing.T) {
 		"the anchors were unchanged, so only the newly named resource should be sent")
 
 	// And that certificate's renewals now reach this stream.
-	h.certs.SetResult([]*workloadidentity.X509SVID{newTestSVID(t, "spiffe://example.org/workload")}, nil)
+	h.certs.SetResult([]*x509svid.SVID{newTestSVID(t, "spiffe://example.org/workload")}, nil)
 	g.Eventually(func() int {
 		return h.subs.NotifyWorkload("pod-one")
 	}).Should(Equal(1))
@@ -567,7 +596,7 @@ func TestStreamSecrets_RejectionIsLoggedAndTheStreamContinues(t *testing.T) {
 
 	// And the stream still serves: a bundle change reaches it.
 	anchor := newTestCertificate(t, "rolled-authority")
-	h.bundles.SetX509Bundles(map[string][][]byte{testTrustDomain: {anchor.der}}, nil)
+	h.bundles.SetX509Bundles(bundleSet(t, map[string]testCertificate{testTrustDomain: anchor}), nil)
 	g.Eventually(func() int {
 		return h.subs.NotifyCertBundles(testProviderArn)
 	}).Should(Equal(1))
@@ -625,8 +654,8 @@ func TestStreamSecrets_LeaseAndReadsUseTheCallersOwnWorkload(t *testing.T) {
 }
 
 // TestStreamSecrets_BundleChangeWakesOnlyTheChangedProvider is the routing item.
-// Two callers whose sessions name different providers open streams; a rotation in
-// one provider reaches only its own stream, and the other keeps its version.
+// Two callers whose providers differ open streams; a rotation in one provider
+// reaches only its own stream, and the other keeps its version.
 func TestStreamSecrets_BundleChangeWakesOnlyTheChangedProvider(t *testing.T) {
 	g := NewWithT(t)
 
@@ -643,19 +672,17 @@ func TestStreamSecrets_BundleChangeWakesOnlyTheChangedProvider(t *testing.T) {
 		attested++
 		return testWorkload(fmt.Sprintf("pod-%d", attested)), nil
 	}
-	h.sessions.Func = func(_ context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error) {
-		if w.PodUID == "pod-1" {
-			return &workloadidentity.WorkloadSession{ProviderArn: testProviderArn}, nil
-		}
-		return &workloadidentity.WorkloadSession{ProviderArn: testOtherProviderArn}, nil
-	}
+	// pod-1's provider is named explicitly and every other pod falls to Arn, which
+	// is the fake resolver's stand-in for "the rest".
+	h.providers.Arns = map[string]string{"pod-1": testProviderArn}
+	h.providers.Arn = testOtherProviderArn
 
 	anchor := newTestCertificate(t, "authority")
 	otherAnchor := newTestCertificate(t, "other-authority")
-	h.bundles.SetX509Bundles(map[string][][]byte{
-		testTrustDomain:      {anchor.der},
-		testOtherTrustDomain: {otherAnchor.der},
-	}, nil)
+	h.bundles.SetX509Bundles(bundleSet(t, map[string]testCertificate{
+		testTrustDomain:      anchor,
+		testOtherTrustDomain: otherAnchor,
+	}), nil)
 
 	first := h.open(t)
 	first.request(t, []string{TrustDomainPrefix + testTrustDomain}, "")
@@ -676,10 +703,10 @@ func TestStreamSecrets_BundleChangeWakesOnlyTheChangedProvider(t *testing.T) {
 
 	// The first provider's authorities roll.
 	rolled := newTestCertificate(t, "rolled-authority")
-	h.bundles.SetX509Bundles(map[string][][]byte{
-		testTrustDomain:      {rolled.der},
-		testOtherTrustDomain: {otherAnchor.der},
-	}, nil)
+	h.bundles.SetX509Bundles(bundleSet(t, map[string]testCertificate{
+		testTrustDomain:      rolled,
+		testOtherTrustDomain: otherAnchor,
+	}), nil)
 	g.Expect(h.subs.NotifyCertBundles(testProviderArn)).To(Equal(1),
 		"only the changed provider's subscription should be signalled")
 
@@ -917,13 +944,13 @@ func TestFetchSecrets_UnknownResourceNameIsNotFound(t *testing.T) {
 }
 
 // TestFetchSecrets_NotEnrolledIsRefused pins that the unary method is not a way
-// around enrollment. It reads the session for no other reason, since nothing here
-// routes on the provider it names.
+// around enrollment. It takes no subscription, so the refusal has to come from
+// the lease, which is the other place the caller's provider gets resolved.
 func TestFetchSecrets_NotEnrolledIsRefused(t *testing.T) {
 	g := NewWithT(t)
 
 	h := newHarness(t)
-	h.sessions.SetResult(nil, pkgerrors.ErrNotEnrolled)
+	h.bundles.SetLease(pkgerrors.ErrNotEnrolled)
 
 	_, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
 		TypeUrl:       SecretTypeURL,
@@ -1026,15 +1053,14 @@ func serveWithoutConnCredentials(t *testing.T) secretv3.SecretDiscoveryServiceCl
 
 	anchor := newTestCertificate(t, "authority")
 	bundles := &fake.BundleSource{}
-	bundles.SetTrustDomain(testTrustDomain, nil)
-	bundles.SetX509Bundles(map[string][][]byte{testTrustDomain: {anchor.der}}, nil)
+	bundles.SetTrustDomain(testTrustDomainID, nil)
+	bundles.SetX509Bundles(bundleSet(t, map[string]testCertificate{testTrustDomain: anchor}), nil)
 
 	handler := New(Opts{
-		Attestor: &fake.Attestor{Result: testWorkload("pod-one")},
-		Sessions: &fake.SessionProvider{Result: &workloadidentity.WorkloadSession{ProviderArn: testProviderArn}},
-		Certs:    &fake.CertSource{},
-		Bundles:  bundles,
-		Subs:     &fake.Subscriber{},
+		Attestor:                &fake.Attestor{Result: testWorkload("pod-one")},
+		Certs:                   &fake.CertSource{},
+		Bundles:                 bundles,
+		StreamSecretsSubscriber: &fake.Subscriber{Providers: &fake.ProviderArnResolver{Arn: testProviderArn}},
 	})
 
 	dir, err := filepath.EvalSymlinks(t.TempDir())

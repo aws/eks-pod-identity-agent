@@ -13,21 +13,23 @@ import (
 
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"google.golang.org/protobuf/types/known/anypb"
-
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // testCertificate is a self-signed certificate and its key, standing in for an
-// issued SVID. The tests need real DER because the encoder parses what it is
-// given rather than trusting it.
+// issued SVID or an authority. It holds the parsed certificate, which is what the
+// tiers now hand over, with the DER reachable as cert.Raw.
 type testCertificate struct {
-	der []byte
-	key *ecdsa.PrivateKey
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
 }
 
-// newTestCertificate issues a self-signed certificate for the given SPIFFE ID.
-func newTestCertificate(t *testing.T, spiffeID string) testCertificate {
+// newTestCertificate issues a self-signed certificate under the given common
+// name.
+func newTestCertificate(t *testing.T, commonName string) testCertificate {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -37,7 +39,7 @@ func newTestCertificate(t *testing.T, spiffeID string) testCertificate {
 
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: spiffeID},
+		Subject:      pkix.Name{CommonName: commonName},
 		NotBefore:    time.Now().Add(-time.Minute),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
@@ -47,22 +49,36 @@ func newTestCertificate(t *testing.T, spiffeID string) testCertificate {
 		t.Fatalf("creating a certificate: %v", err)
 	}
 
-	return testCertificate{der: der, key: key}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parsing the certificate just created: %v", err)
+	}
+
+	return testCertificate{cert: cert, key: key}
 }
 
-// newTestSVID builds an X509SVID carrying one self-signed certificate.
-func newTestSVID(t *testing.T, spiffeID string) *workloadidentity.X509SVID {
+// newTestSVID builds an X.509-SVID carrying one self-signed certificate.
+func newTestSVID(t *testing.T, spiffeID string) *x509svid.SVID {
 	t.Helper()
 
-	cert := newTestCertificate(t, spiffeID)
+	issued := newTestCertificate(t, spiffeID)
 
-	return &workloadidentity.X509SVID{
-		SpiffeID:     spiffeID,
-		Certificates: [][]byte{cert.der},
-		PrivateKey:   cert.key,
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
+	return &x509svid.SVID{
+		ID:           spiffeid.RequireFromString(spiffeID),
+		Certificates: []*x509.Certificate{issued.cert},
+		PrivateKey:   issued.key,
 	}
+}
+
+// testBundle is one trust domain's authorities, as the bundle tier holds them.
+func testBundle(t *testing.T, trustDomain string, authorities ...testCertificate) *x509bundle.Bundle {
+	t.Helper()
+
+	bundle := x509bundle.New(spiffeid.RequireTrustDomainFromString(trustDomain))
+	for _, authority := range authorities {
+		bundle.AddX509Authority(authority.cert)
+	}
+	return bundle
 }
 
 // TestSecretTypeURL_MatchesWhatEnvoyExpects is the compatibility pin the
@@ -110,7 +126,9 @@ func TestParseResourceName(t *testing.T) {
 
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(r.kind).To(Equal(tc.wantKind))
-			g.Expect(r.trustDomain).To(Equal(tc.wantTrustDomain))
+			// The zero TrustDomain, whose Name is empty, is the caller's own
+			// domain, resolved against the bundle tier rather than here.
+			g.Expect(r.trustDomain.Name()).To(Equal(tc.wantTrustDomain))
 			// The name is echoed verbatim because Envoy rejects an update whose
 			// secret name is not the one it subscribed to.
 			g.Expect(r.name).To(Equal(tc.input))
@@ -134,6 +152,9 @@ func TestParseResourceName_Refusals(t *testing.T) {
 		// asked, so it is refused with the name that would have worked.
 		{"a SPIFFE ID rather than a domain", "spiffe://example.org/workload", "names a SPIFFE ID"},
 		{"case matters on ROOTCA", "rootca", "unknown resource name"},
+		// Rejected by go-spiffe rather than by the prefix check, which is the
+		// point: the name has to be a trust domain the tier could key on.
+		{"a domain go-spiffe will not parse", "spiffe://EXAMPLE.ORG", "invalid trust domain"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
@@ -178,7 +199,7 @@ func TestTLSCertificateSecret_IsPEMEnvoyCanParse(t *testing.T) {
 	g.Expect(chainBlock).ToNot(BeNil())
 	g.Expect(chainBlock.Type).To(Equal("CERTIFICATE"))
 	g.Expect(rest).To(BeEmpty())
-	g.Expect(chainBlock.Bytes).To(Equal(svid.Certificates[0]))
+	g.Expect(chainBlock.Bytes).To(Equal(svid.Certificates[0].Raw))
 
 	keyBlock, rest := pem.Decode(tlsCert.GetPrivateKey().GetInlineBytes())
 	g.Expect(keyBlock).ToNot(BeNil())
@@ -196,15 +217,16 @@ func TestTLSCertificateSecret_IsPEMEnvoyCanParse(t *testing.T) {
 }
 
 // TestTLSCertificateSecret_PreservesChainOrder pins leaf-first, which is the
-// order Envoy expects and the order X509SVID.Certificates documents.
+// order Envoy expects and the order x509svid.SVID.Certificates documents.
 func TestTLSCertificateSecret_PreservesChainOrder(t *testing.T) {
 	g := NewWithT(t)
 
 	leaf := newTestCertificate(t, "spiffe://example.org/workload")
 	intermediate := newTestCertificate(t, "intermediate")
 
-	svid := &workloadidentity.X509SVID{
-		Certificates: [][]byte{leaf.der, intermediate.der},
+	svid := &x509svid.SVID{
+		ID:           spiffeid.RequireFromString("spiffe://example.org/workload"),
+		Certificates: []*x509.Certificate{leaf.cert, intermediate.cert},
 		PrivateKey:   leaf.key,
 	}
 
@@ -223,36 +245,31 @@ func TestTLSCertificateSecret_PreservesChainOrder(t *testing.T) {
 	}
 
 	g.Expect(order).To(HaveLen(2))
-	g.Expect(order[0]).To(Equal(leaf.der))
-	g.Expect(order[1]).To(Equal(intermediate.der))
+	g.Expect(order[0]).To(Equal(leaf.cert.Raw))
+	g.Expect(order[1]).To(Equal(intermediate.cert.Raw))
 }
 
+// TestTLSCertificateSecret_Refusals covers what the tier can still hand over
+// wrongly. There is no malformed-DER case any more: the tier yields parsed
+// *x509.Certificates, so a corrupt certificate cannot reach this far.
 func TestTLSCertificateSecret_Refusals(t *testing.T) {
 	leaf := newTestCertificate(t, "spiffe://example.org/workload")
 
 	for _, tc := range []struct {
 		name        string
-		svid        *workloadidentity.X509SVID
+		svid        *x509svid.SVID
 		wantMessage string
 	}{
 		{"no SVID at all", nil, "no X.509-SVID"},
 		{
 			"an SVID with no certificate",
-			&workloadidentity.X509SVID{PrivateKey: leaf.key},
+			&x509svid.SVID{PrivateKey: leaf.key},
 			"carries no certificate",
 		},
 		{
 			"an SVID with no key",
-			&workloadidentity.X509SVID{Certificates: [][]byte{leaf.der}},
+			&x509svid.SVID{Certificates: []*x509.Certificate{leaf.cert}},
 			"carries no private key",
-		},
-		{
-			// Nothing downstream would catch this: PEM encoding is base64 with a
-			// header, so corrupt DER would reach Envoy as a well-formed document
-			// and fail as a handshake error in the customer's mesh instead.
-			"an SVID whose certificate is not DER",
-			&workloadidentity.X509SVID{Certificates: [][]byte{[]byte("not a certificate")}, PrivateKey: leaf.key},
-			"not valid DER",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -274,7 +291,8 @@ func TestValidationContextSecret_IsPEMEnvoyCanParse(t *testing.T) {
 	first := newTestCertificate(t, "authority-one")
 	second := newTestCertificate(t, "authority-two")
 
-	secret, err := validationContextSecret(ResourceNameOwnValidationContext, [][]byte{first.der, second.der})
+	secret, err := validationContextSecret(ResourceNameOwnValidationContext,
+		testBundle(t, "example.org", first, second))
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(secret.GetName()).To(Equal(ResourceNameOwnValidationContext))
@@ -294,7 +312,7 @@ func TestValidationContextSecret_IsPEMEnvoyCanParse(t *testing.T) {
 		anchors = append(anchors, block.Bytes)
 	}
 
-	g.Expect(anchors).To(Equal([][]byte{first.der, second.der}))
+	g.Expect(anchors).To(Equal([][]byte{first.cert.Raw, second.cert.Raw}))
 }
 
 // TestValidationContextSecret_IsStableForUnchangedAnchors is what makes the
@@ -306,30 +324,34 @@ func TestValidationContextSecret_IsStableForUnchangedAnchors(t *testing.T) {
 
 	anchor := newTestCertificate(t, "authority")
 
-	first, err := validationContextSecret(ResourceNameOwnValidationContext, [][]byte{anchor.der})
+	first, err := validationContextSecret(ResourceNameOwnValidationContext,
+		testBundle(t, "example.org", anchor))
 	g.Expect(err).ToNot(HaveOccurred())
 
-	second, err := validationContextSecret(ResourceNameOwnValidationContext, [][]byte{anchor.der})
+	second, err := validationContextSecret(ResourceNameOwnValidationContext,
+		testBundle(t, "example.org", anchor))
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(first.GetValidationContext().GetTrustedCa().GetInlineBytes()).
 		To(Equal(second.GetValidationContext().GetTrustedCa().GetInlineBytes()))
 }
 
+// TestValidationContextSecret_Refusals covers an empty bundle and a missing one.
+// A malformed authority is no longer reachable, for the same reason as on the
+// certificate: the tier holds parsed certificates.
 func TestValidationContextSecret_Refusals(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
-		anchors     [][]byte
+		bundle      *x509bundle.Bundle
 		wantMessage string
 	}{
-		{"no anchors", nil, "no trust anchors"},
-		{"an empty anchor set", [][]byte{}, "no trust anchors"},
-		{"an anchor that is not DER", [][]byte{[]byte("not a certificate")}, "not valid DER"},
+		{"no bundle at all", nil, "no trust anchors"},
+		{"a bundle with no authorities", testBundle(t, "example.org"), "no trust anchors"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			_, err := validationContextSecret(ResourceNameOwnValidationContext, tc.anchors)
+			_, err := validationContextSecret(ResourceNameOwnValidationContext, tc.bundle)
 
 			g.Expect(err).To(HaveOccurred())
 			g.Expect(err.Error()).To(ContainSubstring(tc.wantMessage))

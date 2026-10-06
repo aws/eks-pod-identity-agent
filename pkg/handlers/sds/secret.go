@@ -10,16 +10,14 @@
 package sds
 
 import (
-	"crypto"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
 // Resource names Envoy may ask for on this socket.
@@ -62,18 +60,6 @@ const (
 // moved it would otherwise be invisible here and fatal in the field.
 const SecretTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret"
 
-// PEM block types. Envoy parses both from the DataSource bytes.
-const (
-	// pemBlockCertificate is the block type for a certificate, leaf or anchor.
-	pemBlockCertificate = "CERTIFICATE"
-
-	// pemBlockPrivateKey is the block type for an unencrypted PKCS#8 key, which
-	// is what MarshalPKCS8PrivateKey produces. "PRIVATE KEY" rather than "RSA
-	// PRIVATE KEY" or "EC PRIVATE KEY", since those name the older
-	// algorithm-specific encodings and would not match the bytes.
-	pemBlockPrivateKey = "PRIVATE KEY"
-)
-
 // secretKind is which of the two secret kinds a resource name selects.
 type secretKind int
 
@@ -98,10 +84,10 @@ type resource struct {
 	kind secretKind
 
 	// trustDomain names the domain whose anchors are wanted, for a
-	// kindValidationContext resource. Empty means the caller's own domain, which
-	// is the ROOTCA case and is resolved against the bundle tier at build time
-	// rather than here.
-	trustDomain string
+	// kindValidationContext resource. The zero TrustDomain means the caller's own
+	// domain, which is the ROOTCA case and is resolved against the bundle tier at
+	// build time rather than here.
+	trustDomain spiffeid.TrustDomain
 }
 
 // parseResourceName resolves one name Envoy asked for.
@@ -127,11 +113,19 @@ func parseResourceName(name string) (resource, error) {
 		// spiffe://example.org/workload. Refused rather than truncated to its
 		// domain, since a configuration asking for one is not asking for what
 		// truncation would return.
+		//
+		// Checked before TrustDomainFromString, which would accept the ID and
+		// return its domain, so the refusal is ours to word rather than a
+		// silent truncation.
 		if strings.Contains(domain, "/") {
 			return resource{}, fmt.Errorf("resource name %q names a SPIFFE ID, but a validation context is per trust domain: use %s%s",
 				name, TrustDomainPrefix, strings.SplitN(domain, "/", 2)[0])
 		}
-		return resource{name: name, kind: kindValidationContext, trustDomain: domain}, nil
+		trustDomain, err := spiffeid.TrustDomainFromString(domain)
+		if err != nil {
+			return resource{}, fmt.Errorf("resource name %q names an invalid trust domain: %w", name, err)
+		}
+		return resource{name: name, kind: kindValidationContext, trustDomain: trustDomain}, nil
 
 	default:
 		return resource{}, fmt.Errorf("unknown resource name %q: this agent serves %q, %q and %s<trust-domain>",
@@ -141,11 +135,16 @@ func parseResourceName(name string) (resource, error) {
 
 // tlsCertificateSecret builds the TlsCertificate secret for svid.
 //
-// Envoy wants PEM in both DataSource fields, and the agent holds the chain as DER
-// and the key as a crypto.Signer, so the marshalling happens here at the edge. The
-// key is marshalled rather than carried as bytes through the agent, which is why
-// X509SVID holds a Signer in the first place.
-func tlsCertificateSecret(name string, svid *workloadidentity.X509SVID) (*tlsv3.Secret, error) {
+// Envoy wants PEM in both DataSource fields, which is exactly what go-spiffe's
+// Marshal returns: the chain as concatenated CERTIFICATE blocks, leaf first, and
+// the key as an unencrypted PKCS#8 PRIVATE KEY block. The Workload API handler
+// calls MarshalRaw beside this for the DER the SPIFFE wire format carries, so the
+// two interfaces differ only in which of the pair they call.
+//
+// Nothing re-parses the chain here. The tier hands over parsed
+// *x509.Certificates, so a malformed certificate cannot reach this far; it would
+// have failed where it was parsed, which is where the error belongs.
+func tlsCertificateSecret(name string, svid *x509svid.SVID) (*tlsv3.Secret, error) {
 	if svid == nil {
 		return nil, fmt.Errorf("no X.509-SVID to serve as %q", name)
 	}
@@ -156,14 +155,9 @@ func tlsCertificateSecret(name string, svid *workloadidentity.X509SVID) (*tlsv3.
 		return nil, fmt.Errorf("the X.509-SVID for %q carries no private key", name)
 	}
 
-	chain, err := certificateChainPEM(svid.Certificates)
+	chain, key, err := svid.Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("encoding the certificate chain for %q: %w", name, err)
-	}
-
-	key, err := privateKeyPEM(svid.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("encoding the private key for %q: %w", name, err)
+		return nil, fmt.Errorf("marshalling the X.509-SVID for %q: %w", name, err)
 	}
 
 	return &tlsv3.Secret{
@@ -178,19 +172,24 @@ func tlsCertificateSecret(name string, svid *workloadidentity.X509SVID) (*tlsv3.
 }
 
 // validationContextSecret builds the CertificateValidationContext secret holding
-// anchors.
+// bundle's authorities.
 //
 // Only TrustedCa is set. SPIRE additionally offers a SPIFFE-aware custom
 // validator, which matters when one context has to verify peers from several
 // trust domains; with federation out of scope there is only ever one domain's
 // anchors here, and Istio's generated configuration combines an SDS-provided
 // trusted_ca with its own default validation context.
-func validationContextSecret(name string, anchors [][]byte) (*tlsv3.Secret, error) {
-	if len(anchors) == 0 {
+//
+// Bundle.Marshal is the PEM encoding Envoy wants, and it walks the authorities in
+// the order the bundle holds them, so an unchanged authority set encodes to
+// identical bytes and the handler's dedupe does not see a change that is only a
+// reordering.
+func validationContextSecret(name string, bundle *x509bundle.Bundle) (*tlsv3.Secret, error) {
+	if bundle == nil || len(bundle.X509Authorities()) == 0 {
 		return nil, fmt.Errorf("no trust anchors to serve as %q", name)
 	}
 
-	trusted, err := certificateChainPEM(anchors)
+	trusted, err := bundle.Marshal()
 	if err != nil {
 		return nil, fmt.Errorf("encoding the trust anchors for %q: %w", name, err)
 	}
@@ -214,48 +213,4 @@ func inlineBytes(b []byte) *corev3.DataSource {
 	return &corev3.DataSource{
 		Specifier: &corev3.DataSource_InlineBytes{InlineBytes: b},
 	}
-}
-
-// certificateChainPEM concatenates DER certificates into one PEM document, in the
-// order given. For a chain that is leaf first, which is what X509SVID.Certificates
-// holds and what Envoy expects; for anchors the order is immaterial to Envoy but
-// is preserved anyway, so that an unchanged authority set encodes to identical
-// bytes and the handler's dedupe does not see a change that is only a reordering.
-//
-// Each certificate is parsed before it is encoded. Nothing downstream would catch
-// a malformed one: PEM encoding is just base64 with a header, so a corrupt DER
-// would reach Envoy as a well-formed document it then rejects, and the failure
-// would surface as a handshake error in the customer's mesh rather than as an
-// error from this agent.
-func certificateChainPEM(der [][]byte) ([]byte, error) {
-	var out []byte
-
-	for i, certificate := range der {
-		if _, err := x509.ParseCertificate(certificate); err != nil {
-			return nil, fmt.Errorf("certificate %d of %d is not valid DER: %w", i+1, len(der), err)
-		}
-		out = append(out, pem.EncodeToMemory(&pem.Block{
-			Type:  pemBlockCertificate,
-			Bytes: certificate,
-		})...)
-	}
-
-	return out, nil
-}
-
-// privateKeyPEM marshals signer as an unencrypted PKCS#8 PEM document.
-//
-// PKCS#8 covers RSA and ECDSA with one encoding, so this does not branch on the
-// key type, and it is what the Workload API carries too, so both interfaces
-// marshal the same bytes and differ only in the PEM wrapper.
-func privateKeyPEM(signer crypto.Signer) ([]byte, error) {
-	der, err := x509.MarshalPKCS8PrivateKey(signer)
-	if err != nil {
-		return nil, fmt.Errorf("marshalling the private key as PKCS#8: %w", err)
-	}
-
-	return pem.EncodeToMemory(&pem.Block{
-		Type:  pemBlockPrivateKey,
-		Bytes: der,
-	}), nil
 }
