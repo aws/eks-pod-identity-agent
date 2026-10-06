@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	pkgerrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
@@ -66,11 +68,30 @@ type Handler struct {
 	secretv3.UnimplementedSecretDiscoveryServiceServer
 
 	opts Opts
+
+	// backoff paces an RPC's retries of its own steps: attesting, leasing,
+	// subscribing and reading the tiers. A failed send to the caller is not
+	// retried, since the stream is already gone and Envoy will reconnect. Each
+	// RPC starts from a copy, so one stream's failures never slow another's.
+	backoff wait.Backoff
+}
+
+// retryBackoff is go-spiffe's own client backoff, one second doubling to thirty,
+// which workloadapi also uses. Matched rather than chosen: a blocked stream
+// should poll the tiers no harder than a client would poll the agent, and two
+// interfaces retrying the same tier at different rates would make a tier outage
+// read differently depending on which one a workload happened to use.
+var retryBackoff = wait.Backoff{
+	Duration: time.Second,
+	Factor:   2,
+	Jitter:   0.1,
+	Steps:    1 << 30,
+	Cap:      30 * time.Second,
 }
 
 // New returns a Handler over the given tiers.
 func New(opts Opts) *Handler {
-	return &Handler{opts: opts}
+	return &Handler{opts: opts, backoff: retryBackoff}
 }
 
 // Register attaches the handler to a gRPC server. It is what the wiring site
@@ -108,7 +129,7 @@ func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsSer
 // correct when it is sent and carries nothing that says when it stops being
 // correct, so polling it is not a substitute for the stream.
 func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
-	state := newRPCState(workloadidentity.RPCFetchSecrets)
+	state := newRPCState(workloadidentity.RPCFetchSecrets, h.backoff)
 
 	resp, err := h.fetchSecrets(ctx, req)
 	if err != nil {
@@ -125,6 +146,11 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
 	log := logger.FromContext(ctx)
 
+	// Nothing here is wrapped in a retry, unlike the stream. A unary caller is
+	// holding a call open and has its own deadline to spend, so a transient tier
+	// failure is answered rather than waited out: the code says it is worth
+	// retrying and the caller decides whether to. Blocking inside the call would
+	// spend a deadline we did not set on a wait the caller cannot see.
 	caller, err := h.caller(ctx)
 	if err != nil {
 		return nil, err
@@ -195,7 +221,7 @@ func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 // the stream with the code the Workload API uses for it.
 func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecretsServer) error {
 	ctx := stream.Context()
-	state := newRPCState(workloadidentity.RPCStreamSecrets)
+	state := newRPCState(workloadidentity.RPCStreamSecrets, h.backoff)
 
 	// The loop only ever exits with an error: a client disconnect, a server
 	// shutdown and a refusal all arrive as one, so there is no success return to
@@ -208,8 +234,15 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDiscoveryService_StreamSecretsServer, state *rpcState) error {
 	log := logger.FromContext(ctx)
 
-	caller, err := h.caller(ctx)
-	if err != nil {
+	// Each setup step is awaited, so a transient failure before the first
+	// response blocks the stream rather than ending it. There is no signal
+	// channel to cut the wait short yet, which is why nil is passed: the
+	// subscription that would provide one is itself one of these steps.
+	var caller *workloadidentity.Workload
+	if err := state.await(ctx, nil, func() (err error) {
+		caller, err = h.caller(ctx)
+		return err
+	}); err != nil {
 		return err
 	}
 
@@ -218,8 +251,11 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 	// provider whose bundles hold still would look unused to the bundle tier,
 	// which stops refreshing a provider with no open lease and would then miss
 	// the next rotation.
-	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
-	if err != nil {
+	var releaseLease func()
+	if err := state.await(ctx, nil, func() (err error) {
+		releaseLease, err = h.opts.Bundles.Lease(ctx, caller)
+		return err
+	}); err != nil {
 		return err
 	}
 	defer releaseLease()
@@ -232,8 +268,12 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 	//
 	// SubscribeToJWTBundles is never called from here. Envoy does not consume JWT
 	// authorities, so a JWT key roll must not wake this stream at all.
-	signals, releaseSub, err := h.opts.StreamSecretsSubscriber.SubscribeToWorkloadMaterial(ctx, caller)
-	if err != nil {
+	var signals <-chan struct{}
+	var releaseSub func()
+	if err := state.await(ctx, nil, func() (err error) {
+		signals, releaseSub, err = h.opts.StreamSecretsSubscriber.SubscribeToWorkloadMaterial(ctx, caller)
+		return err
+	}); err != nil {
 		return err
 	}
 	defer releaseSub()
@@ -262,7 +302,11 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 			// Each pass sends the state it reads now rather than anything the
 			// signal carried, so a slow stream is never handed a superseded
 			// credential.
-			if err := s.sendNamed(ctx); err != nil {
+			//
+			// Awaited, and safe to re-run: a retried pass re-reads every named
+			// resource and the dedupe suppresses the ones an earlier attempt
+			// already sent unchanged.
+			if err := state.await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
 				return err
 			}
 
@@ -280,7 +324,19 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 				// context's own status is the right answer for both.
 				return handlers.StatusErrorFromContext(ctx)
 			}
-			if err := s.handleRequest(ctx, log, received.req); err != nil {
+			// Applying the request and sending for it are separate steps so that
+			// only the send is retried. Re-applying a request after a partial
+			// send would re-run the stale-nonce rule against a nonce that send
+			// had already advanced, and the request would read as stale: the
+			// resources it still wanted would go unserved until the next signal.
+			send, err := s.applyRequest(log, received.req)
+			if err != nil {
+				return err
+			}
+			if !send {
+				continue
+			}
+			if err := state.await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
 				return err
 			}
 		}
@@ -394,23 +450,25 @@ type streamState struct {
 	lastNonce string
 }
 
-// handleRequest applies one DiscoveryRequest.
+// applyRequest applies one DiscoveryRequest to the stream's state and reports
+// whether anything should be sent for it. It reads no tier and sends nothing, so
+// it is never retried; the send that follows it is.
 //
 // The acknowledgement protocol is not optional politeness: getting it wrong
 // produces a stream that appears to work and then stops updating.
-func (s *streamState) handleRequest(ctx context.Context, log *logrus.Entry, req *discoveryv3.DiscoveryRequest) error {
+func (s *streamState) applyRequest(log *logrus.Entry, req *discoveryv3.DiscoveryRequest) (bool, error) {
 	// A rejection arrives as a request carrying an error detail. Logged and the
 	// stream continues: rolling back would re-send material Envoy just refused,
 	// and retrying would send the same bytes again.
 	if detail := req.GetErrorDetail(); detail != nil {
 		log.Warnf("Envoy rejected SDS version %s for %v: %s",
 			req.GetVersionInfo(), req.GetResourceNames(), detail.GetMessage())
-		return nil
+		return false, nil
 	}
 
 	requested, err := parseRequestedResources(req.GetResourceNames())
 	if err != nil {
-		return status.Error(codes.NotFound, err.Error())
+		return false, status.Error(codes.NotFound, err.Error())
 	}
 
 	// A request whose nonce is not the one on the most recent response is
@@ -426,12 +484,12 @@ func (s *streamState) handleRequest(ctx context.Context, log *logrus.Entry, req 
 	// answering a stale acknowledgement.
 	stale := req.GetResponseNonce() != "" && req.GetResponseNonce() != s.lastNonce
 	if stale && sameResources(s.named, requested) {
-		return nil
+		return false, nil
 	}
 
 	s.named = requested
 
-	return s.sendNamed(ctx)
+	return true, nil
 }
 
 // sendNamed re-reads and sends every resource Envoy has named, one response each.
@@ -558,9 +616,14 @@ func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity
 		if domain.IsZero() {
 			// The tier answers the zero trust domain until a bundle for the
 			// provider has been fetched, and a lease does not wait for one.
-			// Unavailable rather than blocking: Envoy retries on it, and a cold
-			// start is over in one fetch.
-			return nil, status.Errorf(codes.Unavailable,
+			//
+			// ErrBundleUnavailable rather than a status built here, because this
+			// is the cold start and it is exactly what a retry fixes: the lease
+			// taken above is what starts the fetch, so the stream blocks for one
+			// backoff and then serves. A hand-built Unavailable would carry no
+			// taxonomy member, so IsRetryable would read it as permanent and end
+			// the stream, and the metric would label it none.
+			return nil, pkgerrors.ErrBundleUnavailable.Wrapf(nil,
 				"the trust domain for %q is not known yet, because no trust bundle has been fetched for this workload's provider", r.name)
 		}
 	}

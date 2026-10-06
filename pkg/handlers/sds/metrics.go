@@ -2,12 +2,14 @@ package sds
 
 import (
 	"context"
-	"errors"
+	goerrors "errors"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 )
 
@@ -25,8 +27,8 @@ import (
 // caller alone, while SDS has to answer per resource name off a bidirectional
 // request stream.
 
-// rpcState is one RPC's obligation to the metrics: when it started, and whether it
-// has answered yet.
+// rpcState is one RPC's progress: when it started, whether it has answered, and
+// how long its next retry waits.
 type rpcState struct {
 	// rpc is the LabelRPC value, which is this RPC's constant.
 	rpc string
@@ -40,11 +42,73 @@ type rpcState struct {
 	// rotations is still one RPC, and counting each send would make the counter a
 	// response count on this interface and a stream count on the other.
 	answeredOnce bool
+
+	// backoff is this RPC's own retry pace and initial what it resets to after a
+	// step that succeeds. Each RPC carries its own copy, so one stream's failures
+	// never slow another's retries.
+	backoff wait.Backoff
+	initial wait.Backoff
 }
 
 // newRPCState starts the clock for one RPC.
-func newRPCState(rpc string) *rpcState {
-	return &rpcState{rpc: rpc, start: time.Now()}
+func newRPCState(rpc string, backoff wait.Backoff) *rpcState {
+	return &rpcState{rpc: rpc, start: time.Now(), backoff: backoff, initial: backoff}
+}
+
+// await runs op until it succeeds, fails in a way no retry can fix, or ctx ends.
+// Between retryable failures it waits out the backoff, cut short by a signal when
+// there is a channel to hear one on, since a signal means there is something new
+// to read and the wait has nothing left to wait for.
+//
+// Returned errors are the tiers' own, unmapped, for the entry point to record and
+// map. Deliberately the same shape as workloadapi's streamState.await: a
+// retryable failure blocks the stream and is retried here rather than ending it,
+// because the agent knows the failure is transient and the client only knows the
+// stream broke. Envoy is left to reconnect for the failures that are not
+// transient, which are the ones a retry cannot help.
+//
+// Note what this means for a caller: a retryable error never reaches it. The
+// stream stays open with no response until the tier comes good, the error turns
+// non-retryable, or the workload goes away.
+func (s *rpcState) await(ctx context.Context, signals <-chan struct{}, op func() error) error {
+	for {
+		err := op()
+		switch {
+		case ctx.Err() != nil:
+			// Checked before err, so a failure caused by the shutdown or the
+			// disconnect is reported as what it was rather than as a tier fault.
+			return ctx.Err()
+		case err == nil:
+			s.backoff = s.initial
+			return nil
+		case !errors.IsRetryable(err):
+			return err
+		}
+
+		delay := s.backoff.Step()
+		logger.FromContext(ctx).WithField("rpc", s.rpc).
+			Debugf("Retrying the SDS stream in %s: %v", delay, err)
+
+		if !s.wait(ctx, signals, delay) {
+			return ctx.Err()
+		}
+	}
+}
+
+// wait blocks for delay, or until a signal arrives, and reports false if ctx ended
+// first. The timer is stopped on every path, so nothing outlives the RPC.
+func (s *rpcState) wait(ctx context.Context, signals <-chan struct{}, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-signals:
+	case <-timer.C:
+	}
+
+	return true
 }
 
 // answered records the RPC's first answer and ignores every later one.
@@ -81,7 +145,7 @@ func (s *rpcState) failed(ctx context.Context, err error) error {
 	// agent failing to produce an answer. Upstream's stream engine returns one
 	// unwrapped and counts nothing, so this does too.
 	var send sendError
-	if errors.As(err, &send) {
+	if goerrors.As(err, &send) {
 		return send.err
 	}
 

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	pkgerrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
@@ -76,7 +77,22 @@ type harness struct {
 	// longer reads a session, so this is the only thing that names a provider.
 	providers *fake.ProviderArnResolver
 
+	// handler is kept so a test can shorten the retry backoff before it opens a
+	// stream. Each stream copies the handler's backoff when it starts, so a test
+	// that writes it after opening one would not affect that stream.
+	handler *Handler
+
 	client secretv3.SecretDiscoveryServiceClient
+}
+
+// testBackoff paces the retries in tests. Short enough that a test waiting out
+// one step does not dominate the suite, and still a real wait, so a retry loop
+// that spun would show up as a flake rather than passing.
+var testBackoff = wait.Backoff{
+	Duration: 5 * time.Millisecond,
+	Factor:   1,
+	Steps:    1 << 30,
+	Cap:      5 * time.Millisecond,
 }
 
 // newHarness serves a Handler over a socket in the test's temp dir, wired to
@@ -97,14 +113,15 @@ func newHarness(t *testing.T) *harness {
 	h.bundles.SetTrustDomain(testTrustDomainID, nil)
 	h.bundles.SetX509Bundles(bundleSet(t, map[string]testCertificate{testTrustDomain: anchor}), nil)
 
-	handler := New(Opts{
+	h.handler = New(Opts{
 		Attestor:                h.attestor,
 		Certs:                   h.certs,
 		Bundles:                 h.bundles,
 		StreamSecretsSubscriber: h.subs,
 	})
+	h.handler.backoff = testBackoff
 
-	h.client = serve(t, handler)
+	h.client = serve(t, h.handler)
 
 	return h
 }
@@ -410,11 +427,16 @@ func TestStreamSecrets_UnknownResourceNameIsNotFound(t *testing.T) {
 	g.Expect(status.Convert(err).Message()).To(ContainSubstring("unknown resource name"))
 }
 
-// TestStreamSecrets_ColdStartRootCAIsUnavailable pins the decided answer for the
-// window before any bundle has been fetched: the bundle tier reports an empty own
-// trust domain, a lease does not wait for a fetch, and Envoy retries on
-// Unavailable.
-func TestStreamSecrets_ColdStartRootCAIsUnavailable(t *testing.T) {
+// TestStreamSecrets_ColdStartBlocksThenServes pins the decided answer for the
+// window before any bundle has been fetched. The bundle tier reports a zero own
+// trust domain and a lease does not wait for a fetch, so the condition is real
+// and brief; the stream holds the request open across it rather than ending and
+// making Envoy come back, which is the agent-retries-first decision.
+//
+// The refusal underneath is ErrBundleUnavailable, which is what makes it
+// retryable. A status built in the handler would have no taxonomy member, so the
+// retry would read it as permanent.
+func TestStreamSecrets_ColdStartBlocksThenServes(t *testing.T) {
 	g := NewWithT(t)
 
 	h := newHarness(t)
@@ -423,9 +445,16 @@ func TestStreamSecrets_ColdStartRootCAIsUnavailable(t *testing.T) {
 	ts := h.open(t)
 	ts.request(t, []string{ResourceNameOwnValidationContext}, "")
 
-	err := ts.streamError(t)
-	g.Expect(status.Code(err)).To(Equal(codes.Unavailable))
-	g.Expect(status.Convert(err).Message()).To(ContainSubstring("no trust bundle has been fetched"))
+	// Nothing is served and, crucially, nothing is refused: no Unavailable
+	// reaches Envoy for a condition the agent is about to resolve itself.
+	ts.expectNoResponse(t)
+
+	// The first fetch lands, which is what the lease started.
+	h.bundles.SetTrustDomain(testTrustDomainID, nil)
+
+	served := secretIn(t, ts.nextResponse(t))
+	g.Expect(served.GetName()).To(Equal(ResourceNameOwnValidationContext))
+	g.Expect(served.GetValidationContext()).ToNot(BeNil())
 }
 
 // TestStreamSecrets_NamedTrustDomain covers the spiffe://<trust-domain> form,
@@ -1081,4 +1110,148 @@ func serveWithoutConnCredentials(t *testing.T) secretv3.SecretDiscoveryServiceCl
 	t.Cleanup(func() { _ = conn.Close() })
 
 	return secretv3.NewSecretDiscoveryServiceClient(conn)
+}
+
+// TestStreamSecrets_RetriesARetryableTierFailure is the decision in one test: a
+// transient tier failure is waited out inside the agent, not handed to Envoy. The
+// agent knows the failure is transient, and all Envoy would learn is that its
+// stream broke.
+func TestStreamSecrets_RetriesARetryableTierFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+
+	// Fails the first two reads, then succeeds, as an STS blip would.
+	svid := newTestSVID(t, "spiffe://example.org/workload")
+	var mu sync.Mutex
+	attempts := 0
+	h.certs.Func = func(context.Context, *workloadidentity.Workload) ([]*x509svid.SVID, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		attempts++
+		if attempts <= 2 {
+			return nil, pkgerrors.ErrIssuanceFailed
+		}
+		return []*x509svid.SVID{svid}, nil
+	}
+
+	ts := h.open(t)
+	ts.request(t, []string{ResourceNameTLSCertificate}, "")
+
+	// The stream stays open across the failures and then answers.
+	served := secretIn(t, ts.nextResponse(t))
+	g.Expect(served.GetName()).To(Equal(ResourceNameTLSCertificate))
+	g.Expect(served.GetTlsCertificate()).ToNot(BeNil())
+
+	mu.Lock()
+	defer mu.Unlock()
+	g.Expect(attempts).To(BeNumerically(">=", 3), "the read should have been retried, not abandoned")
+}
+
+// TestStreamSecrets_ThrottledIssuanceIsRetriedNotReturned covers the throttling
+// case specifically, because it is the one the taxonomy keeps apart from a plain
+// failure. Retried here rather than returned as ResourceExhausted, which is the
+// cost of the agent-retries-first decision and is recorded as such.
+func TestStreamSecrets_ThrottledIssuanceIsRetriedNotReturned(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+
+	svid := newTestSVID(t, "spiffe://example.org/workload")
+	var mu sync.Mutex
+	throttled := true
+	h.certs.Func = func(context.Context, *workloadidentity.Workload) ([]*x509svid.SVID, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if throttled {
+			throttled = false
+			return nil, pkgerrors.ErrIssuanceThrottled
+		}
+		return []*x509svid.SVID{svid}, nil
+	}
+
+	ts := h.open(t)
+	ts.request(t, []string{ResourceNameTLSCertificate}, "")
+
+	g.Expect(secretIn(t, ts.nextResponse(t)).GetName()).To(Equal(ResourceNameTLSCertificate))
+}
+
+// TestStreamSecrets_NonRetryableTierFailureEndsTheStream is the other half: a
+// failure no retry can fix is handed to Envoy immediately, which is what leaves
+// it free to reconnect or to surface the condition. Blocking on one of these
+// would be a stream that never answers and never says why.
+func TestStreamSecrets_NonRetryableTierFailureEndsTheStream(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+	h.certs.SetResult(nil, pkgerrors.ErrSessionRefused)
+
+	ts := h.open(t)
+	ts.request(t, []string{ResourceNameTLSCertificate}, "")
+
+	err := ts.streamError(t)
+	g.Expect(status.Code(err)).To(Equal(codes.PermissionDenied))
+}
+
+// TestStreamSecrets_RetryEndsWhenTheClientLeaves pins the bound on a retry loop
+// that never succeeds. The retry is unbounded by design, as workloadapi's is, so
+// the only thing that stops it is the workload going away, and it has to stop
+// cleanly: the lease and the subscription both have to come back.
+func TestStreamSecrets_RetryEndsWhenTheClientLeaves(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+	// Never comes good.
+	h.certs.SetResult(nil, pkgerrors.ErrIssuanceFailed)
+
+	ts := h.open(t)
+	ts.request(t, []string{ResourceNameTLSCertificate}, "")
+
+	// Retrying, so nothing is served and nothing is refused.
+	ts.expectNoResponse(t)
+	g.Expect(h.bundles.LiveLeases()).To(Equal(1))
+
+	ts.cancel()
+
+	g.Eventually(h.bundles.Released).Should(Equal(1))
+	g.Eventually(h.subs.LiveSubscriptions).Should(BeZero())
+}
+
+// TestStreamSecrets_RetryIsCutShortByASignal pins that a stream parked between
+// retries does not sit out its backoff when there is news. A rotation published
+// while it waits should be picked up at once, since the wait had nothing left to
+// wait for.
+func TestStreamSecrets_RetryIsCutShortByASignal(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+	// A long backoff, so a test that passes can only have been woken by the
+	// signal rather than by the timer.
+	h.handler.backoff = wait.Backoff{Duration: time.Hour, Factor: 1, Steps: 1 << 30, Cap: time.Hour}
+
+	svid := newTestSVID(t, "spiffe://example.org/workload")
+	var mu sync.Mutex
+	failing := true
+	h.certs.Func = func(context.Context, *workloadidentity.Workload) ([]*x509svid.SVID, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if failing {
+			return nil, pkgerrors.ErrIssuanceFailed
+		}
+		return []*x509svid.SVID{svid}, nil
+	}
+
+	ts := h.open(t)
+	ts.request(t, []string{ResourceNameTLSCertificate}, "")
+	ts.expectNoResponse(t)
+
+	// The tier comes good and says so, while the stream is parked on an hour.
+	mu.Lock()
+	failing = false
+	mu.Unlock()
+	g.Eventually(func() int {
+		return h.subs.NotifyWorkload("pod-one")
+	}).Should(Equal(1))
+
+	g.Expect(secretIn(t, ts.nextResponse(t)).GetName()).To(Equal(ResourceNameTLSCertificate))
 }
