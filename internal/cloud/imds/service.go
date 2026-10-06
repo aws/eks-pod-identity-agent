@@ -216,10 +216,12 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	}
 
 	newMap := make(map[string]string)
+	anyFailed := false
 	for _, ns := range namespaces {
 		info, err := s.readNamespaceInfo(ctx, ns)
 		if err != nil {
-			log.WithField("namespace", ns).Warnf("Failed to read namespace info, skipping: %v", err)
+			log.WithField("namespace", ns).Warnf("Failed to read namespace info, retaining known pods for it: %v", err)
+			anyFailed = true
 			continue
 		}
 		for podUID, code := range info.PodCredentials {
@@ -232,9 +234,30 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 		}
 	}
 
+	// If unable to read a namespace, keep pods that weren't found in IMDS. This
+	// prevents failed namespace reads from clearing the pod from namespaceMapping,
+	// which would evict the pod from the cache. Instead, the background refresh
+	// process will try again, and in the meantime failures to get creds from IMDS
+	// will fall back to eksauth. Note that this may preserve mappings for deleted pods.
+	if anyFailed {
+		currentMap := s.loadMapping()
+		carryForwardEntries(newMap, currentMap)
+	}
+
 	s.storeMapping(newMap)
-	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces", len(newMap), len(namespaces))
+	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces (completeScan=%v)",
+		len(newMap), len(namespaces), !anyFailed)
 	return nil
+}
+
+// carryForwardEntries carries forward previous-map entries into newMap
+func carryForwardEntries(newMap, previousMap map[string]string) {
+	for podUID, oldNS := range previousMap {
+		if _, seen := newMap[podUID]; seen {
+			continue
+		}
+		newMap[podUID] = oldNS
+	}
 }
 
 // maxMetadataBytes bounds a single IMDS response.

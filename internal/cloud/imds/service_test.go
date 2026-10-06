@@ -312,6 +312,7 @@ func TestNamespaceMapping_Build(t *testing.T) {
 		name        string
 		rootListing string                                    // newline-delimited IMDS root listing response
 		infoByNS    map[string]func() (*http.Response, error) // namespace suffix → HTTP response for its /info file
+		prevMapping map[string]string                         // podUID → namespace map seeded before the build (for salvage cases)
 		wantPods    int                                       // expected total entries in podUID → namespace map
 		wantLookups map[string]string                         // podUID → namespace pairs that must exist
 		wantMissing []string                                  // podUIDs that must NOT be in the map
@@ -328,7 +329,9 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			wantMissing: []string{"pod-missing"},
 		},
 		{
-			name:        "partial failure skips failed namespace",
+			// No previous map, so there is nothing to salvage: a failed namespace
+			// simply contributes no pods this cycle.
+			name:        "partial failure with no previous map drops failed namespace",
 			rootListing: "iam-eks-1\niam-eks-2",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
@@ -336,6 +339,63 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			},
 			wantPods:    1,
 			wantLookups: map[string]string{"pod-a": "1"},
+		},
+		{
+			// pod-c lives in ns2, ns2 read fails. ns2's pods are salvaged from
+			// the previous map so a transient failure does not look like removal.
+			name:        "partial failure salvages pods from failed namespace",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a", "pod-b")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(500, "internal error"), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "1", "pod-b": "1", "pod-c": "2"},
+			wantPods:    3,
+			wantLookups: map[string]string{"pod-a": "1", "pod-b": "1", "pod-c": "2"},
+		},
+		{
+			// pod-a reshuffled ns2→ns1; ns2 (its OLD home) fails. ns1 reads OK
+			// and reports pod-a, so the current-cycle namespace (1) wins over the
+			// salvaged previous namespace (2).
+			name:        "reshuffle beats salvage when new namespace reads successfully",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "2"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-a": "1"},
+		},
+		{
+			// pod-a reshuffled ns2→ns1; ns1 (its NEW home) fails. ns2 reads OK
+			// and no longer lists pod-a. The agent cannot tell relocation from
+			// removal while ns1 is dark, so on a partial scan we retain pod-a with
+			// its stale previous namespace (2) rather than evict a possibly-live
+			// pod. The stale home self-heals on the next clean scan.
+			name:        "partial failure retains pod with stale namespace (reshuffle into failed ns)",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
+				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON()), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "2"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-a": "2"},
+		},
+		{
+			// Complete scan (no namespace failed): a pod absent from the previous
+			// map is a confirmed removal and is NOT salvaged, so it is evicted.
+			name:        "complete scan evicts removed pod",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON()), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "1", "pod-gone": "2"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-a": "1"},
+			wantMissing: []string{"pod-gone"},
 		},
 		{
 			name:        "non-sequential namespaces",
@@ -397,6 +457,12 @@ func TestNamespaceMapping_Build(t *testing.T) {
 				}
 				return httpResponse(404, ""), nil
 			})
+
+			// Seed the previous map so salvage-on-partial-scan cases can exercise
+			// retention of pods from namespaces that fail to read this cycle.
+			if tt.prevMapping != nil {
+				svc.storeMapping(tt.prevMapping)
+			}
 
 			// Build the mapping: discover namespaces → read info files → populate podUID map.
 			require.NoError(t, svc.buildNamespaceMapping(testCtx()))
