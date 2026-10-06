@@ -108,6 +108,21 @@ func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsSer
 // correct when it is sent and carries nothing that says when it stops being
 // correct, so polling it is not a substitute for the stream.
 func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
+	state := newRPCState(workloadidentity.RPCFetchSecrets)
+
+	resp, err := h.fetchSecrets(ctx, req)
+	if err != nil {
+		return nil, state.failed(ctx, err)
+	}
+	state.answered()
+
+	return resp, nil
+}
+
+// fetchSecrets is FetchSecrets without the metrics, so every path out of it
+// carries the error the tiers raised rather than a status built from it. The
+// caller above records it and maps it exactly once.
+func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
 	log := logger.FromContext(ctx)
 
 	caller, err := h.caller(ctx)
@@ -126,7 +141,7 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 	// it would answer the same way forever.
 	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
 	if err != nil {
-		return nil, handlers.StatusError(err)
+		return nil, err
 	}
 	defer releaseLease()
 
@@ -147,7 +162,7 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 
 		packed, err := anypb.New(secret)
 		if err != nil {
-			return nil, handlers.StatusError(fmt.Errorf("packing the secret %q: %w", secret.GetName(), err))
+			return nil, fmt.Errorf("packing the secret %q: %w", secret.GetName(), err)
 		}
 
 		resources = append(resources, packed)
@@ -180,6 +195,17 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 // the stream with the code the Workload API uses for it.
 func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecretsServer) error {
 	ctx := stream.Context()
+	state := newRPCState(workloadidentity.RPCStreamSecrets)
+
+	// The loop only ever exits with an error: a client disconnect, a server
+	// shutdown and a refusal all arrive as one, so there is no success return to
+	// account for here.
+	return state.failed(ctx, h.streamSecrets(ctx, stream, state))
+}
+
+// streamSecrets is StreamSecrets without the metrics, returning the tiers' own
+// errors for the caller above to record and map once.
+func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDiscoveryService_StreamSecretsServer, state *rpcState) error {
 	log := logger.FromContext(ctx)
 
 	caller, err := h.caller(ctx)
@@ -194,7 +220,7 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 	// the next rotation.
 	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
 	if err != nil {
-		return handlers.StatusError(err)
+		return err
 	}
 	defer releaseLease()
 
@@ -208,7 +234,7 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 	// authorities, so a JWT key roll must not wake this stream at all.
 	signals, releaseSub, err := h.opts.StreamSecretsSubscriber.SubscribeToWorkloadMaterial(ctx, caller)
 	if err != nil {
-		return handlers.StatusError(err)
+		return err
 	}
 	defer releaseSub()
 
@@ -216,6 +242,7 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 		handler: h,
 		stream:  stream,
 		caller:  caller,
+		rpc:     state,
 	}
 
 	requests := recvLoop(ctx, stream)
@@ -269,12 +296,23 @@ func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, error
 		// The server was built without the conn-carrying credentials, so nobody
 		// on this socket can be attested. A wiring bug, but refusing is still
 		// the only safe answer.
-		return nil, status.Error(codes.PermissionDenied, "the caller's connection is not available, so it cannot be attested")
+		//
+		// Raised as ErrUnattestable rather than as a status built here, which is
+		// what workloadapi's attest does for the same condition: it keeps the
+		// code the shared mapping's to decide, and gives the metric a real error
+		// label instead of none.
+		return nil, pkgerrors.ErrUnattestable.Wrapf(nil,
+			"the caller's connection is not available, so it cannot be attested")
 	}
 
 	caller, err := h.opts.Attestor.Attest(ctx, conn)
 	if err != nil {
-		return nil, handlers.StatusError(err)
+		return nil, err
+	}
+	if caller == nil {
+		// Nothing downstream nil-checks the workload, and a tier handed a nil
+		// one would panic the stream rather than refuse it.
+		return nil, pkgerrors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
 	}
 
 	return caller, nil
@@ -324,6 +362,11 @@ type streamState struct {
 	handler *Handler
 	stream  secretv3.SecretDiscoveryService_StreamSecretsServer
 	caller  *workloadidentity.Workload
+
+	// rpc is the stream's metrics state, so the first response can be recorded
+	// where it is sent. Shared with the method that will end the stream, which is
+	// what keeps one stream to one observation.
+	rpc *rpcState
 
 	// named is what Envoy is currently subscribed to, in request order, rebuilt
 	// from each request it sends. State-of-the-world means a request carries the
@@ -427,7 +470,7 @@ func (s *streamState) sendNamed(ctx context.Context) error {
 func (s *streamState) send(secret *tlsv3.Secret) error {
 	packed, err := anypb.New(secret)
 	if err != nil {
-		return handlers.StatusError(fmt.Errorf("packing the secret %q: %w", secret.GetName(), err))
+		return fmt.Errorf("packing the secret %q: %w", secret.GetName(), err)
 	}
 
 	s.sent++
@@ -441,9 +484,14 @@ func (s *streamState) send(secret *tlsv3.Secret) error {
 		Nonce:       nonce,
 	}); err != nil {
 		// A send failure is a broken or closed stream, which already carries its
-		// own status. Returning it unwrapped keeps a disconnect reported as such.
-		return err
+		// own status. Marked as a send so the metrics leave it uncounted and
+		// return it unwrapped, which keeps a disconnect reported as such.
+		return sendError{err: err}
 	}
+
+	// The stream has answered. Only the first one counts, so a long-lived stream
+	// pushing rotations stays one RPC.
+	s.rpc.answered()
 
 	if s.lastSent == nil {
 		s.lastSent = make(map[string]*tlsv3.Secret, len(s.named))
@@ -460,30 +508,22 @@ func (h *Handler) buildSecret(ctx context.Context, caller *workloadidentity.Work
 	case kindTLSCertificate:
 		svids, err := h.opts.Certs.X509SVIDs(ctx, caller)
 		if err != nil {
-			return nil, handlers.StatusError(err)
+			return nil, err
 		}
 		if len(svids) == 0 {
 			// The tier promises exactly one, so an empty slice is a tier defect
 			// rather than a caller problem.
-			return nil, handlers.StatusError(pkgerrors.ErrIssuanceFailed.Wrapf(nil,
-				"the certificate source returned no X.509-SVID for %q", r.name))
+			return nil, pkgerrors.ErrIssuanceFailed.Wrapf(nil,
+				"the certificate source returned no X.509-SVID for %q", r.name)
 		}
-		secret, err := tlsCertificateSecret(r.name, svids[0])
-		if err != nil {
-			return nil, handlers.StatusError(err)
-		}
-		return secret, nil
+		return tlsCertificateSecret(r.name, svids[0])
 
 	case kindValidationContext:
 		bundle, err := h.validationBundle(ctx, caller, r)
 		if err != nil {
 			return nil, err
 		}
-		secret, err := validationContextSecret(r.name, bundle)
-		if err != nil {
-			return nil, handlers.StatusError(err)
-		}
-		return secret, nil
+		return validationContextSecret(r.name, bundle)
 
 	default:
 		// Unreachable: parseResourceName returns one of the two kinds or an
@@ -497,7 +537,7 @@ func (h *Handler) buildSecret(ctx context.Context, caller *workloadidentity.Work
 func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity.Workload, r resource) (*x509bundle.Bundle, error) {
 	bundles, err := h.opts.Bundles.X509Bundles(ctx, caller)
 	if err != nil {
-		return nil, handlers.StatusError(err)
+		return nil, err
 	}
 	if bundles == nil {
 		// A tier answering with neither a set nor an error, which the lookup
@@ -513,7 +553,7 @@ func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity
 		// knows.
 		domain, err = h.opts.Bundles.OwnTrustDomain(ctx, caller)
 		if err != nil {
-			return nil, handlers.StatusError(err)
+			return nil, err
 		}
 		if domain.IsZero() {
 			// The tier answers the zero trust domain until a bundle for the
