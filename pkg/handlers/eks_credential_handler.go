@@ -83,19 +83,6 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 
 	var authSvc credentials.CredentialRetriever = credentialsRetriever
 
-	// IMDS credential discovery is feature-flagged, default disabled
-	if opts.EnableIMDS {
-		// Check if IMDS is present on the node
-		if imdscloud.ProbeIMDS(ctx, opts.Cfg) {
-			// If so, configure the agent's credential delegates to be a chain of [imds, eksAuth]
-			log.Info("IMDS available: using [imds, eksauth] chained retriever")
-			imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
-			credentialsRetriever = credsretriever.NewChainedRetriever(imdsSvc, credentialsRetriever)
-		} else {
-			log.Info("IMDS not available on node: using eksauth-only retriever")
-		}
-	}
-
 	tv, err := validation.NewTokenValidator(ctx)
 	if err != nil {
 		log.Infof("failed to initialize token validator: %v", err)
@@ -104,18 +91,23 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	return newCredentialManager(opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+	return newCredentialManager(ctx, opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
 }
 
 // newCredentialManager is NewCredentialManager over delegates it's given: general
 // serves the handler without a cache and refreshes the cache, and authSvc serves
 // misses. cacheOpts carries the cache options only tests set.
-func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
+//
+// The [imds, eksauth] chain is constructed only when caching is enabled. The IMDS
+// delegate cannot validate tokens, and without caching, the agent doesn't know
+// which tokens are valid. So, without caching, only eksauth must be used.
+func newCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
 	general, authSvc credentials.CredentialRetriever, tv *validation.TokenValidator) CredentialManager {
 	manager := CredentialManager{Retriever: general, EKSAuth: authSvc}
 	if opts.CredentialRenewal == 0 || opts.MaxCacheSize == 0 {
 		return manager
 	}
+	general = buildCredentialRetriever(ctx, opts, general)
 	cacheOpts.Delegate = general
 	cacheOpts.RenewalTtl = opts.CredentialRenewal
 	cacheOpts.MaxSize = opts.MaxCacheSize
@@ -131,6 +123,23 @@ func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opt
 	}
 	manager.Retriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
 	return manager
+}
+
+// buildCredentialRetriever returns a [imds, eksauth] chained retriever when
+// IMDS credential discovery is enabled and IMDS is present on the node.
+// Otherwise it returns the given delegate unchanged.
+func buildCredentialRetriever(ctx context.Context, opts EksCredentialHandlerOpts, delegate credentials.CredentialRetriever) credentials.CredentialRetriever {
+	log := logger.FromContext(ctx)
+	if !opts.EnableIMDS {
+		return delegate
+	}
+	if !imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+		log.Info("IMDS not available on node: using eksauth-only retriever")
+		return delegate
+	}
+	log.Info("IMDS available: using [imds, eksauth] chained retriever")
+	imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
+	return credsretriever.NewChainedRetriever(imdsSvc, delegate)
 }
 
 func (h *EksCredentialHandler) ConfigureHandler(register func(pattern string, handlerFunc http.HandlerFunc)) {
