@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 )
 
 const (
@@ -138,7 +140,8 @@ func (s *Server) Close() {
 // Config is the agent's AWS configuration pointed at the fake: Region, the
 // static Node* credentials, and BaseEndpoint set to URL. Its retryer is
 // aws.NopRetryer, so the caller sees the fake's failure after one attempt. A
-// test that wants the SDK's retries sets Retryer on the returned value.
+// test that wants the SDK's retries sets Retryer on the returned value. IMDS is
+// off, so eksauth.NewService's zone lookup fails at once whatever the host.
 func (s *Server) Config() aws.Config {
 	return aws.Config{
 		Region: Region,
@@ -150,8 +153,9 @@ func (s *Server) Config() aws.Config {
 				Source:          "eksauthtest",
 			}, nil
 		}),
-		BaseEndpoint: aws.String(s.URL),
-		Retryer:      func() aws.Retryer { return aws.NopRetryer{} },
+		BaseEndpoint:  aws.String(s.URL),
+		Retryer:       func() aws.Retryer { return aws.NopRetryer{} },
+		ConfigSources: []interface{}{config.LoadOptions{EC2IMDSClientEnableState: imds.ClientDisabled}},
 	}
 }
 

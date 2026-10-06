@@ -35,6 +35,7 @@ var (
 	maxCacheSize            int
 	refreshQps              int
 	rotateCredentials       bool
+	enableIMDSCredentials   bool
 
 	// Workload identity tunables. The values the workload identity path shares
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
@@ -155,13 +156,14 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	// listen on all bindHosts
 	for i, ip := range bindHosts {
 		addr := fmt.Sprintf("%s:%d", ip, serverPort)
-		servers[i] = server.NewEksCredentialServer(addr, handlers.EksCredentialHandlerOpts{
+		servers[i] = server.NewEksCredentialServer(ctx, addr, handlers.EksCredentialHandlerOpts{
 			Cfg:                cfg,
 			ClusterName:        clusterName,
 			CredentialRenewal:  maxCredentialRenewal,
 			MaxCacheSize:       maxCacheSize,
 			RefreshQPS:         refreshQps,
 			EndpointOverridden: overrideEksAuthEndpoint != "",
+			EnableIMDS:         enableIMDSCredentials,
 		})
 	}
 
@@ -238,6 +240,8 @@ func init() {
 		[]string{configuration.DefaultIpv4TargetHost, "[" + configuration.DefaultIpv6TargetHost + "]"}, "Hosts to bind server to")
 	serverCmd.Flags().BoolVar(&rotateCredentials, "rotate-credentials", false, "Enable credentials rotation from shared credentials file")
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
+	serverCmd.Flags().BoolVar(&enableIMDSCredentials, "enable-imds-credentials", false,
+		"Enable consuming credentials from IMDS when available on the node")
 
 	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, true,
 		"Serve SPIFFE workload identity on its socket. Set false to turn it off, and boot needs neither the API server nor the kubelet's kubeconfig")

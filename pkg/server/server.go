@@ -58,9 +58,9 @@ func NewProbeServer(addr string, hosts []string, port uint16) *Server {
 	return srv
 }
 
-func NewEksCredentialServer(addr string, opts handlers.EksCredentialHandlerOpts) *Server {
+func NewEksCredentialServer(ctx context.Context, addr string, opts handlers.EksCredentialHandlerOpts) *Server {
 	srv := newBaseServer(addr)
-	srv.configurer = handlers.NewEksCredentialHandler(opts)
+	srv.configurer = handlers.NewEksCredentialHandler(ctx, opts)
 	return srv
 }
 

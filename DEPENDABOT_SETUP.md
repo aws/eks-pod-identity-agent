@@ -84,7 +84,7 @@ Based on the repository analysis:
 
 ### Docker Images (from `Dockerfile`)
 - `public.ecr.aws/eks-distro-build-tooling/golang:1.26.1`
-- `public.ecr.aws/eks-distro/kubernetes/go-runner:v0.18.0-eks-1-34-latest`
+- `public.ecr.aws/eks-distro-build-tooling/go-runner:v0.18.0-go-1.26-latest.al23`
 - `public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base:latest-al23`
 
 ## Alignment with Repository Practices

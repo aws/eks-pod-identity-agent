@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/aws/aws-sdk-go-v2/service/eksauth"
 	"github.com/sirupsen/logrus"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 )
@@ -18,15 +19,21 @@ import (
 //go:generate mockgen.sh eksauth $GOFILE
 
 type Iface interface {
+	// GetIamCredentials fetches IAM credentials for a pod from EKS Auth.
 	GetIamCredentials(ctx context.Context,
 		request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error)
+	// String returns the delegate's name for logging and metrics.
+	String() string
+	// IsIrrecoverable reports whether an error means the credential is gone/invalid
+	IsIrrecoverable(err error) (string, bool)
 }
 
 type service struct {
 	eksAuthService *eksauth.Client
+	nodeMetadata   *imds.NodeMetadata
 }
 
-func NewService(cfg aws.Config) Iface {
+func NewService(ctx context.Context, cfg aws.Config) Iface {
 	// Configure HTTP client with custom timeouts
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -41,13 +48,16 @@ func NewService(cfg aws.Config) Iface {
 	eksAuthService := eksauth.NewFromConfig(cfg)
 	return &service{
 		eksAuthService: eksAuthService,
+		nodeMetadata:   imds.FetchNodeMetadata(ctx, cfg),
 	}
 }
 
-type responseMetadata string
+// String returns the delegate's name for logging and metrics.
+func (s *service) String() string { return "eks-auth" }
 
-func (r responseMetadata) AssociationId() string {
-	return string(r)
+// IsIrrecoverable classifies an EKS Auth API error as irrecoverable or transient.
+func (s *service) IsIrrecoverable(err error) (string, bool) {
+	return IsIrrecoverableApiError(err)
 }
 
 func (s *service) GetIamCredentials(ctx context.Context,
@@ -56,10 +66,17 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	log.Info("Calling EKS Auth to fetch credentials")
 
 	startRequestTime := time.Now()
-	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, &eksauth.AssumeRoleForPodIdentityInput{
+
+	input := &eksauth.AssumeRoleForPodIdentityInput{
 		ClusterName: aws.String(request.ClusterName),
 		Token:       aws.String(request.ServiceAccountToken),
-	}, withWorkloadIdentityProviderArn)
+	}
+
+	if s.nodeMetadata != nil {
+		input.Zone = aws.String(s.nodeMetadata.Zone)
+	}
+
+	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, input, withWorkloadIdentityProviderArn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to fetch credentials from EKS Auth: %w", err)
 	}
@@ -90,11 +107,14 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	providerArn, _ := creds.ResultMetadata.Get(workloadIdentityProviderArnKey{}).(string)
 
 	return &credentials.EksCredentialsResponse{
-		AccessKeyId:     *creds.Credentials.AccessKeyId,
-		SecretAccessKey: *creds.Credentials.SecretAccessKey,
-		Token:           *creds.Credentials.SessionToken,
-		AccountId:       parsedArn.AccountID,
-		Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
-		ProviderArn:     providerArn,
-	}, responseMetadata(*creds.PodIdentityAssociation.AssociationId), nil
+			AccessKeyId:     *creds.Credentials.AccessKeyId,
+			SecretAccessKey: *creds.Credentials.SecretAccessKey,
+			Token:           *creds.Credentials.SessionToken,
+			AccountId:       parsedArn.AccountID,
+			Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
+			ProviderArn:     providerArn,
+		}, credentials.CredentialMetadata{
+			Association: *creds.PodIdentityAssociation.AssociationId,
+			CredSource:  credentials.SourceAuthService,
+		}, nil
 }
