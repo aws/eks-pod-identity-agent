@@ -51,7 +51,7 @@ var (
 func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts) *EksCredentialHandler {
 	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
 	log := logger.FromContext(ctx)
-	credentialsRetriever := eksauth.NewService(context.Background(), opts.Cfg)
+	credentialsRetriever := eksauth.NewService(ctx, opts.Cfg, opts.EnableIMDS)
 
 	var authSvc credentials.CredentialRetriever = credentialsRetriever
 
