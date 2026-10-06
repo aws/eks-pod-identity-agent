@@ -9,22 +9,14 @@ import (
 )
 
 // Attest resolves the caller from the connection the server's transport
-// credentials put in ctx, the only route to it. A missing connection is a wiring
-// bug, and refusing is still the only safe answer.
+// credentials put in ctx, the only route to it.
 //
-// It lives here, beside the status mapping, because both interfaces on the
-// workload identity socket have to attest the same way. A workload refused on the
-// SPIFFE Workload API and served over Envoy SDS, or refused by each for different
-// reasons, is the customer's to reverse engineer. One function makes that
-// agreement structural rather than maintained by hand: two identical copies would
-// pass their own packages' tests while drifting apart.
+// Shared by both interfaces on the socket, because a workload refused on one and
+// served on the other is the customer's to reverse engineer. Two identical copies
+// would pass their own packages' tests while drifting apart.
 //
-// The failures are raised as ErrUnattestable rather than as a status built here,
-// which keeps the gRPC code StatusCode's to decide and gives the RPC metrics a
-// real error label instead of none.
-//
-// The attestor is a parameter rather than read off a handler, which is the only
-// reason this can be shared at all.
+// Failures are ErrUnattestable rather than a status built here, which leaves the
+// gRPC code to StatusCode and gives the RPC metrics a real error label.
 func Attest(ctx context.Context, attestor workloadidentity.Attestor) (*workloadidentity.Workload, error) {
 	conn, ok := grpcserver.ConnFromContext(ctx)
 	if !ok {

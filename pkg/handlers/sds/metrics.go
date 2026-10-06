@@ -13,19 +13,16 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 )
 
-// This file is how SDS reports on the RPC metrics, and it deliberately accounts
-// the same way workloadapi's stream engine does: one RPC counts once, at the
-// answer it gave or at the error that ended it before one, and a caller that left
-// counts neither. The two interfaces share the collectors in
-// pkg/handlers/rpc_metrics.go, so a series that meant "per stream" on one
-// interface and "per response" on the other would make the shared metric
-// unreadable.
+// RPC metrics and retry for the SDS handlers, accounted the same way
+// workloadapi's stream engine does: one RPC counts once, at the answer it gave or
+// at the error that ended it before one, and a caller that left counts neither.
+// Both interfaces share the collectors in pkg/handlers/rpc_metrics.go, so a
+// series meaning "per stream" on one and "per response" on the other would make
+// the metric unreadable.
 //
-// The accounting is duplicated rather than imported because workloadapi's
-// streamState is unexported and bound to that handler, and because SDS cannot use
-// its stream engine at all: that engine builds one response per wake from the
-// caller alone, while SDS has to answer per resource name off a bidirectional
-// request stream.
+// Duplicated rather than imported: workloadapi's streamState is unexported, and
+// SDS cannot use its stream engine anyway, which builds one response per wake and
+// never reads from the client.
 
 // rpcState is one RPC's progress: when it started, whether it has answered, and
 // how long its next retry waits.
@@ -56,18 +53,15 @@ func newRPCState(rpc string, backoff wait.Backoff) *rpcState {
 }
 
 // await runs op until it succeeds, fails in a way no retry can fix, or ctx ends.
-// Between retryable failures it waits out the backoff, cut short by a signal when
-// there is a channel to hear one on, since a signal means there is something new
-// to read and the wait has nothing left to wait for.
+// Between retryable failures it waits out the backoff, cut short by a signal,
+// which means there is something new to read anyway. Returned errors are the
+// tiers' own, unmapped, for the entry point to record and map.
 //
-// Returned errors are the tiers' own, unmapped, for the entry point to record and
-// map. Deliberately the same shape as workloadapi's streamState.await: a
-// retryable failure blocks the stream and is retried here rather than ending it,
-// because the agent knows the failure is transient and the client only knows the
-// stream broke. Envoy is left to reconnect for the failures that are not
-// transient, which are the ones a retry cannot help.
+// Same shape as workloadapi's streamState.await: the agent knows a failure is
+// transient and the client would only learn its stream broke, so a retryable one
+// blocks here. Envoy reconnects for the rest.
 //
-// Note what this means for a caller: a retryable error never reaches it. The
+// Consequence worth knowing: a retryable error never reaches the caller. The
 // stream stays open with no response until the tier comes good, the error turns
 // non-retryable, or the workload goes away.
 func (s *rpcState) await(ctx context.Context, signals <-chan struct{}, op func() error) error {

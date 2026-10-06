@@ -115,18 +115,15 @@ func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsSer
 // FetchSecrets serves the same secrets StreamSecrets does, once, with nothing
 // subscribed behind them.
 //
-// No Envoy sidecar reaches it. Envoy's gRPC subscription machinery is
-// stream-only, and the unary method exists to carry the REST binding
-// (POST /v3/discovery:secrets), which is HTTP/JSON and never arrives on this
-// gRPC socket. It is served for the callers that are not Envoy: an operator
-// asking what a pod would be handed, a readiness probe, a control plane library
-// doing a one-shot read. Serving it also removes a trap, since a method
-// answering Unimplemented while the stream beside it serves identical material
-// reads as a defect to anyone writing tooling against the socket.
+// No Envoy sidecar reaches it: Envoy's subscription machinery is stream-only, and
+// the unary method carries the REST binding (POST /v3/discovery:secrets), which
+// never arrives on a gRPC socket. Served for the callers that are not Envoy, such
+// as an operator asking what a pod would be handed or a one-shot library read,
+// and so that a method answering Unimplemented beside a stream serving identical
+// material does not read as a defect.
 //
-// A caller that needs rotation must use StreamSecrets. What this returns is
-// correct when it is sent and carries nothing that says when it stops being
-// correct, so polling it is not a substitute for the stream.
+// It carries nothing that says when its answer stops being correct, so polling it
+// is not a substitute for StreamSecrets.
 func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
 	state := newRPCState(workloadidentity.RPCFetchSecrets, h.backoff)
 
@@ -293,18 +290,14 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 			return handlers.StatusErrorFromContext(ctx)
 
 		case <-signals:
-			// The channel arrives primed, so the first signal may land before
-			// Envoy has named anything. Nothing is subscribed yet in that case
-			// and this reads nothing, which is intended: the first request is
-			// answered from a fresh read of what it names.
+			// The channel arrives primed, so the first signal can land before
+			// Envoy has named anything, and then this reads nothing. Intended:
+			// the first request is answered from a fresh read of what it names.
 			//
-			// Each pass sends the state it reads now rather than anything the
-			// signal carried, so a slow stream is never handed a superseded
-			// credential.
-			//
-			// Awaited, and safe to re-run: a retried pass re-reads every named
-			// resource and the dedupe suppresses the ones an earlier attempt
-			// already sent unchanged.
+			// Each pass sends what it reads now, not what the signal carried, so
+			// a slow stream is never handed a superseded credential. Safe to
+			// retry for the same reason: the dedupe suppresses whatever an
+			// earlier attempt already sent unchanged.
 			if err := state.await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
 				return err
 			}
@@ -447,17 +440,13 @@ func (s *streamState) applyRequest(log *logrus.Entry, req *discoveryv3.Discovery
 		return false, status.Error(codes.NotFound, err.Error())
 	}
 
-	// A request whose nonce is not the one on the most recent response is
-	// answering a superseded response. It is ignored rather than treated as a new
-	// subscription, which is what keeps a late acknowledgement from re-sending
-	// everything.
+	// A request echoing anything but the latest nonce is acknowledging a
+	// superseded response, and re-serving it would re-send everything.
 	//
-	// Ignored only when the named set is unchanged, though. Envoy sends a request
-	// when its interest changes as well as to acknowledge, and with one resource
-	// per response there can be more than one response in flight, so an interest
-	// change can legitimately carry an older nonce. Dropping that would leave a
-	// resource Envoy asked for unserved forever, which is far worse than
-	// answering a stale acknowledgement.
+	// Only ignored when the named set is unchanged, though: Envoy also sends a
+	// request when its interest changes, and with one resource per response there
+	// can be several in flight, so an interest change can legitimately carry an
+	// older nonce. Dropping that would leave a named resource unserved forever.
 	stale := req.GetResponseNonce() != "" && req.GetResponseNonce() != s.lastNonce
 	if stale && sameResources(s.named, requested) {
 		return false, nil
@@ -649,15 +638,13 @@ func parseRequestedResources(names []string) ([]resource, error) {
 // requestedOrAll parses the names on a unary request, treating a request that
 // names nothing as a request for everything.
 //
-// Empty meaning everything is the xDS wildcard rule, and upstream SPIRE applies
-// it on this method. An empty string among the names is dropped before the count
-// is taken, also for parity: SPIRE filters those out, so a caller sending a
-// single empty name gets the wildcard rather than an error.
+// Empty meaning everything is the xDS wildcard rule, which SPIRE also applies
+// here. Empty strings are dropped before the count, for the same parity: a caller
+// sending one gets the wildcard rather than an error.
 //
-// The stream path deliberately does not share any of this. An Envoy stream opens
-// before it knows what it wants and its first request routinely names nothing,
-// so reading that as "send everything" there would push a certificate and a
-// private key at a sidecar that asked for neither.
+// Not shared with the stream. An Envoy stream opens before it knows what it
+// wants and its first request routinely names nothing, so reading that as "send
+// everything" would push a private key at a sidecar that asked for neither.
 func requestedOrAll(names []string) ([]resource, error) {
 	named := make([]string, 0, len(names))
 	for _, name := range names {

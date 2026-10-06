@@ -24,22 +24,16 @@ import (
 //
 // These are a contract with the customer's Envoy configuration, not an internal
 // choice: the names appear in their bootstrap, so changing one breaks every
-// deployed sidecar. They are taken from Istio and SPIRE rather than invented.
+// deployed sidecar. Taken from Istio and SPIRE rather than invented.
 //
-// Istio generates a sidecar bootstrap that names "default" for the certificate
-// and "ROOTCA" for the validation context, and those names are hardcoded rather
-// than configurable (istio/istio#41414). Any other choice would mean no Istio
-// sidecar could use this agent without patching Istio. SPIRE serves the same two
-// names plus trust-domain URIs, so a customer migrating off self-managed SPIRE
-// keeps their existing Envoy configuration unchanged, which is the point of
-// serving SDS at all.
-//
-// On the SPIRE side these are its default_svid_name and default_bundle_name,
-// documented with their defaults of "default" and "ROOTCA" under SDS
-// Configuration in
+// Istio hardcodes "default" and "ROOTCA" in the bootstrap it generates
+// (istio/istio#41414), so any other choice would mean patching Istio. SPIRE
+// serves the same two, as its default_svid_name and default_bundle_name, plus
+// trust-domain URIs: see SDS Configuration in
 // https://github.com/spiffe/spire/blob/main/doc/spire_agent.md
-// Note that they are configurable there and fixed here: a migrating customer who
-// overrode either one has to name the resource the same way again on this agent.
+//
+// They are configurable in SPIRE and fixed here, so a migrating customer who
+// overrode one has to rename the resource.
 const (
 	// ResourceNameTLSCertificate is the workload's own X.509-SVID: the chain and
 	// private key Envoy presents in a handshake.
@@ -191,10 +185,9 @@ func tlsCertificateSecret(name string, svid *x509svid.SVID) (*tlsv3.Secret, erro
 // anchors here, and Istio's generated configuration combines an SDS-provided
 // trusted_ca with its own default validation context.
 //
-// Bundle.Marshal is the PEM encoding Envoy wants, and it walks the authorities in
-// the order the bundle holds them, so an unchanged authority set encodes to
-// identical bytes and the handler's dedupe does not see a change that is only a
-// reordering.
+// Bundle.Marshal is the PEM Envoy wants, and walks the authorities in the order
+// the bundle holds them, so an unchanged set encodes to identical bytes and the
+// dedupe does not see a reordering as a change.
 func validationContextSecret(name string, bundle *x509bundle.Bundle) (*tlsv3.Secret, error) {
 	if bundle == nil || len(bundle.X509Authorities()) == 0 {
 		return nil, fmt.Errorf("no trust anchors to serve as %q", name)
