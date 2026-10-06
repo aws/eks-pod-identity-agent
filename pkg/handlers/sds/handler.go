@@ -53,9 +53,9 @@ type Opts struct {
 //
 // UnimplementedSecretDiscoveryServiceServer is embedded by value because the
 // generated code requires it: the interface has an unexported method only that
-// struct provides, and registration panics on a nil pointer embed. It also
-// supplies the two RPCs this agent does not serve, which the methods below
-// override only to make the refusal legible.
+// struct provides, and registration panics on a nil pointer embed. Of the
+// service's three RPCs it now supplies only DeltaSecrets, which the method below
+// overrides to make the refusal legible.
 type Handler struct {
 	secretv3.UnimplementedSecretDiscoveryServiceServer
 
@@ -86,15 +86,82 @@ func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsSer
 		"this agent serves state-of-the-world SDS only: set api_type to GRPC, not DELTA_GRPC, in the sidecar's sds_config")
 }
 
-// FetchSecrets is not served.
+// FetchSecrets serves the same secrets StreamSecrets does, once, with nothing
+// subscribed behind them.
 //
-// There is no Envoy configuration that reaches it: Envoy's gRPC subscription
-// machinery is stream-only, and the unary method exists to carry the REST binding
-// (POST /v3/discovery:secrets), which is HTTP/JSON and never arrives on this gRPC
-// socket. So this refuses hand-written tooling rather than any sidecar.
-func (h *Handler) FetchSecrets(_ context.Context, _ *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
-	return nil, status.Error(codes.Unimplemented,
-		"this agent serves SDS over StreamSecrets only: set api_type to GRPC in the sidecar's sds_config")
+// No Envoy sidecar reaches it. Envoy's gRPC subscription machinery is
+// stream-only, and the unary method exists to carry the REST binding
+// (POST /v3/discovery:secrets), which is HTTP/JSON and never arrives on this
+// gRPC socket. It is served for the callers that are not Envoy: an operator
+// asking what a pod would be handed, a readiness probe, a control plane library
+// doing a one-shot read. Serving it also removes a trap, since a method
+// answering Unimplemented while the stream beside it serves identical material
+// reads as a defect to anyone writing tooling against the socket.
+//
+// A caller that needs rotation must use StreamSecrets. What this returns is
+// correct when it is sent and carries nothing that says when it stops being
+// correct, so polling it is not a substitute for the stream.
+func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
+	log := logger.FromContext(ctx)
+
+	// Attested and the session read exactly as the stream does. Nothing here
+	// consumes the session, since there is no subscription to route on, but
+	// reading it is what makes a workload refused on the stream refused here
+	// too: a method that skipped it would be a way around enrollment.
+	caller, _, err := h.caller(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Taken for the call rather than skipped. A one-shot read is still a read of
+	// the provider's bundles, and on the first interest in a provider the lease
+	// is what starts it being fetched and refreshed at all; without one, a cold
+	// provider would answer this call and every retry of it the same way.
+	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
+	if err != nil {
+		return nil, handlers.StatusError(err)
+	}
+	defer releaseLease()
+
+	requested, err := requestedOrAll(req.GetResourceNames())
+	if err != nil {
+		// NotFound, the same as the stream, rather than the InvalidArgument
+		// SPIRE answers: one bad name has to produce one status on both methods
+		// or the socket has two contracts.
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+
+	resources := make([]*anypb.Any, 0, len(requested))
+	for _, r := range requested {
+		secret, err := h.buildSecret(ctx, caller, r)
+		if err != nil {
+			return nil, err
+		}
+
+		packed, err := anypb.New(secret)
+		if err != nil {
+			return nil, handlers.StatusError(fmt.Errorf("packing the secret %q: %w", secret.GetName(), err))
+		}
+
+		resources = append(resources, packed)
+	}
+
+	log.Debugf("FetchSecrets served %d resource(s) to pod %s", len(resources), caller.PodUID)
+
+	// Every resource in one response, unlike the stream. The one-per-response
+	// rule there exists because Envoy's SdsApi is a singleton watch that reads
+	// resources[0]; a unary fetch has no watch, and the whole named set is what
+	// the method means.
+	//
+	// VersionInfo and Nonce are left empty deliberately. Both belong to the
+	// acknowledgement protocol, which needs a stream to acknowledge on: there is
+	// nothing here for a caller to ACK or NACK, and a nonce it echoed onto a
+	// stream later would be one that stream never issued. Upstream SPIRE leaves
+	// both unset on this path for the same reason.
+	return &discoveryv3.DiscoveryResponse{
+		TypeUrl:   SecretTypeURL,
+		Resources: resources,
+	}, nil
 }
 
 // StreamSecrets serves an Envoy sidecar its certificate and its validation
@@ -488,6 +555,48 @@ func parseRequestedResources(names []string) ([]resource, error) {
 	}
 
 	return resources, nil
+}
+
+// requestedOrAll parses the names on a unary request, treating a request that
+// names nothing as a request for everything.
+//
+// Empty meaning everything is the xDS wildcard rule, and upstream SPIRE applies
+// it on this method. An empty string among the names is dropped before the count
+// is taken, also for parity: SPIRE filters those out, so a caller sending a
+// single empty name gets the wildcard rather than an error.
+//
+// The stream path deliberately does not share any of this. An Envoy stream opens
+// before it knows what it wants and its first request routinely names nothing,
+// so reading that as "send everything" there would push a certificate and a
+// private key at a sidecar that asked for neither.
+func requestedOrAll(names []string) ([]resource, error) {
+	named := make([]string, 0, len(names))
+	for _, name := range names {
+		if name != "" {
+			named = append(named, name)
+		}
+	}
+
+	if len(named) == 0 {
+		return allResources(), nil
+	}
+
+	return parseRequestedResources(named)
+}
+
+// allResources is the wildcard set: the workload's own certificate and its own
+// trust anchors, which is everything this agent can serve without the caller
+// naming a trust domain.
+//
+// The spiffe://<own domain> form is left out rather than included, because it
+// would repeat ROOTCA's bytes under a second name. Federation is out of scope, so
+// there is no other domain to enumerate; when it arrives, the federated domains
+// belong in this set, which is what makes the wildcard worth having.
+func allResources() []resource {
+	return []resource{
+		{name: ResourceNameTLSCertificate, kind: kindTLSCertificate},
+		{name: ResourceNameOwnValidationContext, kind: kindValidationContext},
+	}
 }
 
 // sameResources reports whether two parsed resource sets name the same things in

@@ -811,19 +811,166 @@ func TestStreamSecrets_SignalBeforeTheFirstRequestReadsNothing(t *testing.T) {
 	g.Expect(secretIn(t, ts.nextResponse(t)).GetName()).To(Equal(ResourceNameTLSCertificate))
 }
 
-// TestFetchSecrets_IsUnimplementedAndSaysWhy pins the refusal. No Envoy
-// configuration reaches the unary method as gRPC, so this refuses tooling, but
-// the message still names what to configure.
-func TestFetchSecrets_IsUnimplementedAndSaysWhy(t *testing.T) {
+// secretsIn unpacks every secret a unary response carries, keyed by name.
+//
+// Deliberately not secretIn: the one-resource-per-response shape that helper
+// asserts is Envoy's SdsApi constraint on the stream, and a unary fetch answers
+// the whole named set in one response.
+func secretsIn(t *testing.T, response *discoveryv3.DiscoveryResponse) map[string]*tlsv3.Secret {
+	t.Helper()
+
+	g := NewWithT(t)
+
+	g.Expect(response.GetTypeUrl()).To(Equal(SecretTypeURL))
+
+	secrets := make(map[string]*tlsv3.Secret, len(response.GetResources()))
+	for _, packed := range response.GetResources() {
+		g.Expect(packed.GetTypeUrl()).To(Equal(SecretTypeURL))
+
+		secret := &tlsv3.Secret{}
+		g.Expect(packed.UnmarshalTo(secret)).To(Succeed())
+		secrets[secret.GetName()] = secret
+	}
+
+	g.Expect(secrets).To(HaveLen(len(response.GetResources())), "a name was served twice")
+
+	return secrets
+}
+
+// TestFetchSecrets_ServesBothSecretKindsInOneResponse is the unary counterpart of
+// TestStreamSecrets_ServesBothSecretKinds. The shape is the difference that
+// matters: one response carrying the whole named set, because there is no
+// singleton watch on the other end to read only the first resource.
+func TestFetchSecrets_ServesBothSecretKindsInOneResponse(t *testing.T) {
 	g := NewWithT(t)
 
 	h := newHarness(t)
 
-	_, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{})
+	response, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{ResourceNameTLSCertificate, ResourceNameOwnValidationContext},
+	})
+	g.Expect(err).ToNot(HaveOccurred())
 
-	g.Expect(status.Code(err)).To(Equal(codes.Unimplemented))
-	g.Expect(status.Convert(err).Message()).To(ContainSubstring("StreamSecrets"))
-	g.Expect(status.Convert(err).Message()).To(ContainSubstring("api_type"))
+	secrets := secretsIn(t, response)
+	g.Expect(secrets).To(HaveLen(2))
+
+	certificate := secrets[ResourceNameTLSCertificate]
+	g.Expect(certificate.GetTlsCertificate().GetCertificateChain().GetInlineBytes()).ToNot(BeEmpty())
+	g.Expect(certificate.GetTlsCertificate().GetPrivateKey().GetInlineBytes()).ToNot(BeEmpty())
+
+	validation := secrets[ResourceNameOwnValidationContext]
+	g.Expect(validation.GetValidationContext().GetTrustedCa().GetInlineBytes()).ToNot(BeEmpty())
+
+	// Neither belongs to an acknowledgement protocol that exists here, and a
+	// nonce echoed onto a stream later would be one that stream never issued.
+	g.Expect(response.GetVersionInfo()).To(BeEmpty())
+	g.Expect(response.GetNonce()).To(BeEmpty())
+}
+
+// TestFetchSecrets_NamingNothingServesTheWildcardSet pins the xDS rule that an
+// empty resource list means everything, which upstream SPIRE applies on this
+// method. An empty string among the names is dropped before the count is taken,
+// so it reaches the same answer rather than an unknown-name error.
+//
+// The stream deliberately does not share the rule: its first request routinely
+// names nothing, and answering that with a private key the sidecar never asked
+// for would be the wrong way to read it.
+func TestFetchSecrets_NamingNothingServesTheWildcardSet(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+
+	for _, names := range [][]string{nil, {""}} {
+		response, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+			TypeUrl:       SecretTypeURL,
+			ResourceNames: names,
+		})
+		g.Expect(err).ToNot(HaveOccurred())
+
+		secrets := secretsIn(t, response)
+		g.Expect(secrets).To(HaveKey(ResourceNameTLSCertificate))
+		g.Expect(secrets).To(HaveKey(ResourceNameOwnValidationContext))
+
+		// Not the spiffe://<own domain> form as well: it would repeat ROOTCA's
+		// bytes under a second name.
+		g.Expect(secrets).To(HaveLen(2))
+	}
+}
+
+// TestFetchSecrets_UnknownResourceNameIsNotFound pins that the two methods answer
+// one bad name with one code. SPIRE answers InvalidArgument here; matching its
+// own stream matters more, since a caller cannot be asked to branch on which
+// method it used.
+func TestFetchSecrets_UnknownResourceNameIsNotFound(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+
+	_, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{"ALL"},
+	})
+
+	g.Expect(status.Code(err)).To(Equal(codes.NotFound))
+	g.Expect(status.Convert(err).Message()).To(ContainSubstring("unknown resource name"))
+}
+
+// TestFetchSecrets_NotEnrolledIsRefused pins that the unary method is not a way
+// around enrollment. It reads the session for no other reason, since nothing here
+// routes on the provider it names.
+func TestFetchSecrets_NotEnrolledIsRefused(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+	h.sessions.SetResult(nil, pkgerrors.ErrNotEnrolled)
+
+	_, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{ResourceNameOwnValidationContext},
+	})
+
+	g.Expect(status.Code(err)).To(Equal(codes.PermissionDenied))
+}
+
+// TestFetchSecrets_LeasesWithoutSubscribing pins the two halves of the one-shot
+// contract. The lease is taken, because a cold provider has to start being
+// fetched for a retry to ever answer, and released before the call returns rather
+// than left for the context. Nothing is subscribed: there is no stream to wake, so
+// a subscription here would be a leak that the notification tier would then fan
+// out to.
+func TestFetchSecrets_LeasesWithoutSubscribing(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+
+	_, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{ResourceNameOwnValidationContext},
+	})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(h.bundles.LeaseCalls()).To(Equal(1))
+	g.Expect(h.bundles.ReleaseCalls()).To(Equal(1), "the lease must be released by the handler, not left to the RPC's context")
+	g.Expect(h.bundles.LiveLeases()).To(BeZero())
+	g.Expect(h.subs.SubscribeCalls()).To(BeZero())
+}
+
+// TestFetchSecrets_WithoutConnCredentialsIsRefused is the unary half of the
+// wiring guard: gRPC serves an RPC with a nil AuthInfo quite happily, so a server
+// built without the conn-carrying credentials would otherwise answer a caller it
+// cannot attest.
+func TestFetchSecrets_WithoutConnCredentialsIsRefused(t *testing.T) {
+	g := NewWithT(t)
+
+	client := serveWithoutConnCredentials(t)
+
+	_, err := client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{ResourceNameTLSCertificate},
+	})
+
+	g.Expect(status.Code(err)).To(Equal(codes.PermissionDenied))
 }
 
 // TestDeltaSecrets_IsUnimplementedAndNamesTheFix is the one that matters
@@ -856,6 +1003,27 @@ func TestDeltaSecrets_IsUnimplementedAndNamesTheFix(t *testing.T) {
 func TestStreamSecrets_WithoutConnCredentialsIsRefused(t *testing.T) {
 	g := NewWithT(t)
 
+	client := serveWithoutConnCredentials(t)
+
+	stream, err := client.StreamSecrets(context.Background())
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// Races the refusal, which is taken before the handler reads anything.
+	_ = stream.Send(&discoveryv3.DiscoveryRequest{ResourceNames: []string{ResourceNameTLSCertificate}})
+
+	_, err = stream.Recv()
+	g.Expect(status.Code(err)).To(Equal(codes.PermissionDenied))
+}
+
+// serveWithoutConnCredentials serves a fully wired Handler on a server built with
+// no grpc.Creds at all, which is the one wiring mistake that leaves a handler
+// with no caller to attest. Shared by both methods' guards: the refusal has to
+// hold on each of them independently, since each reads the conn for itself.
+func serveWithoutConnCredentials(t *testing.T) secretv3.SecretDiscoveryServiceClient {
+	t.Helper()
+
+	g := NewWithT(t)
+
 	anchor := newTestCertificate(t, "authority")
 	bundles := &fake.BundleSource{}
 	bundles.SetTrustDomain(testTrustDomain, nil)
@@ -886,12 +1054,5 @@ func TestStreamSecrets_WithoutConnCredentialsIsRefused(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	t.Cleanup(func() { _ = conn.Close() })
 
-	stream, err := secretv3.NewSecretDiscoveryServiceClient(conn).StreamSecrets(context.Background())
-	g.Expect(err).ToNot(HaveOccurred())
-
-	// Races the refusal, which is taken before the handler reads anything.
-	_ = stream.Send(&discoveryv3.DiscoveryRequest{ResourceNames: []string{ResourceNameTLSCertificate}})
-
-	_, err = stream.Recv()
-	g.Expect(status.Code(err)).To(Equal(codes.PermissionDenied))
+	return secretv3.NewSecretDiscoveryServiceClient(conn)
 }
