@@ -954,6 +954,49 @@ func TestFetchSecrets_NamingNothingServesTheWildcardSet(t *testing.T) {
 	}
 }
 
+// TestFetchSecrets_NamedTrustDomain covers the spiffe://<trust-domain> form on the
+// unary method. The resolution is shared with the stream, which has its own test
+// for it, but nothing exercised it here and the unary path reaches it through a
+// different entry point.
+func TestFetchSecrets_NamedTrustDomain(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+	name := TrustDomainPrefix + testTrustDomain
+
+	response, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{name},
+	})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	secrets := secretsIn(t, response)
+	g.Expect(secrets).To(HaveLen(1))
+	g.Expect(secrets[name].GetValidationContext().GetTrustedCa().GetInlineBytes()).ToNot(BeEmpty())
+
+	// The certificate source is never consulted for a validation context, the
+	// same as on the stream.
+	g.Expect(h.certs.Calls()).To(BeZero())
+}
+
+// TestFetchSecrets_UnfederatedTrustDomainIsNotFound pairs with it: a domain the
+// provider has no anchors for is NotFound on this method too. Worth pinning
+// because federation is out of scope at launch, so the only trust domain in the
+// set is the caller's own and every other name a customer writes lands here.
+func TestFetchSecrets_UnfederatedTrustDomainIsNotFound(t *testing.T) {
+	g := NewWithT(t)
+
+	h := newHarness(t)
+
+	_, err := h.client.FetchSecrets(context.Background(), &discoveryv3.DiscoveryRequest{
+		TypeUrl:       SecretTypeURL,
+		ResourceNames: []string{TrustDomainPrefix + "nobody.example"},
+	})
+
+	g.Expect(status.Code(err)).To(Equal(codes.NotFound))
+	g.Expect(status.Convert(err).Message()).To(ContainSubstring("no trust anchors"))
+}
+
 // TestFetchSecrets_UnknownResourceNameIsNotFound pins that the two methods answer
 // one bad name with one code. SPIRE answers InvalidArgument here; matching its
 // own stream matters more, since a caller cannot be asked to branch on which
