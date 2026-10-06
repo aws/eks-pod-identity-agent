@@ -20,7 +20,6 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	pkgerrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -343,35 +342,12 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 	}
 }
 
-// caller attests the process on the other end of the connection. Identical to the
-// Workload API handler's, deliberately: a workload refused on one interface and
-// served on the other would be the customer's to reverse engineer.
+// caller attests the process on the other end of the connection. Shared with the
+// Workload API handler as handlers.Attest, deliberately: a workload refused on
+// one interface and served on the other would be the customer's to reverse
+// engineer.
 func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, error) {
-	conn, ok := grpcserver.ConnFromContext(ctx)
-	if !ok {
-		// The server was built without the conn-carrying credentials, so nobody
-		// on this socket can be attested. A wiring bug, but refusing is still
-		// the only safe answer.
-		//
-		// Raised as ErrUnattestable rather than as a status built here, which is
-		// what workloadapi's attest does for the same condition: it keeps the
-		// code the shared mapping's to decide, and gives the metric a real error
-		// label instead of none.
-		return nil, pkgerrors.ErrUnattestable.Wrapf(nil,
-			"the caller's connection is not available, so it cannot be attested")
-	}
-
-	caller, err := h.opts.Attestor.Attest(ctx, conn)
-	if err != nil {
-		return nil, err
-	}
-	if caller == nil {
-		// Nothing downstream nil-checks the workload, and a tier handed a nil
-		// one would panic the stream rather than refuse it.
-		return nil, pkgerrors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
-	}
-
-	return caller, nil
+	return handlers.Attest(ctx, h.opts.Attestor)
 }
 
 // received is one result from the receive side of the stream.

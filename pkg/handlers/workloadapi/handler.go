@@ -26,7 +26,6 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -239,21 +238,10 @@ func claimsStruct(claims map[string]any) (*structpb.Struct, error) {
 }
 
 // attest resolves the caller from the connection the server's transport
-// credentials put in ctx, the only route to it. A missing connection is a wiring
-// bug, and refusing is still the only safe answer.
+// credentials put in ctx. Shared with the SDS handler as handlers.Attest, so a
+// workload cannot be refused on one interface and served on the other.
 func (h *Handler) attest(ctx context.Context) (*workloadidentity.Workload, error) {
-	conn, ok := grpcserver.ConnFromContext(ctx)
-	if !ok {
-		return nil, wierrors.ErrUnattestable.Wrapf(nil, "the caller's connection is not available, so it cannot be attested")
-	}
-	caller, err := h.opts.Attestor.Attest(ctx, conn)
-	if err != nil {
-		return nil, err
-	}
-	if caller == nil {
-		return nil, wierrors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
-	}
-	return caller, nil
+	return handlers.Attest(ctx, h.opts.Attestor)
 }
 
 // failUnary ends a unary call that failed: it records the failure, logs it and
