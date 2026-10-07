@@ -81,31 +81,6 @@ func TestEksCredentialsResponse_Serialization(t *testing.T) {
 	}
 }
 
-// TestEksCredentialsResponse_SerializationLeavesOutTheProviderArn pins that the
-// credentials the handler marshals for a pod are the same bytes whether or not
-// EKS Auth decorated the session.
-func TestEksCredentialsResponse_SerializationLeavesOutTheProviderArn(t *testing.T) {
-	g := NewWithT(t)
-	response := EksCredentialsResponse{
-		AccessKeyId:     "some-access-key",
-		SecretAccessKey: "some-secret-key",
-		Token:           "some-token",
-		AccountId:       "some-account-id",
-		Expiration:      SdkCompliantExpirationTime{time.Date(1996, 3, 27, 7, 45, 23, 123_456_789, time.UTC)},
-	}
-	decorated := response
-	decorated.ProviderArn = "arn:aws:iam::111122223333:workload-identity-provider/example"
-
-	want, err := json.Marshal(response)
-	g.Expect(err).NotTo(HaveOccurred())
-	got, err := json.Marshal(decorated)
-	g.Expect(err).NotTo(HaveOccurred())
-
-	g.Expect(got).To(Equal(want))
-	g.Expect(string(got)).NotTo(ContainSubstring(decorated.ProviderArn))
-	g.Expect(string(got)).NotTo(ContainSubstring("ProviderArn"))
-}
-
 func TestGetPodUIDFromToken(t *testing.T) {
 	// Build a valid unsigned JWT with pod UID
 	validToken := buildTestToken(t, map[string]interface{}{

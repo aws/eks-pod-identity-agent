@@ -134,6 +134,20 @@ func (mr *MockResponseMetadataMockRecorder) AssociationId() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AssociationId", reflect.TypeOf((*MockResponseMetadata)(nil).AssociationId))
 }
 
+// ProviderArn mocks base method.
+func (m *MockResponseMetadata) ProviderArn() string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ProviderArn")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// ProviderArn indicates an expected call of ProviderArn.
+func (mr *MockResponseMetadataMockRecorder) ProviderArn() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ProviderArn", reflect.TypeOf((*MockResponseMetadata)(nil).ProviderArn))
+}
+
 // Source mocks base method.
 func (m *MockResponseMetadata) Source() credentials.CredentialSource {
 	m.ctrl.T.Helper()
