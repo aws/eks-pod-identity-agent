@@ -211,3 +211,21 @@ func TestGetIamCredentials_ReturnsAuthServiceSource(t *testing.T) {
 	g.Expect(resp.AccessKeyId).To(Equal("AKIAIOSFODNN7EXAMPLE"))
 	g.Expect(resp.AccountId).To(Equal("123456789012"))
 }
+
+// TestNewService_IMDSDisabled_SkipsMetadataFetch verifies that when the IMDS
+// feature is disabled, NewService does not fetch node metadata
+func TestNewService_IMDSDisabled_SkipsMetadataFetch(t *testing.T) {
+	g := NewWithT(t)
+	logger.Initialize("error")
+
+	cfg := aws.Config{
+		Region:      "us-west-2",
+		Credentials: aws.AnonymousCredentials{},
+	}
+
+	iface := NewService(context.Background(), cfg, false)
+
+	svc, ok := iface.(*service)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(svc.nodeMetadata).To(BeNil())
+}

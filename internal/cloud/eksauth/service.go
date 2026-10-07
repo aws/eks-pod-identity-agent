@@ -33,7 +33,7 @@ type service struct {
 	nodeMetadata   *imds.NodeMetadata
 }
 
-func NewService(ctx context.Context, cfg aws.Config) Iface {
+func NewService(ctx context.Context, cfg aws.Config, enableIMDS bool) Iface {
 	// Configure HTTP client with custom timeouts
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -46,9 +46,15 @@ func NewService(ctx context.Context, cfg aws.Config) Iface {
 	}
 	cfg.HTTPClient = httpClient
 	eksAuthService := eksauth.NewFromConfig(cfg)
+
+	var nodeMetadata *imds.NodeMetadata
+	if enableIMDS {
+		nodeMetadata = imds.FetchNodeMetadata(ctx, cfg)
+	}
+
 	return &service{
 		eksAuthService: eksAuthService,
-		nodeMetadata:   imds.FetchNodeMetadata(ctx, cfg),
+		nodeMetadata:   nodeMetadata,
 	}
 }
 
@@ -99,13 +105,13 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	}
 
 	return &credentials.EksCredentialsResponse{
-		AccessKeyId:     *creds.Credentials.AccessKeyId,
-		SecretAccessKey: *creds.Credentials.SecretAccessKey,
-		Token:           *creds.Credentials.SessionToken,
-		AccountId:       parsedArn.AccountID,
-		Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
-	}, credentials.CredentialMetadata{
-		Association: *creds.PodIdentityAssociation.AssociationId,
-		CredSource:  credentials.SourceAuthService,
-	}, nil
+			AccessKeyId:     *creds.Credentials.AccessKeyId,
+			SecretAccessKey: *creds.Credentials.SecretAccessKey,
+			Token:           *creds.Credentials.SessionToken,
+			AccountId:       parsedArn.AccountID,
+			Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
+		}, credentials.CredentialMetadata{
+			Association: *creds.PodIdentityAssociation.AssociationId,
+			CredSource:  credentials.SourceAuthService,
+		}, nil
 }
