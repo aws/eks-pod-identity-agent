@@ -152,19 +152,25 @@ func runServersUntilShutdown(pCtx context.Context, servers []runnable) {
 }
 
 func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
+	credentialOpts := handlers.EksCredentialHandlerOpts{
+		Cfg:                cfg,
+		ClusterName:        clusterName,
+		CredentialRenewal:  maxCredentialRenewal,
+		MaxCacheSize:       maxCacheSize,
+		RefreshQPS:         refreshQps,
+		EndpointOverridden: overrideEksAuthEndpoint != "",
+		EnableIMDS:         enableIMDSCredentials,
+	}
+	workloadIdentityOpts := newWorkloadIdentityServerOpts(cfg)
+	wiClients, err := buildSharedCredentialManager(ctx, &credentialOpts, &workloadIdentityOpts)
+	if err != nil {
+		return nil, err
+	}
 	servers := make([]runnable, len(bindHosts))
 	// listen on all bindHosts
 	for i, ip := range bindHosts {
 		addr := fmt.Sprintf("%s:%d", ip, serverPort)
-		servers[i] = server.NewEksCredentialServer(ctx, addr, handlers.EksCredentialHandlerOpts{
-			Cfg:                cfg,
-			ClusterName:        clusterName,
-			CredentialRenewal:  maxCredentialRenewal,
-			MaxCacheSize:       maxCacheSize,
-			RefreshQPS:         refreshQps,
-			EndpointOverridden: overrideEksAuthEndpoint != "",
-			EnableIMDS:         enableIMDSCredentials,
-		})
+		servers[i] = server.NewEksCredentialServer(ctx, addr, credentialOpts)
 	}
 
 	// add health probes listening on host's network
@@ -173,11 +179,38 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 
 	// Last, so a node the agent cannot attest on, or a socket that cannot be
 	// bound, fails the boot before anything is serving.
-	workloadIdentity, err := workloadIdentityServers(ctx, newWorkloadIdentityServerOpts(cfg))
+	workloadIdentity, err := workloadIdentityServers(ctx, workloadIdentityOpts, wiClients)
 	if err != nil {
 		return nil, err
 	}
 	return append(servers, workloadIdentity...), nil
+}
+
+// newCredentialManager builds the credential manager. Tests replace it.
+var newCredentialManager = handlers.NewCredentialManager
+
+// buildSharedCredentialManager builds the workload identity clients, nil with the
+// feature off, then the one credential manager every bind host and the session
+// tier share. Its cache refreshes with the clients' shared token minter. It
+// returns the clients for the workload identity servers.
+func buildSharedCredentialManager(ctx context.Context, credentialOpts *handlers.EksCredentialHandlerOpts,
+	workloadIdentityOpts *handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
+	wiClients, err := newWorkloadIdentityClients(ctx, *workloadIdentityOpts)
+	if err != nil {
+		return nil, fmt.Errorf("building the workload identity clients: %w", err)
+	}
+	credentialOpts.WorkloadIdentityTokens = wiClients.credentialTokens()
+	shareCredentialManager(newCredentialManager(ctx, *credentialOpts), credentialOpts, workloadIdentityOpts)
+	return wiClients, nil
+}
+
+// shareCredentialManager hands manager's retriever to every bind host's handler
+// and its cache and EKS Auth client to the workload identity session tier.
+func shareCredentialManager(manager handlers.CredentialManager, credentialOpts *handlers.EksCredentialHandlerOpts,
+	workloadIdentityOpts *handlers.WorkloadIdentityServerOpts) {
+	credentialOpts.CredentialRetriever = manager.Retriever
+	workloadIdentityOpts.CredentialCache = manager.Cache
+	workloadIdentityOpts.EKSAuth = manager.EKSAuth
 }
 
 // newWorkloadIdentityServerOpts collects the workload identity flag values into
