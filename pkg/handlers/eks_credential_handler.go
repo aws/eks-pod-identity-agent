@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -110,7 +111,7 @@ func (h *EksCredentialHandler) HandleRequest(resp http.ResponseWriter, req *http
 	eksCredentialsRequest := &credentials.EksCredentialsRequest{
 		ClusterName:         h.ClusterName,
 		ServiceAccountToken: req.Header.Get("Authorization"),
-		RequestTargetHost:   req.Host,
+		RequestTargetHost:   requestTargetHost(req),
 	}
 
 	creds, err := h.GetEksCredentials(ctx, eksCredentialsRequest)
@@ -146,4 +147,18 @@ func (h *EksCredentialHandler) GetEksCredentials(ctx context.Context, request *c
 	// call EKS Auth
 	iamCredentials, _, err := h.CredentialRetriever.GetIamCredentials(ctx, request)
 	return iamCredentials, err
+}
+
+// requestTargetHost returns the address the connection was accepted on, as
+// recorded by net/http under LocalAddrContextKey. The locality check must run
+// against this server-observed address rather than the client-supplied Host
+// header: a remote caller can set any Host header, so authorizing on req.Host
+// would let a non-node-local caller satisfy the link-local check. It falls back
+// to req.Host only when the local address is absent, which happens in unit
+// tests that invoke the handler without a running net/http server.
+func requestTargetHost(req *http.Request) string {
+	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && localAddr != nil {
+		return localAddr.String()
+	}
+	return req.Host
 }

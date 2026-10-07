@@ -119,8 +119,12 @@ func TestEksCredentialServer(t *testing.T) {
 
 			// setup the handler
 			eksAuthMockService := eksauth.NewMockIface(controller)
+			// The locality check now runs against the address the connection was
+			// accepted on (via http.LocalAddrContextKey), not the Host header, so
+			// the valid-call cases must authorize the loopback IPs the test server
+			// actually accepts on rather than the "localhost" hostname.
 			validator := validation.DefaultCredentialValidator{
-				TargetHosts: []string{"localhost"},
+				TargetHosts: []string{"127.0.0.1", "::1"},
 			}
 			if tc.requestAddress != "" {
 				validator.TargetHosts = []string{tc.requestAddress}
