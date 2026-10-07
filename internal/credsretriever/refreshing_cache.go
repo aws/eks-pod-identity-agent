@@ -29,7 +29,8 @@ type cachedCredentialRetriever struct {
 	// internalActiveRequestCache, but not cache, it means an active request is ongoing,
 	// other requests to the same service token should wait for this active request.
 	internalActiveRequestCache *expiring.Cache[string, error]
-	// delegate is the credential source for trusted tokens
+	// delegate classifies errors for IsIrrecoverable. The cache refreshes
+	// through its own Opts.Delegate.
 	delegate credentials.CredentialRetriever
 	// authoritativeDelegate is the credential source that can validate untrusted tokens
 	authoritativeDelegate credentials.CredentialRetriever
@@ -56,15 +57,19 @@ const (
 
 type CachedCredentialRetrieverOpts struct {
 	// Cache is where the retriever stores and serves credentials.
-	Cache                 *credcache.Cache
-	Delegate              credentials.CredentialRetriever
+	Cache *credcache.Cache
+	// Delegate classifies errors for IsIrrecoverable, as the general delegate
+	// did before the cache moved out. The cache refreshes through its own
+	// Opts.Delegate.
+	Delegate credentials.CredentialRetriever
+	// AuthoritativeDelegate fetches credentials on a miss: EKS Auth.
 	AuthoritativeDelegate credentials.CredentialRetriever
 	TokenValidator        tokenValidator
 }
 
 // NewCachedCredentialRetriever creates a credential retriever that serves and
-// stores credentials in opts.Cache, which refreshes them through Delegate until
-// the association is removed and no longer needed.
+// stores credentials in opts.Cache, which refreshes them until the association
+// is removed and no longer needed.
 func NewCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) credentials.CredentialRetriever {
 	if opts.Cache == nil || opts.Delegate == nil || opts.AuthoritativeDelegate == nil {
 		panic("Cache, Delegate and AuthoritativeDelegate must be non-nil")
@@ -136,11 +141,11 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 
 	// The token is not trusted by the cache, so admit it via the authoritative
 	// delegate (EKS Auth).
-	entry, metadata, err := r.callDelegateAndCache(ctx, r.authoritativeDelegate, request)
+	cacheEntry, metadata, err := r.callDelegateAndCache(ctx, r.authoritativeDelegate, request)
 	if err != nil {
 		return nil, nil, err
 	}
-	return entry.Credentials, metadata, nil
+	return cacheEntry.Credentials, metadata, nil
 }
 
 // tryServingFromCache checks the cache for valid credentials matching the request.
@@ -154,9 +159,9 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 		return nil, false
 	}
 
-	if _, withinTtl := r.cache.Usable(val); !withinTtl {
+	if _, withinTtl := r.cache.CredentialsWithinValidTtl(val); !withinTtl {
 		log.Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
-		r.cache.Delete(podUID, val)
+		r.cache.Delete(podUID)
 		return nil, false
 	}
 
@@ -181,7 +186,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 		return nil, false
 	}
 
-	r.cache.Modify(podUID, val, func(e *credcache.Entry) {
+	r.cache.Modify(podUID, func(e *credcache.Entry) {
 		e.Request = request
 	})
 	log.WithField("cache-hit", 1).Tracef("Local validation succeeded, using cached credentials")
@@ -269,37 +274,5 @@ func (r *cachedCredentialRetriever) fetchCredentialsFromDelegate(ctx context.Con
 		LogCtx:      requestLogCtx,
 		Credentials: iamCredentials,
 		Metadata:    metadata,
-		Owner:       delegateOwner{r},
 	}, nil
 }
-
-// delegateOwner renews an entry this retriever stored by replaying the entry's
-// request through the general delegate.
-type delegateOwner struct {
-	r *cachedCredentialRetriever
-}
-
-var _ credcache.Owner = delegateOwner{}
-
-// Renew refreshes an already-cached entry via the general delegate.
-func (o delegateOwner) Renew(ctx context.Context, _ string, e *credcache.Entry) (*credcache.Entry, error) {
-	if e.Request == nil {
-		return nil, fmt.Errorf("cached credentials have no request to refresh them with")
-	}
-	next, err := o.r.fetchCredentialsFromDelegate(ctx, o.r.delegate, e.Request)
-	if err != nil {
-		return nil, fmt.Errorf("error getting credentials to cache: %w", err)
-	}
-	if next.Credentials == nil {
-		return nil, fmt.Errorf("delegate returned nil credentials")
-	}
-	return next, nil
-}
-
-// IsIrrecoverable classifies a failed refresh as the general delegate does.
-func (o delegateOwner) IsIrrecoverable(err error) (string, bool) {
-	return o.r.delegate.IsIrrecoverable(err)
-}
-
-// Evicted does nothing: the cache already logs and counts every eviction.
-func (delegateOwner) Evicted(string, *credcache.Entry, bool) {}

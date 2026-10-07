@@ -104,23 +104,32 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	manager := CredentialManager{Retriever: credentialsRetriever, EKSAuth: authSvc}
-	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
-		manager.Cache = credcache.New(credcache.Opts{
-			RenewalTtl: opts.CredentialRenewal,
-			MaxSize:    opts.MaxCacheSize,
-			RefreshQPS: opts.RefreshQPS,
-		})
-		retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
-			Cache:                 manager.Cache,
-			Delegate:              credentialsRetriever,
-			AuthoritativeDelegate: authSvc,
-		}
-		if tv != nil {
-			retrieverOpts.TokenValidator = tv
-		}
-		manager.Retriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
+	return newCredentialManager(opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+}
+
+// newCredentialManager is NewCredentialManager over delegates it's given: general
+// serves the handler without a cache and refreshes the cache, and authSvc serves
+// misses. cacheOpts carries the cache options only tests set.
+func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
+	general, authSvc credentials.CredentialRetriever, tv *validation.TokenValidator) CredentialManager {
+	manager := CredentialManager{Retriever: general, EKSAuth: authSvc}
+	if opts.CredentialRenewal == 0 || opts.MaxCacheSize == 0 {
+		return manager
 	}
+	cacheOpts.Delegate = general
+	cacheOpts.RenewalTtl = opts.CredentialRenewal
+	cacheOpts.MaxSize = opts.MaxCacheSize
+	cacheOpts.RefreshQPS = opts.RefreshQPS
+	manager.Cache = credcache.New(cacheOpts)
+	retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
+		Cache:                 manager.Cache,
+		Delegate:              general,
+		AuthoritativeDelegate: authSvc,
+	}
+	if tv != nil {
+		retrieverOpts.TokenValidator = tv
+	}
+	manager.Retriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
 	return manager
 }
 

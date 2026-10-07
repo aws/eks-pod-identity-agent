@@ -1,7 +1,7 @@
 // Package credcache keeps the agent's credentials, one entry per pod UID. It
 // refreshes each entry before its credentials expire and evicts it after, by one
-// algorithm for every entry. The caller that stores an entry decides who may read
-// it, and gives the entry an Owner that renews it.
+// rule for every entry: present the entry's request to its source. The caller
+// that stores an entry decides who may read it.
 package credcache
 
 import (
@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,6 +33,11 @@ const (
 	defaultMaxRetryJitter  = 1 * time.Minute
 	renewalTimeout         = 1 * time.Minute
 
+	// tokenRenewalFloor is how long a stored token needs to have left for a
+	// refresh to present it when Opts.RefreshWith gives the entry a TokenSource.
+	// One closer to expiry is swapped for a current token first.
+	tokenRenewalFloor = 5 * time.Minute
+
 	// A new set of credentials are placed in IMDS every ~30 minutes, so IMDS
 	// creds should refresh as often.
 	imdsRefreshInterval = 30 * time.Minute
@@ -53,23 +57,17 @@ var (
 	)
 )
 
-// errNotCurrent is what a write returns when the cache no longer holds the entry
-// it was asked to act on.
-var errNotCurrent = errors.New("the entry was replaced or removed")
-
 // Entry is one pod's credentials and what the cache needs to refresh them. The
-// cache knows an entry by its Credentials pointer: Modify's copy keeps it and is
-// the same entry, while Store and Replace put in a new one. Nothing that reads an
-// entry modifies it.
+// cache knows an entry by its Credentials pointer. Every fetch must allocate its
+// own credentials and only Modify's copy shares them, so Store puts in a new
+// entry while Modify keeps it the same one. Nothing that reads an entry modifies
+// it.
 type Entry struct {
 	Credentials *credentials.EksCredentialsResponse
 	Metadata    credentials.ResponseMetadata
-	// Owner renews the entry and is told when it leaves the cache. The caller
-	// that stores the entry sets it.
-	Owner Owner
-	// Request is the credentials request the HTTP retriever last fetched or
-	// verified the entry for. The retriever serves the entry to a request with
-	// the same token. Nil when the caller that stored the entry verifies no token.
+	// Request is the credentials request the entry was last fetched or verified
+	// for, and what a refresh presents. The HTTP retriever serves the entry to a
+	// request with the same token. An entry without one can't be refreshed.
 	Request *credentials.EksCredentialsRequest
 	// LogCtx carries the log fields naming the pod and association, for the
 	// refresh and eviction logs.
@@ -93,24 +91,35 @@ func (e *Entry) logCtx() context.Context {
 	return e.LogCtx
 }
 
-// Owner renews entries for the caller that stored them. The cache asks it to
-// renew an entry before its credentials expire, and tells it when the entry has
-// gone, so every caller's entries refresh by the same algorithm.
-type Owner interface {
-	// Renew fetches the entry that replaces e. The cache stores it unless e has
-	// since been replaced or removed.
-	Renew(ctx context.Context, podUID string, e *Entry) (*Entry, error)
-	// IsIrrecoverable reports whether err from Renew means dropping e rather
-	// than keeping it until it expires, with a code for metrics.
+// TokenSource gives a refresh a current token when the stored one is close to
+// expiry. An entry Opts.RefreshWith gives none presents its stored token as it
+// is.
+type TokenSource interface {
+	// Token returns a current token for the pod and service account current's
+	// token was issued for.
+	Token(ctx context.Context, current *credentials.EksCredentialsRequest) (string, error)
+	// IsIrrecoverable reports whether err from Token means dropping the entry
+	// rather than keeping it until it expires, with a code for metrics.
 	IsIrrecoverable(err error) (string, bool)
-	// Evicted is called once e has left the cache. removed is whether a caller
-	// deleted it, rather than the cache evicting it at its eviction time or for
-	// capacity. It can run under the cache's lock, so it never calls the cache.
-	Evicted(podUID string, e *Entry, removed bool)
+}
+
+// classifier reports whether a failed refresh drops its entry, as
+// credentials.CredentialRetriever and TokenSource do.
+type classifier interface {
+	IsIrrecoverable(err error) (string, bool)
 }
 
 // Opts configures a Cache.
 type Opts struct {
+	// Delegate is the source a refresh uses unless RefreshWith gives another: the
+	// [IMDS, EKS Auth] chain, or EKS Auth alone. Required. Every source must return
+	// credentials no entry already holds, since they name the renewed entry.
+	Delegate credentials.CredentialRetriever
+	// RefreshWith gives what refreshes e: the source its request goes to, and a
+	// TokenSource that swaps a stored token close to expiry first. A nil source
+	// means Delegate, a nil TokenSource means the stored token goes as it is, and
+	// a nil RefreshWith means (Delegate, nil).
+	RefreshWith func(e *Entry) (source credentials.CredentialRetriever, tokens TokenSource)
 	// RenewalTtl is the longest an entry goes before a refresh:
 	// --max-credential-retention-before-renewal.
 	RenewalTtl time.Duration
@@ -129,18 +138,20 @@ type Opts struct {
 	Now              func() time.Time
 }
 
-// Cache keeps credentials by pod UID. Its sweep refreshes an entry through the
-// entry's Owner once its refresh time passes, and evicts it at its eviction
-// time. Both times come from the credentials' source. Every write that acts on
-// an entry another write may have replaced checks the cache still holds it.
+// Cache keeps credentials by pod UID. Its sweep refreshes an entry once its
+// refresh time passes, presenting the entry's request to the entry's source, and
+// evicts it at its eviction time. Both times come from the credentials' source.
+// Writes go by pod UID, as upstream's do. A refresh skips an entry removed or
+// replaced since the sweep picked it, and one that keeps the old credentials
+// doesn't put them back over a newer entry or a removed one.
 type Cache struct {
 	items *expiring.Cache[string, *Entry]
-	// mu serializes every write, so a write's check that it still holds an entry
-	// and the write itself are one step. Owner.Evicted can run under it.
+	// mu serializes every write, so keep's check that the cache still holds its
+	// entry and its write are one step.
 	mu sync.Mutex
-	// removing holds the credentials of the entry Delete is removing under mu, so
-	// onEvicted can tell a removal from an eviction.
-	removing atomic.Pointer[credentials.EksCredentialsResponse]
+
+	delegate    credentials.CredentialRetriever
+	refreshWith func(e *Entry) (credentials.CredentialRetriever, TokenSource)
 
 	maxSize          int
 	renewalTtl       time.Duration
@@ -153,9 +164,12 @@ type Cache struct {
 	refreshLimiter *rate.Limiter
 }
 
-// New builds a Cache and starts its sweep. It panics when RefreshQPS is too low
-// to refresh a full cache within RenewalTtl.
+// New builds a Cache and starts its sweep. It panics when Delegate is nil, or when
+// RefreshQPS is too low to refresh a full cache within RenewalTtl.
 func New(opts Opts) *Cache {
+	if opts.Delegate == nil {
+		panic("Delegate must be non-nil")
+	}
 	if opts.CleanupInterval == 0 {
 		opts.CleanupInterval = defaultCleanupInterval
 	}
@@ -169,6 +183,8 @@ func New(opts Opts) *Cache {
 	}
 	c := &Cache{
 		items:            expiring.NewLru[string, *Entry](opts.MaxSize, opts.RenewalTtl, opts.CleanupInterval),
+		delegate:         opts.Delegate,
+		refreshWith:      opts.RefreshWith,
 		maxSize:          opts.MaxSize,
 		renewalTtl:       opts.RenewalTtl,
 		minCredentialTtl: cmp.Or(opts.MinCredentialTtl, DefaultMinCredentialTtl),
@@ -192,16 +208,17 @@ func (c *Cache) MaxSize() int { return c.maxSize }
 func (c *Cache) RecordMiss() { promCacheState.WithLabelValues("miss").Inc() }
 
 // Get returns the pod's entry, or false when it has none or the entry is past its
-// eviction time. Usable says whether its credentials can still be served.
+// eviction time. CredentialsWithinValidTtl says whether its credentials can still
+// be served.
 func (c *Cache) Get(podUID string) (*Entry, bool) {
 	return c.items.Get(podUID)
 }
 
-// Usable reports whether e's credentials can be stored or served, and how long
-// they have left. The policy is per source:
-//   - IMDS: always usable (static stability), reporting the IMDS refresh interval.
-//   - Auth Service: usable while more than the minimum TTL is left.
-func (c *Cache) Usable(e *Entry) (time.Duration, bool) {
+// CredentialsWithinValidTtl reports whether e's credentials can be stored or
+// served, and how long they have left. The policy is per source:
+//   - IMDS: always valid (static stability), reporting the IMDS refresh interval.
+//   - Auth Service: valid while more than the minimum TTL is left.
+func (c *Cache) CredentialsWithinValidTtl(e *Entry) (time.Duration, bool) {
 	if e.source() == credentials.SourceIMDS {
 		// IMDS creds are always "valid": return the refresh interval as the
 		// duration (not a real remaining TTL) so callers never treat them as expired.
@@ -212,50 +229,40 @@ func (c *Cache) Usable(e *Entry) (time.Duration, bool) {
 }
 
 // Store puts e in the cache for podUID, replacing whatever is there, and schedules
-// its refresh and eviction by source. It refuses an entry with no Owner or with
-// credentials that aren't usable.
+// its refresh and eviction by source. It refuses an entry whose credentials
+// aren't within their valid TTL.
 func (c *Cache) Store(ctx context.Context, podUID string, e *Entry) error {
-	refreshTtl, evictionTtl, err := c.schedule(ctx, podUID, e)
-	if err != nil {
-		return err
+	if e == nil || e.Credentials == nil {
+		return errors.New("no credentials to cache")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.items.SetWithRefreshExpire(podUID, e, refreshTtl, evictionTtl)
+	credsDuration, valid := c.CredentialsWithinValidTtl(e)
+	if !valid {
+		return fmt.Errorf("fetched credentials are expired or will expire within the next %0.2f seconds", credsDuration.Seconds())
+	}
+	refreshTtl, evictionTtl := c.ttls(e.source(), credsDuration)
+	func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.items.SetWithRefreshExpire(podUID, e, refreshTtl, evictionTtl)
+	}()
+	logger.FromContext(ctx).WithFields(map[string]interface{}{
+		"refreshTtl":    refreshTtl,
+		"evictionTtl":   evictionTtl,
+		"credsDuration": credsDuration,
+		"source":        e.source(),
+		"podUID":        podUID,
+	}).Infof("Storing creds in cache")
 	return nil
 }
 
-// Replace stores next in place of old, as Store does, only if the cache still
-// holds old for podUID. It reports whether the cache now holds next, which it
-// already does when next's owner stored it while renewing.
-func (c *Cache) Replace(ctx context.Context, podUID string, old, next *Entry) (bool, error) {
-	refreshTtl, evictionTtl, err := c.schedule(ctx, podUID, next)
-	if err != nil {
-		return false, err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.containsLocked(podUID, next); ok {
-		return true, nil
-	}
-	if _, ok := c.containsLocked(podUID, old); !ok {
-		return false, nil
-	}
-	c.items.SetWithRefreshExpire(podUID, next, refreshTtl, evictionTtl)
-	return true, nil
-}
-
-// Modify replaces old with a copy that f has changed, keeping old's refresh and
-// eviction times, only if the cache still holds old for podUID. f changes no
-// credentials. It reports whether it replaced old.
-func (c *Cache) Modify(podUID string, old *Entry, f func(*Entry)) bool {
+// Modify replaces podUID's entry with a copy that f has changed, keeping the
+// entry's refresh and eviction times. f changes no credentials. It reports
+// whether podUID had an entry.
+func (c *Cache) Modify(podUID string, f func(*Entry)) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	modified := false
 	c.items.Modify(podUID, func(current *Entry) *Entry {
-		if current.Credentials != old.Credentials {
-			return current
-		}
 		next := *current
 		f(&next)
 		modified = true
@@ -264,23 +271,16 @@ func (c *Cache) Modify(podUID string, old *Entry, f func(*Entry)) bool {
 	return modified
 }
 
-// Delete removes old, only if the cache still holds it for podUID. It reports
-// whether it did.
-func (c *Cache) Delete(podUID string, old *Entry) bool {
+// Delete removes podUID's entry, if it has one.
+func (c *Cache) Delete(podUID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.containsLocked(podUID, old); !ok {
-		return false
-	}
-	c.removing.Store(old.Credentials)
-	defer c.removing.Store(nil)
 	c.items.Delete(podUID)
-	return true
 }
 
-// Contains reports whether the cache holds e for podUID, past its eviction
-// time or not.
-func (c *Cache) Contains(podUID string, e *Entry) bool {
+// contains reports whether the cache holds e for podUID, past its eviction time
+// or not.
+func (c *Cache) contains(podUID string, e *Entry) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, ok := c.containsLocked(podUID, e)
@@ -294,29 +294,6 @@ func (c *Cache) containsLocked(podUID string, e *Entry) (*Entry, bool) {
 	return current, ok && current.Credentials == e.Credentials
 }
 
-// schedule checks e can be stored and returns its refresh and eviction TTLs.
-func (c *Cache) schedule(ctx context.Context, podUID string, e *Entry) (time.Duration, time.Duration, error) {
-	if e == nil || e.Credentials == nil {
-		return 0, 0, errors.New("no credentials to cache")
-	}
-	if e.Owner == nil {
-		return 0, 0, errors.New("no owner to renew the cached credentials")
-	}
-	credsDuration, usable := c.Usable(e)
-	if !usable {
-		return 0, 0, fmt.Errorf("fetched credentials are expired or will expire within the next %0.2f seconds", credsDuration.Seconds())
-	}
-	refreshTtl, evictionTtl := c.ttls(e.source(), credsDuration)
-	logger.FromContext(ctx).WithFields(map[string]interface{}{
-		"refreshTtl":    refreshTtl,
-		"evictionTtl":   evictionTtl,
-		"credsDuration": credsDuration,
-		"source":        e.source(),
-		"podUID":        podUID,
-	}).Infof("Storing creds in cache")
-	return refreshTtl, evictionTtl, nil
-}
-
 // ttls returns per-source refresh and eviction TTLs.
 func (c *Cache) ttls(source credentials.CredentialSource, credsDuration time.Duration) (refresh, eviction time.Duration) {
 	// IMDS credentials have static-stability guarantees. Even if expired, static-stability may
@@ -328,15 +305,15 @@ func (c *Cache) ttls(source credentials.CredentialSource, credsDuration time.Dur
 	return min(credsDuration, c.renewalTtl), credsDuration
 }
 
-// onRefresh is the sweep's refresh callback: renew e through its Owner, drop it
-// on an irrecoverable failure, and otherwise keep it and retry later. It skips e
-// once the cache no longer holds it, since the sweep picks every due entry first.
+// onRefresh is the sweep's refresh callback: renew e, drop it on an irrecoverable
+// failure, and otherwise keep it and retry later. It skips e once the cache no
+// longer holds it, since the sweep picks every due entry first.
 func (c *Cache) onRefresh(podUID string, e *Entry) {
 	ctx, cancel := context.WithTimeout(
 		logger.ContextWithField(e.logCtx(), "from", "renewal-thread"), renewalTimeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
-	if !c.Contains(podUID, e) {
+	if !c.contains(podUID, e) {
 		log.Infof("Credentials for pod %s were replaced or removed before their refresh, nothing to refresh", podUID)
 		return
 	}
@@ -346,22 +323,21 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 			log.Errorf("Problem waiting, will schedule refresh to next sweep")
 			return
 		}
-		err = c.renew(ctx, podUID, e)
+		failedBy, err := c.renew(ctx, podUID, e)
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
 			promCacheState.WithLabelValues("hit").Inc()
 			return
 		}
-		if errors.Is(err, errNotCurrent) {
-			log.Infof("Credentials for pod %s were replaced or removed while refreshing, not storing the refresh", podUID)
-			return
-		}
 
-		errCode, isIrrecoverableError := e.Owner.IsIrrecoverable(err)
+		errCode, isIrrecoverableError := noRequestErrCode, false
+		if failedBy != nil {
+			errCode, isIrrecoverableError = failedBy.IsIrrecoverable(err)
+		}
 		if isIrrecoverableError {
 			log.WithField("source", e.source()).Infof("Background refresh failed for pod %s: removing credentials from cache (irrecoverable): %v", podUID, err)
 			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
-			c.Delete(podUID, e)
+			c.Delete(podUID)
 			return
 		}
 		promCacheError.WithLabelValues("Recoverable", errCode).Inc()
@@ -372,29 +348,75 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 	c.keep(ctx, podUID, e)
 }
 
-// renew asks e's Owner for its replacement and stores it in e's place.
-func (c *Cache) renew(ctx context.Context, podUID string, e *Entry) error {
-	next, err := e.Owner.Renew(ctx, podUID, e)
+// noRequestErrCode is the metrics code for a refresh of an entry without a
+// request, which no source classifies.
+const noRequestErrCode = "NoRequest"
+
+// renew fetches e's replacement through what RefreshWith gives it and stores it
+// for podUID, whatever the cache holds by then. On failure it also returns what
+// classifies the error: the TokenSource for a token error, the source otherwise,
+// and nil for an entry without a request.
+func (c *Cache) renew(ctx context.Context, podUID string, e *Entry) (classifier, error) {
+	if e.Request == nil {
+		return nil, errors.New("cached credentials have no request to refresh them with")
+	}
+	source, tokens := c.refresher(e)
+	req := *e.Request
+	if tokens != nil && c.tokenExpiring(req.ServiceAccountToken) {
+		token, err := tokens.Token(ctx, e.Request)
+		if err != nil {
+			return tokens, fmt.Errorf("error getting a current token to refresh with: %w", err)
+		}
+		req.ServiceAccountToken = token
+	}
+	creds, metadata, err := source.GetIamCredentials(ctx, &req)
 	if err != nil {
-		return err
+		return source, fmt.Errorf("error getting credentials to cache: %w", err)
 	}
-	replaced, err := c.Replace(ctx, podUID, e, next)
-	if err != nil {
-		return err
+	if creds == nil {
+		return source, errors.New("delegate returned nil credentials")
 	}
-	if !replaced {
-		return errNotCurrent
+	// The renewal logs as the refresh does, from the renewal thread, and its
+	// store log names its own association.
+	next := &Entry{Credentials: creds, Metadata: metadata, Request: &req,
+		LogCtx: logger.CloneToNewIfPresent(ctx, context.Background())}
+	if metadata != nil {
+		next.LogCtx = logger.ContextWithField(next.LogCtx, "association-id", metadata.AssociationId())
 	}
-	return nil
+	if err := c.Store(next.LogCtx, podUID, next); err != nil {
+		return source, err
+	}
+	return nil, nil
+}
+
+// refresher returns what refreshes e: RefreshWith's source, or Delegate when
+// RefreshWith is nil or gives none, and RefreshWith's TokenSource, if any.
+func (c *Cache) refresher(e *Entry) (credentials.CredentialRetriever, TokenSource) {
+	var source credentials.CredentialRetriever
+	var tokens TokenSource
+	if c.refreshWith != nil {
+		source, tokens = c.refreshWith(e)
+	}
+	if source == nil {
+		source = c.delegate
+	}
+	return source, tokens
+}
+
+// tokenExpiring reports whether token expires within tokenRenewalFloor. A token
+// whose expiry can't be read counts as expiring.
+func (c *Cache) tokenExpiring(token string) bool {
+	exp, err := credentials.GetExpiryFromToken(token)
+	return err != nil || exp.Sub(c.now()) <= tokenRenewalFloor
 }
 
 // keep holds on to e after a refresh that didn't happen or didn't succeed, if
-// its credentials are still usable, and retries after the retry interval plus
-// jitter. It reschedules what the cache holds, which Modify may have changed, and
-// does nothing once the cache no longer holds e.
+// its credentials are still within their valid TTL, and retries after the retry
+// interval plus jitter. It reschedules what the cache holds, which Modify may
+// have changed, and does nothing once the cache no longer holds e.
 func (c *Cache) keep(ctx context.Context, podUID string, e *Entry) {
 	log := logger.FromContext(ctx)
-	credsDuration, valid := c.Usable(e)
+	credsDuration, valid := c.CredentialsWithinValidTtl(e)
 	if !valid {
 		log.Infof("Evicting credentials since they are too old")
 		return
@@ -431,10 +453,9 @@ func (c *Cache) keep(ctx context.Context, podUID string, e *Entry) {
 
 // onEvicted runs for every entry that leaves the cache: one a caller deleted, one
 // past its eviction time, or one pushed out for capacity. It logs and counts the
-// eviction, then tells the entry's Owner.
-func (c *Cache) onEvicted(podUID string, e *Entry) {
+// eviction.
+func (c *Cache) onEvicted(_ string, e *Entry) {
 	log := logger.FromContext(e.logCtx())
 	log.WithField("source", e.source()).Infof("Credentials evicted from cache")
 	promCacheState.WithLabelValues("evicted").Inc()
-	e.Owner.Evicted(podUID, e, e.Credentials == c.removing.Load())
 }
