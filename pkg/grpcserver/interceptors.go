@@ -2,7 +2,9 @@ package grpcserver
 
 import (
 	"context"
+	"strings"
 
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -108,18 +110,19 @@ func StreamLoggerInterceptor() grpc.StreamServerInterceptor {
 	}
 }
 
-// checkSpiffeHeader rejects a call that does not carry SpiffeSecurityHeader set to
-// SpiffeSecurityHeaderValue.
-//
-// It is not an authorization boundary; attestation is. It exists because the SPIFFE
-// Workload API requires the header, and because it stops a browser or a stray HTTP/2
-// client from reaching a handler at all.
-//
-// Every service on this socket is gated, with no exemptions. A SPIFFE library sends
-// the header on every call, and an Envoy sidecar can be given it as a static
-// GrpcService.initial_metadata entry in the bootstrap it ships with, so there is no
-// client that needs an exception and no scope for a rule to apply unevenly.
-func checkSpiffeHeader(ctx context.Context) error {
+// workloadAPIMethodPrefix begins the full method name of every SPIFFE Workload API
+// RPC, which are the only calls the metadata gate applies to.
+var workloadAPIMethodPrefix = "/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/"
+
+// checkSpiffeHeader rejects a Workload API call that does not carry
+// SpiffeSecurityHeader set to SpiffeSecurityHeaderValue, and passes any other method.
+// Only the Workload API is gated, as in SPIRE: its specification requires the header,
+// and Envoy sends none, since istiod's SDS config carries no initial_metadata. It is
+// not an authorization boundary; attestation is.
+func checkSpiffeHeader(ctx context.Context, method string) error {
+	if !strings.HasPrefix(method, workloadAPIMethodPrefix) {
+		return nil
+	}
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return status.Errorf(codes.InvalidArgument, "request carries no metadata: %s has to be set to %q",
@@ -143,7 +146,7 @@ func checkSpiffeHeader(ctx context.Context) error {
 // UnaryMetadataGateInterceptor applies the header requirement to a unary call.
 func UnaryMetadataGateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if err := checkSpiffeHeader(ctx); err != nil {
+		if err := checkSpiffeHeader(ctx, info.FullMethod); err != nil {
 			logger.FromContext(ctx).Debugf("Rejecting call: %v", err)
 			return nil, err
 		}
@@ -154,7 +157,7 @@ func UnaryMetadataGateInterceptor() grpc.UnaryServerInterceptor {
 // StreamMetadataGateInterceptor applies the same requirement to a stream.
 func StreamMetadataGateInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if err := checkSpiffeHeader(ss.Context()); err != nil {
+		if err := checkSpiffeHeader(ss.Context(), info.FullMethod); err != nil {
 			logger.FromContext(ss.Context()).Debugf("Rejecting stream: %v", err)
 			return err
 		}

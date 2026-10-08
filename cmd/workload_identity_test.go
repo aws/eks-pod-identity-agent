@@ -228,7 +228,8 @@ func wiFirstRecv[R any](stream interface{ Recv() (R, error) }, err error) error 
 // Workload API method through the server cmd builds. The test process is not a pod,
 // so the real handler refuses each in-scope method at attestation with
 // PermissionDenied, where the stub would have answered Unimplemented. The WIT methods
-// and SDS stay Unimplemented until their handlers land.
+// and SDS stay Unimplemented until their handlers land, and a Workload API call
+// without the SPIFFE header stops at the gate.
 func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *testing.T) {
 	tiers, _, fetcher := wiBuildTiers(t)
 	conn := wiServe(t, tiers)
@@ -242,6 +243,8 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 		// wantMessage is part of the status message, for a refusal that has to
 		// come from the attestor rather than from a tier or the gate.
 		wantMessage string
+		// withoutHeader leaves out the SPIFFE header, as Envoy does on SDS.
+		withoutHeader bool
 	}{
 		{
 			name: "ValidateJWTSVID",
@@ -303,11 +306,23 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 			wantCode: codes.Unimplemented,
 		},
 		{
+			name: "FetchX509SVID without the SPIFFE header",
+			call: func(ctx context.Context) error {
+				return wiFirstRecv(client.FetchX509SVID(ctx, &workload.X509SVIDRequest{}))
+			},
+			wantCode:      codes.InvalidArgument,
+			wantMessage:   grpcserver.SpiffeSecurityHeader,
+			withoutHeader: true,
+		},
+		// SDS reaches its stub without the header, which the gate asks of the
+		// Workload API only: Envoy sends none.
+		{
 			name: "SDS StreamSecrets",
 			call: func(ctx context.Context) error {
 				return wiFirstRecv(sds.StreamSecrets(ctx))
 			},
-			wantCode: codes.Unimplemented,
+			wantCode:      codes.Unimplemented,
+			withoutHeader: true,
 		},
 		{
 			name: "SDS FetchSecrets",
@@ -315,7 +330,8 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 				_, err := sds.FetchSecrets(ctx, nil)
 				return err
 			},
-			wantCode: codes.Unimplemented,
+			wantCode:      codes.Unimplemented,
+			withoutHeader: true,
 		},
 	}
 
@@ -325,7 +341,9 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			ctx = metadata.AppendToOutgoingContext(ctx, grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue)
+			if !tc.withoutHeader {
+				ctx = metadata.AppendToOutgoingContext(ctx, grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue)
+			}
 
 			err := tc.call(ctx)
 

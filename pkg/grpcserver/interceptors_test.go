@@ -239,24 +239,34 @@ func TestRateLimit_ChargesAStreamOnceAtEstablishment(t *testing.T) {
 	g.Expect(status.Code(err)).To(Equal(codes.ResourceExhausted))
 }
 
-// TestMetadataGate_AppliesToEveryService pins that there is no exemption: whatever is
-// registered on this socket needs the header, including the Envoy SDS service, whose
-// sidecar is given it as a static GrpcService.initial_metadata entry rather than as an
-// exception here.
-func TestMetadataGate_AppliesToEveryService(t *testing.T) {
+// TestMetadataGate_AppliesToTheWorkloadAPIOnly pins the gate's scope from the
+// generated descriptors: every Workload API method needs the header, and no SDS
+// method does, because Envoy calls SDS without one.
+func TestMetadataGate_AppliesToTheWorkloadAPIOnly(t *testing.T) {
 	g := NewWithT(t)
-
-	for _, method := range []string{
-		"/" + workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName + "/FetchX509SVID",
-		"/" + secretv3.SecretDiscoveryService_ServiceDesc.ServiceName + "/StreamSecrets",
-		"/grpc.health.v1.Health/Check",
-		stubUnaryMethod,
-	} {
-		err := checkSpiffeHeader(context.Background())
-		g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument), "%s has to need the header", method)
-	}
 
 	withHeaderCtx := metadata.NewIncomingContext(context.Background(),
 		metadata.Pairs(SpiffeSecurityHeader, SpiffeSecurityHeaderValue))
-	g.Expect(checkSpiffeHeader(withHeaderCtx)).To(Succeed())
+	for _, method := range fullMethods(&workload.SpiffeWorkloadAPI_ServiceDesc) {
+		err := checkSpiffeHeader(context.Background(), method)
+		g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument), "%s has to need the header", method)
+		g.Expect(checkSpiffeHeader(withHeaderCtx, method)).To(Succeed(), method)
+	}
+
+	ungated := append(fullMethods(&secretv3.SecretDiscoveryService_ServiceDesc), "/grpc.health.v1.Health/Check")
+	for _, method := range ungated {
+		g.Expect(checkSpiffeHeader(context.Background(), method)).To(Succeed(), "%s must not need the header", method)
+	}
+}
+
+// fullMethods returns the full method name of every RPC in desc.
+func fullMethods(desc *grpc.ServiceDesc) []string {
+	methods := make([]string, 0, len(desc.Methods)+len(desc.Streams))
+	for _, m := range desc.Methods {
+		methods = append(methods, "/"+desc.ServiceName+"/"+m.MethodName)
+	}
+	for _, s := range desc.Streams {
+		methods = append(methods, "/"+desc.ServiceName+"/"+s.StreamName)
+	}
+	return methods
 }
