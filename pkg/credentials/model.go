@@ -120,3 +120,20 @@ func GetPodUIDFromToken(token string) (string, error) {
 	}
 	return uid, nil
 }
+
+// GetExpiryFromToken returns the exp claim of a Kubernetes service account JWT.
+// It doesn't verify the token.
+func GetExpiryFromToken(token string) (time.Time, error) {
+	parsed, _, err := jwt.NewParser().ParseUnverified(token, jwt.MapClaims{})
+	if err != nil {
+		return time.Time{}, errors.NewRequestValidationError(fmt.Sprintf("cannot parse service account token: %v", err))
+	}
+	exp, err := parsed.Claims.GetExpirationTime()
+	if err != nil {
+		return time.Time{}, errors.NewRequestValidationError(fmt.Sprintf("cannot parse token expiry: %v", err))
+	}
+	if exp == nil {
+		return time.Time{}, errors.NewRequestValidationError("token missing exp claim")
+	}
+	return exp.Time, nil
+}

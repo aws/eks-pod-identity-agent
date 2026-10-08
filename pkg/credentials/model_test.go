@@ -144,6 +144,34 @@ func TestGetPodUIDFromToken(t *testing.T) {
 	}
 }
 
+func TestGetExpiryFromToken(t *testing.T) {
+	exp := time.Unix(1_900_000_000, 0)
+
+	tests := []struct {
+		name    string
+		token   string
+		wantExp time.Time
+		wantErr string
+	}{
+		{"valid token returns exp", buildTestToken(t, map[string]interface{}{"exp": exp.Unix()}), exp, ""},
+		{"malformed JWT", "not-a-jwt", time.Time{}, "cannot parse service account token"},
+		{"missing exp", buildTestToken(t, map[string]interface{}{"foo": "bar"}), time.Time{}, "token missing exp claim"},
+		{"exp not a number", buildTestToken(t, map[string]interface{}{"exp": "soon"}), time.Time{}, "cannot parse token expiry"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := GetExpiryFromToken(tt.token)
+			if tt.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tt.wantErr)))
+				return
+			}
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(got).To(BeTemporally("==", tt.wantExp))
+		})
+	}
+}
+
 // buildTestToken creates an unsigned JWT with the given claims.
 func buildTestToken(t *testing.T, claims map[string]interface{}) string {
 	t.Helper()

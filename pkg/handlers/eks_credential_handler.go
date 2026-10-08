@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
@@ -48,7 +49,34 @@ var (
 	}, []string{"code"})
 )
 
+// NewEksCredentialHandler builds the handler over NewCredentialManager(ctx, opts).Retriever.
 func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts) *EksCredentialHandler {
+	return &EksCredentialHandler{
+		RequestValidator:    validation.DefaultCredentialValidator{},
+		ClusterName:         opts.ClusterName,
+		CredentialRetriever: NewCredentialManager(ctx, opts).Retriever,
+	}
+}
+
+// CredentialManager holds what serves pod credentials: the retriever the
+// handler serves from, the cache under it and the EKS Auth client. A caller other
+// than the handler uses the cache and EKS Auth directly rather than through the
+// handler's retriever.
+type CredentialManager struct {
+	// Retriever is what the handler serves from: the cache's retriever over the
+	// delegates, or the delegates alone when caching is off.
+	Retriever credentials.CredentialRetriever
+	// Cache stores credentials by pod UID. Nil when
+	// --max-credential-retention-before-renewal or --max-cache-size is zero.
+	Cache *credcache.Cache
+	// EKSAuth is the EKS Auth client, the authoritative delegate.
+	EKSAuth credentials.CredentialRetriever
+}
+
+// NewCredentialManager builds the EKS Auth client, the [imds, eksauth] chain when
+// opts.EnableIMDS is set and IMDS answers, and, unless CredentialRenewal or
+// MaxCacheSize is zero, the cache and its retriever with a token validator.
+func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) CredentialManager {
 	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
 	log := logger.FromContext(ctx)
 	credentialsRetriever := eksauth.NewService(ctx, opts.Cfg, opts.EnableIMDS)
@@ -76,25 +104,33 @@ func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts)
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
-		retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
-			Delegate:              credentialsRetriever,
-			AuthoritativeDelegate: authSvc,
-			CredentialsRenewalTtl: opts.CredentialRenewal,
-			MaxCacheSize:          opts.MaxCacheSize,
-			RefreshQPS:            opts.RefreshQPS,
-		}
-		if tv != nil {
-			retrieverOpts.TokenValidator = tv
-		}
-		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
-	}
+	return newCredentialManager(opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+}
 
-	return &EksCredentialHandler{
-		RequestValidator:    validation.DefaultCredentialValidator{},
-		ClusterName:         opts.ClusterName,
-		CredentialRetriever: credentialsRetriever,
+// newCredentialManager is NewCredentialManager over delegates it's given: general
+// serves the handler without a cache and refreshes the cache, and authSvc serves
+// misses. cacheOpts carries the cache options only tests set.
+func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
+	general, authSvc credentials.CredentialRetriever, tv *validation.TokenValidator) CredentialManager {
+	manager := CredentialManager{Retriever: general, EKSAuth: authSvc}
+	if opts.CredentialRenewal == 0 || opts.MaxCacheSize == 0 {
+		return manager
 	}
+	cacheOpts.Delegate = general
+	cacheOpts.RenewalTtl = opts.CredentialRenewal
+	cacheOpts.MaxSize = opts.MaxCacheSize
+	cacheOpts.RefreshQPS = opts.RefreshQPS
+	manager.Cache = credcache.New(cacheOpts)
+	retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
+		Cache:                 manager.Cache,
+		Delegate:              general,
+		AuthoritativeDelegate: authSvc,
+	}
+	if tv != nil {
+		retrieverOpts.TokenValidator = tv
+	}
+	manager.Retriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
+	return manager
 }
 
 func (h *EksCredentialHandler) ConfigureHandler(register func(pattern string, handlerFunc http.HandlerFunc)) {
