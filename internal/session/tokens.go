@@ -31,19 +31,12 @@ import (
 // here introspects a credential.
 func RefreshWith(eksAuth credentials.CredentialRetriever,
 	tokens credcache.TokenSource) func(*credcache.Entry) (credentials.CredentialRetriever, credcache.TokenSource) {
-	return refreshWith(eksAuth, tokens, defaultSourceMetrics())
-}
-
-// refreshWith is RefreshWith over the collector it counts on, so a test can read
-// its own counter instead of the process-wide one.
-func refreshWith(eksAuth credentials.CredentialRetriever, tokens credcache.TokenSource,
-	metrics sourceMetrics) func(*credcache.Entry) (credentials.CredentialRetriever, credcache.TokenSource) {
 	return func(e *credcache.Entry) (credentials.CredentialRetriever, credcache.TokenSource) {
 		if e.Metadata != nil && e.Metadata.ProviderArn() != "" {
-			metrics.observeSource(workloadidentity.CredentialSourceEKSAuth)
+			observeCredentialSource(workloadidentity.CredentialSourceEKSAuth)
 			return eksAuth, tokens
 		}
-		metrics.observeSource(workloadidentity.CredentialSourceIMDSFirst)
+		observeCredentialSource(workloadidentity.CredentialSourceIMDSFirst)
 		return nil, nil
 	}
 }

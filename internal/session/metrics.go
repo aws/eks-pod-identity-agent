@@ -142,21 +142,10 @@ func (m sessionMetrics) observeCache(result string) {
 	m.cache.WithLabelValues(workloadidentity.CacheTierSession, result).Inc()
 }
 
-// sourceMetrics is the collector the enrollment fork rule emits on. It is
-// separate from sessionMetrics because RefreshWith is a package function the
-// cache calls, not a method on a Provider, and a test needs to read its own
-// counter rather than the process-wide one every other test also increments.
-type sourceMetrics struct {
-	sources *prometheus.CounterVec
-}
-
-// defaultSourceMetrics returns the process-wide credential source collector.
-func defaultSourceMetrics() sourceMetrics {
-	return sourceMetrics{sources: promCredentialSource}
-}
-
-// observeSource records one refresh routed to source, which is one of the
-// workloadidentity.CredentialSource values.
-func (m sourceMetrics) observeSource(source string) {
-	m.sources.WithLabelValues(source).Inc()
+// observeCredentialSource records one refresh routed to source, which is one of
+// the workloadidentity.CredentialSource values. It counts on the process-wide
+// collector, since RefreshWith is a package function the cache calls rather than
+// a method on a Provider carrying its own collectors.
+func observeCredentialSource(source string) {
+	promCredentialSource.WithLabelValues(source).Inc()
 }

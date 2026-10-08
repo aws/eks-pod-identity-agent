@@ -446,6 +446,99 @@ func TestSharedCache_AnUndecoratedEntryRefreshesWithItsStoredTokenNearExpiry(t *
 	}
 }
 
+// TestSharedCache_APodEnrolledAfterItsEntryCameFromIMDSKeepsRefreshingThroughIMDS
+// pins what happens when a pod's association gains a workload identity template
+// while the pod already holds an undecorated entry sourced from IMDS.
+//
+// The fork rule reads enrollment off the entry, so an undecorated entry routes
+// to the chain, IMDS answers it, and the renewal is undecorated too: the pod
+// keeps refreshing through IMDS indefinitely, never learning it is now enrolled.
+// Nothing breaks it out on its own, because an IMDS entry refreshes every 30
+// minutes and never evicts.
+//
+// That is accepted rather than a defect, because the pod cannot use workload
+// identity until it restarts anyway: the webhook injects SPIFFE_ENDPOINT_SOCKET
+// and the socket volume at admission, so a running pod has no socket to ask for
+// an SVID on, and an undecorated session harms nothing while it holds one. A
+// pod-spec marker would read the same way for the same reason, so this is not a
+// cost of resolving enrollment from the provider ARN. On restart the pod gets a
+// new UID, misses the cache, and is served the decorated session, which the last
+// phase here stands in for by dropping the entry.
+func TestSharedCache_APodEnrolledAfterItsEntryCameFromIMDSKeepsRefreshingThroughIMDS(t *testing.T) {
+	const enrolledHTTPKey = "ASIAHTTPENROLLED0001"
+	g := NewWithT(t)
+	imds := &imdsLikeRetriever{}
+	h := newSessionFixture(t, sweeping, dueEverySecond, func(o *fixtureOpts) {
+		o.delegate = func(eksAuth credentials.CredentialRetriever) credentials.CredentialRetriever {
+			return credsretriever.NewChainedRetriever(imds, eksAuth)
+		}
+	})
+	token := podToken(t, testSessionPodUID, 0)
+	enrolledArn := eksauthtest.EnrolledSession(time.Time{}).ProviderArn
+
+	// The association carries no workload identity template yet, so EKS Auth
+	// answers undecorated. enrolled flips when the template is added.
+	notEnrolled := eksauthtest.NotEnrolledSession(h.clock.Now().Add(time.Hour))
+	notEnrolled.AccessKeyID = httpAccessKey
+	var enrolled atomic.Bool
+	h.server.SetFunc(func(r eksauthtest.Request) (*eksauthtest.Session, *eksauthtest.APIError) {
+		if r.Token == token {
+			if !enrolled.Load() {
+				return &notEnrolled, nil
+			}
+			decorated := h.httpSession()
+			decorated.AccessKeyID = enrolledHTTPKey
+			return decorated, nil
+		}
+		if n, ok := h.exchangeNumber(r.Token); ok {
+			return h.sessionFor(n), nil
+		}
+		return nil, eksauthtest.InvalidToken()
+	})
+
+	// 1. Not enrolled: the pod's first request is a miss, so EKS Auth serves it
+	//    undecorated, as Mode 2's sync does.
+	_, err := h.httpCredentials(t.Context(), token)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(h.cachedKey(testSessionPodUID)).To(Equal(httpAccessKey))
+
+	// 2. A Mode 2 refresh has since served the pod from IMDS. Relabelling the
+	//    stored entry is how an IMDS-sourced entry is reached without waiting out
+	//    the 30 minute IMDS refresh, and Modify keeps the second-away schedule.
+	g.Expect(h.cache.Modify(testSessionPodUID, func(e *credcache.Entry) {
+		e.Metadata = credentials.CredentialMetadata{CredSource: credentials.SourceIMDS}
+	})).To(BeTrue())
+
+	// 3. The association gains the template, so EKS Auth would now decorate.
+	enrolled.Store(true)
+
+	// 4. The entry carries no provider ARN, so the refresh still routes to the
+	//    chain and IMDS answers it. EKS Auth is never asked.
+	h.eventuallyCached(t, testSessionPodUID, imdsAccessKey)
+	g.Expect(h.server.Calls()).To(Equal(1), "EKS Auth must not be asked, though it would now decorate")
+	g.Expect(imds.calls.Load()).To(Equal(int64(1)))
+	stale, ok := h.cache.Get(testSessionPodUID)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(stale.Metadata.ProviderArn()).To(BeEmpty(), "the renewal is undecorated too")
+	g.Expect(stale.Metadata.Source()).To(Equal(credentials.SourceIMDS))
+	g.Expect(h.sourceCount(workloadidentity.CredentialSourceIMDSFirst)).To(Equal(1.0))
+	g.Expect(h.sourceCount(workloadidentity.CredentialSourceEKSAuth)).To(BeZero(),
+		"enrollment the entry cannot see does not route it to EKS Auth")
+
+	// 5. It heals on the next cache miss, which a pod restart or an agent restart
+	//    produces: EKS Auth is asked again and decorates, so the entry the fork
+	//    rule reads from then on carries the provider ARN.
+	h.cache.Delete(testSessionPodUID)
+	_, err = h.httpCredentials(t.Context(), token)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(h.server.Calls()).To(Equal(2))
+	healed, ok := h.cache.Get(testSessionPodUID)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(healed.Credentials.AccessKeyId).To(Equal(enrolledHTTPKey))
+	g.Expect(healed.Metadata.ProviderArn()).To(Equal(enrolledArn))
+	g.Expect(imds.calls.Load()).To(Equal(int64(1)), "a miss never asks IMDS")
+}
+
 // TestSharedCache_AMintForbiddenDropIsHealedByTheNextHTTPRequest proves a Session
 // entry the sweep dropped because its refresh's mint was refused comes back
 // through the HTTP retriever: the pod's next HTTP request exchanges and stores,

@@ -30,6 +30,8 @@ func TestRefreshWith_GivesOnlyDecoratedEntriesEKSAuthAndTokens(t *testing.T) {
 	eksAuth := mockcreds.NewMockCredentialRetriever(gomock.NewController(t))
 	tokens := MinterTokens(&fake.TokenMinter{})
 
+	refreshWith := RefreshWith(eksAuth, tokens)
+
 	for name, tc := range map[string]struct {
 		metadata    credentials.ResponseMetadata
 		wantEKSAuth bool
@@ -52,9 +54,13 @@ func TestRefreshWith_GivesOnlyDecoratedEntriesEKSAuthAndTokens(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
-			metrics := testSourceMetrics()
+			// The rule counts on the process-wide collector, which the other cases
+			// and every other test in the binary also increment, so the assertion is
+			// on the delta this one call makes.
+			counter := promCredentialSource.WithLabelValues(tc.wantSource)
+			before := testutil.ToFloat64(counter)
 
-			source, gotTokens := refreshWith(eksAuth, tokens, metrics)(&credcache.Entry{Metadata: tc.metadata})
+			source, gotTokens := refreshWith(&credcache.Entry{Metadata: tc.metadata})
 
 			if tc.wantEKSAuth {
 				g.Expect(source).To(BeIdenticalTo(eksAuth))
@@ -66,27 +72,10 @@ func TestRefreshWith_GivesOnlyDecoratedEntriesEKSAuthAndTokens(t *testing.T) {
 
 			// The routing decision is the only place both outcomes are visible, so
 			// it is where an operator reads how many refreshes skipped IMDS.
-			g.Expect(testutil.ToFloat64(metrics.sources.WithLabelValues(tc.wantSource))).To(Equal(1.0))
-			g.Expect(testutil.CollectAndCount(metrics.sources)).To(Equal(1),
-				"one refresh counts on exactly one source")
+			g.Expect(testutil.ToFloat64(counter)).To(Equal(before+1),
+				"one refresh counts once, on the source it was routed to")
 		})
 	}
-}
-
-// TestRefreshWith_ExportedConstructorCountsOnTheProcessCollector proves the
-// exported RefreshWith is the unexported one over the process-wide collector, so
-// the metric is emitted in production and not only in the test above.
-func TestRefreshWith_ExportedConstructorCountsOnTheProcessCollector(t *testing.T) {
-	g := NewWithT(t)
-	eksAuth := mockcreds.NewMockCredentialRetriever(gomock.NewController(t))
-	decorated := &credcache.Entry{Metadata: credentials.CredentialMetadata{Provider: "arn:provider"}}
-
-	counter := promCredentialSource.WithLabelValues(workloadidentity.CredentialSourceEKSAuth)
-	before := testutil.ToFloat64(counter)
-
-	RefreshWith(eksAuth, MinterTokens(&fake.TokenMinter{}))(decorated)
-
-	g.Expect(testutil.ToFloat64(counter)).To(Equal(before + 1))
 }
 
 // TestMinterTokens_MintsForTheWorkloadTheTokenNames proves Token derives the

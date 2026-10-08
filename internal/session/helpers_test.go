@@ -131,9 +131,10 @@ type sessionFixture struct {
 	cache    *credcache.Cache
 	http     credentials.CredentialRetriever
 	provider *Provider
-	// sources is the credential source collector the cache's fork rule counts
-	// on, the fixture's own so a test reads counts no other test has touched.
-	sources sourceMetrics
+	// sourceBase is the credential source counts when the fixture was built. The
+	// fork rule counts on the process-wide collector, which every other test in
+	// the binary also increments, so sourceCount reports the delta since here.
+	sourceBase map[string]float64
 	// minTtl is the cache's floor.
 	minTtl time.Duration
 	// tokenLife is how long each minted token lives on the fixture's clock.
@@ -229,8 +230,8 @@ func newSessionFixture(t *testing.T, configure ...func(*fixtureOpts)) *sessionFi
 		minter = opts.minter
 	}
 	opts.cache.Delegate = delegate
-	h.sources = testSourceMetrics()
-	opts.cache.RefreshWith = refreshWith(client, MinterTokens(minter), h.sources)
+	h.sourceBase = currentSourceCounts()
+	opts.cache.RefreshWith = RefreshWith(client, MinterTokens(minter))
 	h.cache = credcache.New(opts.cache)
 	h.http = credsretriever.NewCachedCredentialRetriever(credsretriever.CachedCredentialRetrieverOpts{
 		Cache:                 h.cache,
@@ -583,9 +584,23 @@ func (h *sessionFixture) exchangeCount(outcome, errLabel string) float64 {
 	return testutil.ToFloat64(h.provider.metrics.exchanges.WithLabelValues(outcome, errLabel))
 }
 
-// sourceCount returns how many refreshes the fixture's cache routed to source.
+// currentSourceCounts reads the credential source counter for every source
+// value, so a fixture can record a baseline and report deltas against it.
+func currentSourceCounts() map[string]float64 {
+	counts := map[string]float64{}
+	for _, source := range []string{
+		workloadidentity.CredentialSourceEKSAuth,
+		workloadidentity.CredentialSourceIMDSFirst,
+	} {
+		counts[source] = testutil.ToFloat64(promCredentialSource.WithLabelValues(source))
+	}
+	return counts
+}
+
+// sourceCount returns how many refreshes have been routed to source since the
+// fixture was built.
 func (h *sessionFixture) sourceCount(source string) float64 {
-	return testutil.ToFloat64(h.sources.sources.WithLabelValues(source))
+	return testutil.ToFloat64(promCredentialSource.WithLabelValues(source)) - h.sourceBase[source]
 }
 
 // newTestSessionMetrics builds unregistered collectors with the production
@@ -596,12 +611,6 @@ func newTestSessionMetrics() sessionMetrics {
 		latency:   prometheus.NewHistogramVec(sessionDurationOpts, sessionDurationLabels),
 		cache:     prometheus.NewCounterVec(cacheTotalOpts, cacheTotalLabels),
 	}
-}
-
-// testSourceMetrics builds an unregistered credential source collector with the
-// production name and labels, for the same reason.
-func testSourceMetrics() sourceMetrics {
-	return sourceMetrics{sources: prometheus.NewCounterVec(credentialSourceOpts, credentialSourceLabels)}
 }
 
 type sessionResult struct {
