@@ -1274,11 +1274,11 @@ func (*countingRetriever) String() string                       { return "counti
 func (*countingRetriever) IsIrrecoverable(error) (string, bool) { return "Unknown", false }
 
 // newTestRetriever builds a cachedCredentialRetriever over a new cache built
-// from cacheOpts. A zero CleanupInterval turns the cache's sweep off, and the
-// cache refreshes through opts.Delegate unless cacheOpts sets its own.
+// from cacheOpts. A zero CleanupInterval puts the cache's sweep an hour away, and
+// the cache refreshes through opts.Delegate unless cacheOpts sets its own.
 func newTestRetriever(cacheOpts credcache.Opts, opts CachedCredentialRetrieverOpts) *cachedCredentialRetriever {
 	if cacheOpts.CleanupInterval == 0 {
-		cacheOpts.CleanupInterval = -1
+		cacheOpts.CleanupInterval = time.Hour
 	}
 	if cacheOpts.Delegate == nil {
 		cacheOpts.Delegate = opts.Delegate

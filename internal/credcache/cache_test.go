@@ -106,18 +106,19 @@ func (f *fakeTokens) IsIrrecoverable(err error) (string, bool) {
 	return f.code, f.irrecoverable
 }
 
-// newTestCache builds a Cache with its sweep off, so a test drives onRefresh.
+// newTestCache builds a Cache whose sweep is an hour away, so a test drives
+// onRefresh itself.
 func newTestCache(delegate credentials.CredentialRetriever) *Cache {
 	return newTestCacheWith(Opts{Delegate: delegate})
 }
 
-// newTestCacheWith is newTestCache with opts, filling in the sizes and turning
-// the sweep off.
+// newTestCacheWith is newTestCache with opts, filling in the sizes and putting
+// the sweep an hour away.
 func newTestCacheWith(opts Opts) *Cache {
 	opts.RenewalTtl = cmp.Or(opts.RenewalTtl, 3*time.Hour)
 	opts.MaxSize = cmp.Or(opts.MaxSize, 100)
 	opts.RefreshQPS = cmp.Or(opts.RefreshQPS, 3)
-	opts.CleanupInterval = -1
+	opts.CleanupInterval = time.Hour
 	if opts.Delegate == nil {
 		opts.Delegate = &fakeSource{}
 	}
@@ -920,7 +921,7 @@ func TestNew_WithoutDelegate_Panics(t *testing.T) {
 	g := NewWithT(t)
 
 	g.Expect(func() {
-		New(Opts{RenewalTtl: time.Hour, MaxSize: 100, CleanupInterval: -1})
+		New(Opts{RenewalTtl: time.Hour, MaxSize: 100})
 	}).To(PanicWith(ContainSubstring("Delegate must be non-nil")))
 }
 
@@ -930,6 +931,6 @@ func TestNew_RefreshQPSTooLowForTheCache_Panics(t *testing.T) {
 	g := NewWithT(t)
 
 	g.Expect(func() {
-		New(Opts{Delegate: &fakeSource{}, RenewalTtl: time.Second, MaxSize: 100, RefreshQPS: 1, CleanupInterval: -1})
+		New(Opts{Delegate: &fakeSource{}, RenewalTtl: time.Second, MaxSize: 100, RefreshQPS: 1})
 	}).To(PanicWith(ContainSubstring("Refresh QPS is too small")))
 }

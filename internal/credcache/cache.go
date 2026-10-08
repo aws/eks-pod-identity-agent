@@ -128,7 +128,7 @@ type Opts struct {
 	// RefreshQPS bounds background refreshes per second, 3 when zero.
 	RefreshQPS int
 	// CleanupInterval is how often the cache looks for entries to refresh or
-	// evict. Zero means a minute; negative turns the sweep off, for tests.
+	// evict. Zero or negative means a minute.
 	CleanupInterval time.Duration
 	// MinCredentialTtl, RetryInterval, MaxRetryJitter and Now default when zero.
 	// Only tests set them.
@@ -170,7 +170,7 @@ func New(opts Opts) *Cache {
 	if opts.Delegate == nil {
 		panic("Delegate must be non-nil")
 	}
-	if opts.CleanupInterval == 0 {
+	if opts.CleanupInterval <= 0 {
 		opts.CleanupInterval = defaultCleanupInterval
 	}
 	if opts.RefreshQPS <= 0 {
@@ -345,6 +345,7 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 	} else {
 		log.Infof("Background refresh rate limited for pod %s: keeping credentials locally", podUID)
 	}
+	// if there was an error, try to keep the old credentials in the agent if they haven't expired
 	c.keep(ctx, podUID, e)
 }
 
