@@ -112,6 +112,14 @@ spec:
           - name: {{ $key }}
             value: {{ $value | quote }}
           {{- end }}
+          {{- if $top.Values.podLiveness.enabled }}
+          # NODE_NAME scopes the agent's pod-liveness watch to this node, so a
+          # background credential refresh can skip pods that have terminated.
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          {{- end }}
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt

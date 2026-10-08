@@ -15,6 +15,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podliveness"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 
@@ -104,7 +105,19 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	return newCredentialManager(opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+	// A node-scoped pod informer lets background refresh skip pods that have
+	// terminated, so churn no longer spends EKS Auth calls on credentials nobody
+	// will read again. If it can't be built (NODE_NAME unset, no in-cluster
+	// config) the agent keeps renewing every entry as before.
+	var podLiveness credcache.PodLiveness
+	if checker, livenessErr := podliveness.NewChecker(ctx); livenessErr != nil {
+		log.Infof("pod liveness check disabled, renewals proceed for every cached pod: %v", livenessErr)
+		podLiveness = podliveness.NewNoopChecker()
+	} else {
+		podLiveness = checker
+	}
+
+	return newCredentialManager(opts, credcache.Opts{PodLiveness: podLiveness}, credentialsRetriever, authSvc, tv)
 }
 
 // newCredentialManager is NewCredentialManager over delegates it's given: general
