@@ -113,7 +113,7 @@ func TestServer_AnswersWithAnEnrolledSessionForAnHourByDefault(t *testing.T) {
 	g.Expect(*out.Credentials.Expiration).To(BeTemporally("<=", after.Add(time.Hour)))
 
 	// The member the SDK drops is there too, read by the agent's client.
-	session, _, err := eksauth.NewService(context.Background(), fake.Config()).GetIamCredentials(context.Background(),
+	session, _, err := eksauth.NewService(context.Background(), fake.Config(), false).GetIamCredentials(context.Background(),
 		&credentials.EksCredentialsRequest{ClusterName: testClusterName, ServiceAccountToken: testToken})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(session.ProviderArn).To(Equal(want.ProviderArn))
@@ -152,7 +152,7 @@ func TestServer_SetSessionControlsEveryMember(t *testing.T) {
 	g.Expect(aws.ToString(out.Subject.ServiceAccount)).To(Equal(session.ServiceAccount))
 	g.Expect(aws.ToString(out.Audience)).To(Equal(DefaultAudience), "an empty Audience is sent as the default")
 
-	got, _, err := eksauth.NewService(context.Background(), fake.Config()).GetIamCredentials(context.Background(),
+	got, _, err := eksauth.NewService(context.Background(), fake.Config(), false).GetIamCredentials(context.Background(),
 		&credentials.EksCredentialsRequest{ClusterName: testClusterName, ServiceAccountToken: testToken})
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(got.ProviderArn).To(Equal(session.ProviderArn))

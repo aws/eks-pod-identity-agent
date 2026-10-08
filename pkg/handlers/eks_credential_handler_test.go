@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
@@ -134,6 +136,79 @@ func TestNewEksCredentialHandler_IMDSDisabled_UsesAuthServiceOnly(t *testing.T) 
 	})
 	assert.Equal(t, "eks-auth", handler.CredentialRetriever.String())
 }
+
+// TestNewCredentialManager_WithCaching_BuildsTheCache verifies a renewal TTL and
+// cache size give the handler the cache's retriever and return the cache.
+func TestNewCredentialManager_WithCaching_BuildsTheCache(t *testing.T) {
+	manager := NewCredentialManager(context.Background(), EksCredentialHandlerOpts{
+		ClusterName:       "test-cluster",
+		CredentialRenewal: time.Hour,
+		MaxCacheSize:      10,
+	})
+	assert.NotNil(t, manager.Cache)
+	assert.Equal(t, "cached-retriever", manager.Retriever.String())
+	assert.Equal(t, "eks-auth", manager.EKSAuth.String())
+}
+
+// TestNewCredentialManager_CacheRefreshesThroughTheGeneralDelegate verifies the
+// wiring: a miss goes to EKS Auth, and the cache refreshes what it stored through
+// the general delegate, the [imds, eksauth] chain when IMDS is on.
+func TestNewCredentialManager_CacheRefreshesThroughTheGeneralDelegate(t *testing.T) {
+	g := NewWithT(t)
+	general := &recordingRetriever{name: "chained-retriever", accessKeyId: "AKIA-REFRESHED"}
+	authSvc := &recordingRetriever{name: "eks-auth", accessKeyId: "AKIA-MISS"}
+	const renewal = 50 * time.Millisecond
+	manager := newCredentialManager(EksCredentialHandlerOpts{
+		CredentialRenewal: renewal,
+		// One pod, and a size the cache's QPS check passes at this renewal TTL.
+		MaxCacheSize: 1,
+		RefreshQPS:   5,
+	}, credcache.Opts{CleanupInterval: renewal / 5}, general, authSvc, nil)
+	request := chainTestRequest(t, "pod-1")
+
+	cred, _, err := manager.Retriever.GetIamCredentials(context.Background(), request)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(cred.AccessKeyId).To(Equal("AKIA-MISS"))
+	g.Eventually(func() string {
+		e, ok := manager.Cache.Get("pod-1")
+		if !ok {
+			return ""
+		}
+		return e.Credentials.AccessKeyId
+	}).WithTimeout(5 * time.Second).WithPolling(renewal / 5).Should(Equal("AKIA-REFRESHED"))
+	g.Expect(authSvc.calls()).To(Equal(1), "only the miss goes to EKS Auth")
+	g.Expect(manager.EKSAuth).To(BeIdenticalTo(authSvc))
+}
+
+// recordingRetriever serves new hour-long credentials with accessKeyId and counts
+// its calls. Unlike a gomock mock it's safe to call after the test ends, as the
+// cache's sweep may.
+type recordingRetriever struct {
+	name, accessKeyId string
+
+	mu sync.Mutex
+	n  int
+}
+
+func (r *recordingRetriever) GetIamCredentials(context.Context, *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.n++
+	return &credentials.EksCredentialsResponse{
+		AccessKeyId: r.accessKeyId,
+		Expiration:  credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+	}, credentials.CredentialMetadata{Association: "a-1", CredSource: credentials.SourceAuthService}, nil
+}
+
+func (r *recordingRetriever) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
+}
+
+func (r *recordingRetriever) String() string                     { return r.name }
+func (*recordingRetriever) IsIrrecoverable(error) (string, bool) { return "Unknown", false }
 
 // TestEndToEnd_CredentialChain_ReturnsCorrectSource ensures the [imds, eksauth]
 // chain returns IMDS credentials when the pod is in IMDS, falls back to eksauth

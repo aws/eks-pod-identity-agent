@@ -57,7 +57,7 @@ func credentialsRequest() *credentials.EksCredentialsRequest {
 
 // getIamCredentials calls GetIamCredentials on a new client for cfg.
 func getIamCredentials(ctx context.Context, cfg aws.Config) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-	return NewService(ctx, cfg).GetIamCredentials(ctx, credentialsRequest())
+	return NewService(ctx, cfg, false).GetIamCredentials(ctx, credentialsRequest())
 }
 
 func TestGetIamCredentials_DecodesEveryFieldOfAnEnrolledSession(t *testing.T) {
@@ -154,7 +154,7 @@ func TestGetIamCredentials_ReadsAMistypedMemberAsAbsent(t *testing.T) {
 func TestGetIamCredentials_IgnoresMembersItDoesNotRead(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
-	svc := NewService(context.Background(), fake.Config())
+	svc := NewService(context.Background(), fake.Config(), false)
 
 	fake.SetRawResponse(http.StatusOK, mustJSON(t, successDocument()))
 	want, wantMetadata, err := svc.GetIamCredentials(context.Background(), credentialsRequest())
@@ -190,9 +190,9 @@ func TestGetIamCredentials_SendsTheOperationSignedByTheNode(t *testing.T) {
 
 	var body map[string]any
 	g.Expect(json.Unmarshal(request.Body, &body)).To(Succeed())
-	// eksauthtest turns IMDS off, so the node's zone is empty.
-	g.Expect(body).To(Equal(map[string]any{"token": testToken, "zone": ""}),
-		"the body carries the token and the zone and nothing else")
+	// The service is built with node metadata off, so the request names no zone.
+	g.Expect(body).To(Equal(map[string]any{"token": testToken}),
+		"the body carries the token and nothing else")
 
 	// Signed by the node credentials, for the eks-auth service in the
 	// configured region.
@@ -447,7 +447,7 @@ func assumeRoleInput() *awseksauth.AssumeRoleForPodIdentityInput {
 func TestWorkloadIdentityProviderArnMiddleware_RunsInsideTheOperationDeserializer(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
-	client := NewService(context.Background(), fake.Config()).(*service).eksAuthService
+	client := NewService(context.Background(), fake.Config(), false).(*service).eksAuthService
 	middlewareID := workloadIdentityProviderArnMiddleware{}.ID()
 
 	var ids []string
@@ -469,7 +469,7 @@ func TestWorkloadIdentityProviderArnMiddleware_RunsInsideTheOperationDeserialize
 func TestWorkloadIdentityProviderArnMiddleware_IsInstalledPerCallOnly(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
-	svc := NewService(context.Background(), fake.Config()).(*service)
+	svc := NewService(context.Background(), fake.Config(), false).(*service)
 	client := svc.eksAuthService
 	apiOptionsBefore := len(client.Options().APIOptions)
 
@@ -743,4 +743,22 @@ func TestGetIamCredentials_ReturnsAuthServiceSource(t *testing.T) {
 	g.Expect(meta.AssociationId()).To(Equal(associationID))
 	g.Expect(resp.AccessKeyId).To(Equal("AKIAIOSFODNN7EXAMPLE"))
 	g.Expect(resp.AccountId).To(Equal("123456789012"))
+}
+
+// TestNewService_IMDSDisabled_SkipsMetadataFetch verifies that when the IMDS
+// feature is disabled, NewService does not fetch node metadata
+func TestNewService_IMDSDisabled_SkipsMetadataFetch(t *testing.T) {
+	g := NewWithT(t)
+	logger.Initialize("error")
+
+	cfg := aws.Config{
+		Region:      "us-west-2",
+		Credentials: aws.AnonymousCredentials{},
+	}
+
+	iface := NewService(context.Background(), cfg, false)
+
+	svc, ok := iface.(*service)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(svc.nodeMetadata).To(BeNil())
 }
