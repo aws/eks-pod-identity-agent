@@ -77,11 +77,11 @@ func TestGetIamCredentials_DecodesEveryFieldOfAnEnrolledSession(t *testing.T) {
 		Token:           session.SessionToken,
 		AccountId:       eksauthtest.AccountID,
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: testExpiration},
-		ProviderArn:     session.ProviderArn,
 	}))
-	g.Expect(got.ProviderArn).ToNot(BeEmpty())
 	g.Expect(metadata).ToNot(BeNil())
 	g.Expect(metadata.AssociationId()).To(Equal(session.AssociationID))
+	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
+	g.Expect(metadata.ProviderArn()).ToNot(BeEmpty())
 }
 
 func TestGetIamCredentials_LeavesProviderArnEmptyWhenTheMemberIsAbsent(t *testing.T) {
@@ -103,6 +103,7 @@ func TestGetIamCredentials_LeavesProviderArnEmptyWhenTheMemberIsAbsent(t *testin
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: testExpiration},
 	}))
 	g.Expect(metadata.AssociationId()).To(Equal(session.AssociationID))
+	g.Expect(metadata.ProviderArn()).To(BeEmpty())
 }
 
 func TestGetIamCredentials_TreatsANullMemberAsAbsent(t *testing.T) {
@@ -112,9 +113,9 @@ func TestGetIamCredentials_TreatsANullMemberAsAbsent(t *testing.T) {
 	document[providerArnMember] = nil
 	fake.SetRawResponse(http.StatusOK, mustJSON(t, document))
 
-	got, _, err := getIamCredentials(context.Background(), fake.Config())
+	got, metadata, err := getIamCredentials(context.Background(), fake.Config())
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(got.ProviderArn).To(BeEmpty())
+	g.Expect(metadata.ProviderArn()).To(BeEmpty())
 	g.Expect(got.AccessKeyId).To(Equal(eksauthtest.EnrolledSession(testExpiration).AccessKeyID))
 }
 
@@ -137,7 +138,7 @@ func TestGetIamCredentials_ReadsAMistypedMemberAsAbsent(t *testing.T) {
 
 			got, metadata, err := getIamCredentials(context.Background(), fake.Config())
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(got.ProviderArn).To(BeEmpty())
+			g.Expect(metadata.ProviderArn()).To(BeEmpty())
 			session := eksauthtest.EnrolledSession(testExpiration)
 			g.Expect(got.AccessKeyId).To(Equal(session.AccessKeyID))
 			g.Expect(got.SecretAccessKey).To(Equal(session.SecretAccessKey))
@@ -169,7 +170,7 @@ func TestGetIamCredentials_IgnoresMembersItDoesNotRead(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(got).To(Equal(want))
 	g.Expect(metadata.AssociationId()).To(Equal(wantMetadata.AssociationId()))
-	g.Expect(got.ProviderArn).To(Equal(eksauthtest.EnrolledSession(testExpiration).ProviderArn))
+	g.Expect(metadata.ProviderArn()).To(Equal(eksauthtest.EnrolledSession(testExpiration).ProviderArn))
 }
 
 func TestGetIamCredentials_SendsTheOperationSignedByTheNode(t *testing.T) {
@@ -362,10 +363,10 @@ func TestGetIamCredentials_DecodesTheFirstValueAsTheSDKDoes(t *testing.T) {
 	fake := eksauthtest.New(t)
 	fake.SetRawResponse(http.StatusOK, append(mustJSON(t, successDocument()), []byte(" trailing")...))
 
-	got, _, err := getIamCredentials(context.Background(), fake.Config())
+	got, metadata, err := getIamCredentials(context.Background(), fake.Config())
 	g.Expect(err).ToNot(HaveOccurred())
 	session := eksauthtest.EnrolledSession(testExpiration)
-	g.Expect(got.ProviderArn).To(Equal(session.ProviderArn))
+	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
 	g.Expect(got.AccessKeyId).To(Equal(session.AccessKeyID))
 }
 
@@ -395,10 +396,10 @@ func TestGetIamCredentials_ReadsTheMemberOffTheAttemptThatSucceeded(t *testing.T
 		})
 	}
 
-	got, _, err := getIamCredentials(context.Background(), cfg)
+	_, metadata, err := getIamCredentials(context.Background(), cfg)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(fake.Calls()).To(Equal(2))
-	g.Expect(got.ProviderArn).To(Equal(session.ProviderArn))
+	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
 }
 
 func TestGetIamCredentials_ReturnsWhenTheContextEnds(t *testing.T) {

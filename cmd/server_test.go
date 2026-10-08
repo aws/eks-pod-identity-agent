@@ -1,13 +1,19 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	. "github.com/onsi/gomega"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -157,4 +163,125 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 		svidRenewalJitter = originalJitter
 		maxCacheSize = originalMaxCacheSize
 	})
+}
+
+// namedRetriever is a retriever a test can tell apart from another by identity.
+type namedRetriever struct {
+	wiNoExchange
+	name string
+}
+
+// TestShareCredentialManager_HandsTheManagersPartsToBothServers proves every
+// bind host serves from the manager's retriever and the session tier gets the
+// manager's cache and EKS Auth client, so both share one cache.
+func TestShareCredentialManager_HandsTheManagersPartsToBothServers(t *testing.T) {
+	g := NewWithT(t)
+	manager := handlers.CredentialManager{
+		Retriever: &namedRetriever{name: "cached-retriever"},
+		Cache: credcache.New(credcache.Opts{
+			Delegate: wiNoExchange{}, RenewalTtl: time.Hour, MaxSize: 10, CleanupInterval: time.Hour,
+		}),
+		EKSAuth: &namedRetriever{name: "eks-auth"},
+	}
+	credentialOpts := handlers.EksCredentialHandlerOpts{ClusterName: "test-cluster"}
+	workloadIdentityOpts := handlers.WorkloadIdentityServerOpts{ClusterName: "test-cluster"}
+
+	shareCredentialManager(manager, &credentialOpts, &workloadIdentityOpts)
+
+	g.Expect(credentialOpts.CredentialRetriever).To(BeIdenticalTo(manager.Retriever))
+	g.Expect(workloadIdentityOpts.CredentialCache).To(BeIdenticalTo(manager.Cache))
+	g.Expect(workloadIdentityOpts.EKSAuth).To(BeIdenticalTo(manager.EKSAuth))
+	g.Expect(credentialOpts.ClusterName).To(Equal("test-cluster"), "only the shared parts may change")
+}
+
+// TestCreateServers_WorkloadIdentityOff_BuildsNoNodeClient proves boot with
+// workload identity off builds no node client, so it needs neither the API
+// server nor the kubelet's kubeconfig. Nothing listens until the servers run.
+func TestCreateServers_WorkloadIdentityOff_BuildsNoNodeClient(t *testing.T) {
+	g := NewWithT(t)
+	builds := countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))
+	original := enableWorkloadIdentity
+	enableWorkloadIdentity = false
+	t.Cleanup(func() { enableWorkloadIdentity = original })
+
+	servers, err := createServers(t.Context(), aws.Config{})
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(servers).ToNot(BeEmpty())
+	g.Expect(builds.Load()).To(BeZero(), "no node client may be built with workload identity off")
+}
+
+// TestBuildSharedCredentialManager_Off_GivesTheCacheNoTokenSource proves the
+// credential manager is built without the workload identity token source when
+// the feature is off, so its cache refreshes every entry through the general
+// delegate, and no node client is built.
+func TestBuildSharedCredentialManager_Off_GivesTheCacheNoTokenSource(t *testing.T) {
+	g := NewWithT(t)
+	builds := countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))
+	built := captureCredentialManagerOpts(t)
+	credentialOpts := handlers.EksCredentialHandlerOpts{ClusterName: "test-cluster"}
+	workloadIdentityOpts := wiOpts
+	workloadIdentityOpts.Enabled = false
+
+	clients, err := buildSharedCredentialManager(t.Context(), &credentialOpts, &workloadIdentityOpts)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(clients).To(BeNil())
+	g.Expect(*built).To(HaveLen(1))
+	g.Expect((*built)[0].WorkloadIdentityTokens).To(BeNil())
+	g.Expect(builds.Load()).To(BeZero())
+}
+
+// TestBuildSharedCredentialManager_On_RefreshesWithTheTiersMinter proves the
+// credential manager's cache gets a token source over the minter the returned
+// clients hand the session tier: a token it mints is what that minter then
+// serves for the pod, from one TokenRequest on the one node client.
+func TestBuildSharedCredentialManager_On_RefreshesWithTheTiersMinter(t *testing.T) {
+	g := NewWithT(t)
+	client := newWINodeClientset("system:node:" + wiTestNode)
+	builds := countNodeClientBuilds(t, client)
+	built := captureCredentialManagerOpts(t)
+	credentialOpts := handlers.EksCredentialHandlerOpts{
+		ClusterName: "test-cluster", CredentialRenewal: time.Hour, MaxCacheSize: 100,
+	}
+	workloadIdentityOpts := wiOpts
+
+	clients, err := buildSharedCredentialManager(t.Context(), &credentialOpts, &workloadIdentityOpts)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(builds.Load()).To(Equal(int32(1)))
+	g.Expect(clients.clientset).To(BeIdenticalTo(client))
+	g.Expect(*built).To(HaveLen(1))
+	g.Expect(workloadIdentityOpts.CredentialCache).ToNot(BeNil(), "the session tier gets the manager's cache")
+	tokens := (*built)[0].WorkloadIdentityTokens
+	g.Expect(tokens).ToNot(BeNil())
+
+	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
+	stored := wiPodToken(w.Namespace, w.ServiceAccount, &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{BoundObjectRef: &authenticationv1.BoundObjectReference{
+			Name: w.PodName, UID: types.UID(w.PodUID),
+		}},
+	}, time.Now().Add(time.Minute))
+	token, err := tokens.Token(t.Context(), &credentials.EksCredentialsRequest{ServiceAccountToken: stored})
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(client.tokenRequests()).To(Equal([]string{token}), "the cache's token source mints on the node client")
+
+	minted, err := clients.minter.Mint(t.Context(), w)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(minted.Token).To(Equal(token), "the session tier's minter serves the token the cache's source minted")
+	g.Expect(client.tokenRequests()).To(HaveLen(1))
+}
+
+// captureCredentialManagerOpts makes newCredentialManager record the options
+// each manager is built with, for the rest of the test.
+func captureCredentialManagerOpts(t *testing.T) *[]handlers.EksCredentialHandlerOpts {
+	t.Helper()
+	var built []handlers.EksCredentialHandlerOpts
+	original := newCredentialManager
+	newCredentialManager = func(ctx context.Context, opts handlers.EksCredentialHandlerOpts) handlers.CredentialManager {
+		built = append(built, opts)
+		return original(ctx, opts)
+	}
+	t.Cleanup(func() { newCredentialManager = original })
+	return &built
 }

@@ -41,6 +41,9 @@ const (
 type ResponseMetadata interface {
 	AssociationId() string
 	Source() CredentialSource
+	// ProviderArn is the workload identity provider EKS Auth decorated the
+	// session with, and empty for a pod not enrolled.
+	ProviderArn() string
 }
 
 // CredentialMetadata is a concrete ResponseMetadata for use by
@@ -48,10 +51,12 @@ type ResponseMetadata interface {
 type CredentialMetadata struct {
 	Association string
 	CredSource  CredentialSource
+	Provider    string
 }
 
 func (m CredentialMetadata) AssociationId() string    { return m.Association }
 func (m CredentialMetadata) Source() CredentialSource { return m.CredSource }
+func (m CredentialMetadata) ProviderArn() string      { return m.Provider }
 
 // NamespaceInfo represents the parsed info file from an IMDS iam-eks namespace.
 //
@@ -63,7 +68,6 @@ func (m CredentialMetadata) Source() CredentialSource { return m.CredSource }
 //	  "LastUpdated": "2026-09-24T21:28:57Z",
 //	  "PodCredentials": { "<podUIDA>": "0",  <podUIDB>": "1"}
 //	}
-//
 type NamespaceInfo struct {
 	Code           string            `json:"Code"`
 	LastUpdated    string            `json:"LastUpdated"`
@@ -86,10 +90,6 @@ type EksCredentialsResponse struct {
 	Token           string                     `json:"Token,omitempty"`
 	AccountId       string                     `json:"AccountId,omitempty"`
 	Expiration      SdkCompliantExpirationTime `json:"Expiration,omitempty"`
-	// ProviderArn is the workload identity provider EKS Auth decorated the
-	// session with, and empty for a pod not enrolled. It's for the agent only,
-	// so json:"-" keeps it out of the credentials served to pods.
-	ProviderArn string `json:"-"`
 }
 
 type SdkCompliantExpirationTime struct {

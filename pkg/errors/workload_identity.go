@@ -148,8 +148,9 @@ func newWorkloadIdentityError(kind Kind, label string, retryable bool) *Workload
 var (
 	// ErrUnattestable is produced by the attestor (T3) when the caller on an
 	// accepted connection, including one not on a Unix socket, cannot be resolved
-	// to a pod, by the bundle source (T6) for a nil workload, and by the token
-	// source (T8) for a pod no longer in the node store. Not retryable.
+	// to a pod, by the bundle source (T6) for a nil workload, by the token source
+	// (T8) for a pod no longer in the node store, and by the session tier (T5)
+	// for a token to renew that names no pod. Not retryable.
 	ErrUnattestable = newWorkloadIdentityError(KindUnattestable, "unattestable", false)
 
 	// ErrNotEnrolled is produced by the token minter (T4) and the session

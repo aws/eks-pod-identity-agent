@@ -90,6 +90,6 @@
 // # Integration
 //
 // Startup must construct the source with the same node-scoped PodStore used for
-// attestation and pass it to the Workload API handler. Current agent startup does
-// not yet construct this source; package tests do not enable production wiring.
+// attestation and pass it to the Workload API handler, which cmd does when it
+// builds the workload identity tiers.
 package jwt

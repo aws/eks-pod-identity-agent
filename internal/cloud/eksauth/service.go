@@ -118,9 +118,9 @@ func (s *service) GetIamCredentials(ctx context.Context,
 			Token:           *creds.Credentials.SessionToken,
 			AccountId:       parsedArn.AccountID,
 			Expiration:      credentials.SdkCompliantExpirationTime{Time: *creds.Credentials.Expiration},
-			ProviderArn:     providerArn,
 		}, credentials.CredentialMetadata{
 			Association: *creds.PodIdentityAssociation.AssociationId,
 			CredSource:  credentials.SourceAuthService,
+			Provider:    providerArn,
 		}, nil
 }

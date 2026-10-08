@@ -7,6 +7,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
@@ -79,6 +81,13 @@ type WorkloadIdentityServerOpts struct {
 	// it is one setting for the agent. JWT-SVIDs are unaffected, since STS signs those
 	// and the agent generates no key for them.
 	SVIDKeyType workloadidentity.KeyType
+	// CredentialCache is the credential cache every bind host serves from, so
+	// the session tier shares it. Nil when caching is off. It isn't a flag: cmd
+	// sets it, and Validate doesn't read it.
+	CredentialCache *credcache.Cache
+	// EKSAuth is the EKS Auth client the session tier exchanges with. cmd sets
+	// it, and Validate doesn't read it.
+	EKSAuth credentials.CredentialRetriever
 }
 
 // durationEnvelope is the range of requested lifetimes the issuing API accepts
