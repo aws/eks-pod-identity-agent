@@ -7,6 +7,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/mock/gomock"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
@@ -28,32 +29,64 @@ func TestRefreshWith_GivesOnlyDecoratedEntriesEKSAuthAndTokens(t *testing.T) {
 	// No calls expected: the rule only picks a source and a token source.
 	eksAuth := mockcreds.NewMockCredentialRetriever(gomock.NewController(t))
 	tokens := MinterTokens(&fake.TokenMinter{})
-	refreshWith := RefreshWith(eksAuth, tokens)
 
 	for name, tc := range map[string]struct {
 		metadata    credentials.ResponseMetadata
 		wantEKSAuth bool
+		wantSource  string
 	}{
 		"decorated": {
 			metadata:    credentials.CredentialMetadata{CredSource: credentials.SourceAuthService, Provider: "arn:provider"},
 			wantEKSAuth: true,
+			wantSource:  workloadidentity.CredentialSourceEKSAuth,
 		},
-		"undecorated": {metadata: credentials.CredentialMetadata{CredSource: credentials.SourceAuthService}},
-		"from IMDS":   {metadata: credentials.CredentialMetadata{CredSource: credentials.SourceIMDS}},
-		"no metadata": {},
+		"undecorated": {
+			metadata:   credentials.CredentialMetadata{CredSource: credentials.SourceAuthService},
+			wantSource: workloadidentity.CredentialSourceIMDSFirst,
+		},
+		"from IMDS": {
+			metadata:   credentials.CredentialMetadata{CredSource: credentials.SourceIMDS},
+			wantSource: workloadidentity.CredentialSourceIMDSFirst,
+		},
+		"no metadata": {wantSource: workloadidentity.CredentialSourceIMDSFirst},
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
-			source, gotTokens := refreshWith(&credcache.Entry{Metadata: tc.metadata})
+			metrics := testSourceMetrics()
+
+			source, gotTokens := refreshWith(eksAuth, tokens, metrics)(&credcache.Entry{Metadata: tc.metadata})
+
 			if tc.wantEKSAuth {
 				g.Expect(source).To(BeIdenticalTo(eksAuth))
 				g.Expect(gotTokens).To(Equal(tokens))
-				return
+			} else {
+				g.Expect(source).To(BeNil())
+				g.Expect(gotTokens).To(BeNil())
 			}
-			g.Expect(source).To(BeNil())
-			g.Expect(gotTokens).To(BeNil())
+
+			// The routing decision is the only place both outcomes are visible, so
+			// it is where an operator reads how many refreshes skipped IMDS.
+			g.Expect(testutil.ToFloat64(metrics.sources.WithLabelValues(tc.wantSource))).To(Equal(1.0))
+			g.Expect(testutil.CollectAndCount(metrics.sources)).To(Equal(1),
+				"one refresh counts on exactly one source")
 		})
 	}
+}
+
+// TestRefreshWith_ExportedConstructorCountsOnTheProcessCollector proves the
+// exported RefreshWith is the unexported one over the process-wide collector, so
+// the metric is emitted in production and not only in the test above.
+func TestRefreshWith_ExportedConstructorCountsOnTheProcessCollector(t *testing.T) {
+	g := NewWithT(t)
+	eksAuth := mockcreds.NewMockCredentialRetriever(gomock.NewController(t))
+	decorated := &credcache.Entry{Metadata: credentials.CredentialMetadata{Provider: "arn:provider"}}
+
+	counter := promCredentialSource.WithLabelValues(workloadidentity.CredentialSourceEKSAuth)
+	before := testutil.ToFloat64(counter)
+
+	RefreshWith(eksAuth, MinterTokens(&fake.TokenMinter{}))(decorated)
+
+	g.Expect(testutil.ToFloat64(counter)).To(Equal(before + 1))
 }
 
 // TestMinterTokens_MintsForTheWorkloadTheTokenNames proves Token derives the

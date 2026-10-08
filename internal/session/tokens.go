@@ -17,12 +17,33 @@ import (
 // tokens swapping a stored token close to expiry, and never through the [IMDS,
 // EKS Auth] chain, whose IMDS answers aren't decorated. Every other entry gets
 // (nil, nil): the cache's Delegate, presenting its stored token as it is.
+//
+// It is also the HOSM/WISE source selection: the provider ARN is the per-pod
+// enrollment signal, so an enrolled pod's refresh never reaches IMDS, where the
+// DR aggregator publishes undecorated credentials for it regardless of
+// enrollment. Consuming one of those would leave the agent holding an
+// undecorated session where issuance requires a decorated one, which fails
+// silently rather than loudly. A sync needs no such rule: a cache miss is served
+// by the authoritative delegate, EKS Auth alone, for every pod.
+//
+// The ARN is read off the response metadata, never off the credentials: an STS
+// session token is opaque, so decoration is not observable on the node. Nothing
+// here introspects a credential.
 func RefreshWith(eksAuth credentials.CredentialRetriever,
 	tokens credcache.TokenSource) func(*credcache.Entry) (credentials.CredentialRetriever, credcache.TokenSource) {
+	return refreshWith(eksAuth, tokens, defaultSourceMetrics())
+}
+
+// refreshWith is RefreshWith over the collector it counts on, so a test can read
+// its own counter instead of the process-wide one.
+func refreshWith(eksAuth credentials.CredentialRetriever, tokens credcache.TokenSource,
+	metrics sourceMetrics) func(*credcache.Entry) (credentials.CredentialRetriever, credcache.TokenSource) {
 	return func(e *credcache.Entry) (credentials.CredentialRetriever, credcache.TokenSource) {
 		if e.Metadata != nil && e.Metadata.ProviderArn() != "" {
+			metrics.observeSource(workloadidentity.CredentialSourceEKSAuth)
 			return eksAuth, tokens
 		}
+		metrics.observeSource(workloadidentity.CredentialSourceIMDSFirst)
 		return nil, nil
 	}
 }

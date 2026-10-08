@@ -44,6 +44,12 @@ var (
 		Help: cacheTotalHelp,
 	}
 	cacheTotalLabels = []string{workloadidentity.LabelTier, workloadidentity.LabelResult}
+
+	credentialSourceOpts = prometheus.CounterOpts{
+		Name: workloadidentity.MetricCredentialSourceTotal,
+		Help: "Count of credential refreshes by the source the pod's enrollment routed them to.",
+	}
+	credentialSourceLabels = []string{workloadidentity.LabelSource}
 )
 
 var (
@@ -56,6 +62,12 @@ var (
 	// mint to the EKS Auth answer. A cache hit isn't an exchange and isn't
 	// observed.
 	promSessionDuration = promauto.NewHistogramVec(sessionDurationOpts, sessionDurationLabels)
+
+	// promCredentialSource counts each refresh by the source RefreshWith routed
+	// it to. It is owned here rather than by credcache because the enrollment
+	// fork rule lives here, and it is the only place both outcomes of that rule
+	// are visible.
+	promCredentialSource = promauto.NewCounterVec(credentialSourceOpts, credentialSourceLabels)
 
 	// promCacheTotal is the shared workload_identity_cache_total counter, which
 	// other tiers register too. sessionCacheTotal registers it lazily, after
@@ -128,4 +140,23 @@ func (m sessionMetrics) observeExchange(err error, seconds float64) {
 // expired.
 func (m sessionMetrics) observeCache(result string) {
 	m.cache.WithLabelValues(workloadidentity.CacheTierSession, result).Inc()
+}
+
+// sourceMetrics is the collector the enrollment fork rule emits on. It is
+// separate from sessionMetrics because RefreshWith is a package function the
+// cache calls, not a method on a Provider, and a test needs to read its own
+// counter rather than the process-wide one every other test also increments.
+type sourceMetrics struct {
+	sources *prometheus.CounterVec
+}
+
+// defaultSourceMetrics returns the process-wide credential source collector.
+func defaultSourceMetrics() sourceMetrics {
+	return sourceMetrics{sources: promCredentialSource}
+}
+
+// observeSource records one refresh routed to source, which is one of the
+// workloadidentity.CredentialSource values.
+func (m sourceMetrics) observeSource(source string) {
+	m.sources.WithLabelValues(source).Inc()
 }

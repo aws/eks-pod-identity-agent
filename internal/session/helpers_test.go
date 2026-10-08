@@ -131,6 +131,9 @@ type sessionFixture struct {
 	cache    *credcache.Cache
 	http     credentials.CredentialRetriever
 	provider *Provider
+	// sources is the credential source collector the cache's fork rule counts
+	// on, the fixture's own so a test reads counts no other test has touched.
+	sources sourceMetrics
 	// minTtl is the cache's floor.
 	minTtl time.Duration
 	// tokenLife is how long each minted token lives on the fixture's clock.
@@ -226,7 +229,8 @@ func newSessionFixture(t *testing.T, configure ...func(*fixtureOpts)) *sessionFi
 		minter = opts.minter
 	}
 	opts.cache.Delegate = delegate
-	opts.cache.RefreshWith = RefreshWith(client, MinterTokens(minter))
+	h.sources = testSourceMetrics()
+	opts.cache.RefreshWith = refreshWith(client, MinterTokens(minter), h.sources)
 	h.cache = credcache.New(opts.cache)
 	h.http = credsretriever.NewCachedCredentialRetriever(credsretriever.CachedCredentialRetrieverOpts{
 		Cache:                 h.cache,
@@ -579,6 +583,11 @@ func (h *sessionFixture) exchangeCount(outcome, errLabel string) float64 {
 	return testutil.ToFloat64(h.provider.metrics.exchanges.WithLabelValues(outcome, errLabel))
 }
 
+// sourceCount returns how many refreshes the fixture's cache routed to source.
+func (h *sessionFixture) sourceCount(source string) float64 {
+	return testutil.ToFloat64(h.sources.sources.WithLabelValues(source))
+}
+
 // newTestSessionMetrics builds unregistered collectors with the production
 // names and labels, so a test reads counts no other test has touched.
 func newTestSessionMetrics() sessionMetrics {
@@ -587,6 +596,12 @@ func newTestSessionMetrics() sessionMetrics {
 		latency:   prometheus.NewHistogramVec(sessionDurationOpts, sessionDurationLabels),
 		cache:     prometheus.NewCounterVec(cacheTotalOpts, cacheTotalLabels),
 	}
+}
+
+// testSourceMetrics builds an unregistered credential source collector with the
+// production name and labels, for the same reason.
+func testSourceMetrics() sourceMetrics {
+	return sourceMetrics{sources: prometheus.NewCounterVec(credentialSourceOpts, credentialSourceLabels)}
 }
 
 type sessionResult struct {

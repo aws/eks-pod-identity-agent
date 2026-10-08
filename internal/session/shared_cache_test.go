@@ -354,6 +354,14 @@ func TestSharedCache_DecoratedEntriesRefreshThroughEKSAuthAndOthersThroughTheCha
 	g.Expect(h.presentedBy(2)).To(Equal(h.minted(1)), "the Session entry presents its own token")
 	g.Expect(imds.calls.Load()).To(Equal(int64(1)), "only the undecorated entry's refresh may ask IMDS")
 
+	// The source metric is what an operator reads during the HOSM/WISE overlap to
+	// confirm enrolled pods are skipping IMDS. It must agree with what the chain
+	// was actually asked: two refreshes bypassed IMDS, one did not.
+	g.Expect(h.sourceCount(workloadidentity.CredentialSourceEKSAuth)).To(Equal(2.0),
+		"the Session entry and the decorated HTTP entry are both routed to EKS Auth")
+	g.Expect(h.sourceCount(workloadidentity.CredentialSourceIMDSFirst)).To(Equal(1.0),
+		"only the undecorated entry is routed to the IMDS-first chain")
+
 	got, err = h.session(otherSessionPodUID)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(got.Credentials.AccessKeyID).To(HavePrefix("ASIAEXCHANGE"), "an IMDS entry must not serve Session")
