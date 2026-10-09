@@ -109,6 +109,20 @@ type classifier interface {
 	IsIrrecoverable(err error) (string, bool)
 }
 
+// PodLiveness reports whether the pod a cached entry belongs to is still present
+// on this node, so a refresh can skip entries for pods that have terminated. It
+// is expected to fail open, reporting alive whenever the answer is not known for
+// certain, so a renewal is only skipped for a pod positively known absent.
+type PodLiveness interface {
+	IsAlive(namespace, name, uid string) bool
+}
+
+// alwaysAlivePodLiveness is the default when Opts.PodLiveness is nil: it reports
+// every pod alive, preserving the behavior from before the liveness check.
+type alwaysAlivePodLiveness struct{}
+
+func (alwaysAlivePodLiveness) IsAlive(_, _, _ string) bool { return true }
+
 // Opts configures a Cache.
 type Opts struct {
 	// Delegate is the source a refresh uses unless RefreshWith gives another: the
@@ -130,6 +144,11 @@ type Opts struct {
 	// CleanupInterval is how often the cache looks for entries to refresh or
 	// evict. Zero or negative means a minute.
 	CleanupInterval time.Duration
+	// PodLiveness, when set, lets a refresh skip entries whose pod has left this
+	// node, evicting them instead of presenting their request to the source. A
+	// nil value disables the check (every pod is treated as alive), preserving
+	// the previous behavior.
+	PodLiveness PodLiveness
 	// MinCredentialTtl, RetryInterval, MaxRetryJitter and Now default when zero.
 	// Only tests set them.
 	MinCredentialTtl time.Duration
@@ -162,6 +181,8 @@ type Cache struct {
 	// refreshLimiter slows down refreshes to avoid getting throttled in case
 	// there is some sort of backlog of creds waiting to be refreshed.
 	refreshLimiter *rate.Limiter
+	// podLiveness lets a refresh skip entries whose pod has left this node.
+	podLiveness PodLiveness
 }
 
 // New builds a Cache and starts its sweep. It panics when Delegate is nil, or when
@@ -192,9 +213,13 @@ func New(opts Opts) *Cache {
 		maxRetryJitter:   cmp.Or(opts.MaxRetryJitter, defaultMaxRetryJitter),
 		now:              opts.Now,
 		refreshLimiter:   rate.NewLimiter(rate.Limit(opts.RefreshQPS), opts.RefreshQPS),
+		podLiveness:      opts.PodLiveness,
 	}
 	if c.now == nil {
 		c.now = time.Now
+	}
+	if c.podLiveness == nil {
+		c.podLiveness = alwaysAlivePodLiveness{}
 	}
 	c.items.OnRefresh(c.onRefresh)
 	c.items.OnEvicted(c.onEvicted)
@@ -317,6 +342,12 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 		log.Infof("Credentials for pod %s were replaced or removed before their refresh, nothing to refresh", podUID)
 		return
 	}
+	if c.podTerminated(e) {
+		log.WithField("source", e.source()).Infof("Pod for %s is no longer on this node, evicting its credentials instead of renewing them", podUID)
+		promCacheState.WithLabelValues("skipped-terminated").Inc()
+		c.Delete(podUID)
+		return
+	}
 	if c.refreshLimiter.Allow() {
 		err := c.refreshLimiter.Wait(ctx)
 		if err != nil {
@@ -347,6 +378,21 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 	}
 	// if there was an error, try to keep the old credentials in the agent if they haven't expired
 	c.keep(ctx, podUID, e)
+}
+
+// podTerminated reports whether e belongs to a pod the liveness checker knows has
+// left this node. It fails open: an entry with no request, a token whose pod
+// identity cannot be read, or a checker that is unsure all count as not
+// terminated, so a refresh is only skipped for a pod positively known absent.
+func (c *Cache) podTerminated(e *Entry) bool {
+	if e.Request == nil {
+		return false
+	}
+	pod, ok := credentials.GetPodIdentityFromToken(e.Request.ServiceAccountToken)
+	if !ok {
+		return false
+	}
+	return !c.podLiveness.IsAlive(pod.Namespace, pod.Name, pod.UID)
 }
 
 // noRequestErrCode is the metrics code for a refresh of an entry without a
