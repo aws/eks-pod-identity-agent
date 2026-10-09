@@ -54,6 +54,15 @@ const (
 	MetricNotificationTotal = "workload_identity_notification_total"
 	// MetricCacheTotal counts cache lookups. All tiers: {tier, result}.
 	MetricCacheTotal = "workload_identity_cache_total"
+	// MetricCredentialSourceTotal counts the credential source a refresh was
+	// routed to, by pod enrollment. T15: {source}.
+	//
+	// It is the observable for the HOSM/WISE overlap: an enrolled pod must never
+	// refresh through IMDS, because the DR aggregator publishes undecorated
+	// credentials for it there, and consuming one is a silent correctness break
+	// rather than a latency regression. Only a refresh is counted, since a sync
+	// is EKS Auth for every pod by construction.
+	MetricCredentialSourceTotal = "workload_identity_credential_source_total"
 	// MetricRPCTotal counts served RPCs. T10,T11: {rpc, outcome, error}.
 	MetricRPCTotal = "workload_identity_rpc_total"
 	// MetricRPCDuration observes served RPC latency. T10,T11: {rpc, outcome}.
@@ -93,6 +102,9 @@ const (
 	LabelTier = "tier"
 	// LabelResult carries the cache lookup result, one of the CacheResult values.
 	LabelResult = "result"
+	// LabelSource carries the credential source a refresh was routed to, one of
+	// the CredentialSource values. It is on MetricCredentialSourceTotal only.
+	LabelSource = "source"
 )
 
 // Values for LabelOutcome.
@@ -177,6 +189,23 @@ const (
 	CacheResultEvicted = "evicted"
 )
 
+// Values for LabelSource, naming where a refresh was routed.
+//
+// These name the route the enrollment decision picked, not the source that
+// ultimately answered. A refresh routed to the chain may still be served by EKS
+// Auth when IMDS holds nothing, and which arm of the chain won is already
+// counted by pod_identity_chained_retriever_result. What is not observable
+// anywhere else, and what this metric exists for, is how many refreshes skipped
+// IMDS because the pod is enrolled.
+const (
+	// CredentialSourceEKSAuth means the pod is enrolled, so the refresh went
+	// straight to EKS Auth and IMDS was not read.
+	CredentialSourceEKSAuth = "eks_auth"
+	// CredentialSourceIMDSFirst means the pod is not enrolled, so the refresh
+	// went to the [IMDS, EKS Auth] chain and kept HOSM static stability.
+	CredentialSourceIMDSFirst = "imds_first"
+)
+
 // Values for LabelReason, one per attestation failure mode.
 const (
 	// ReasonNotUnixSocket means the connection was not a Unix socket, so peer
@@ -233,6 +262,7 @@ func MetricNames() []string {
 		MetricSubscriptionsActive,
 		MetricNotificationTotal,
 		MetricCacheTotal,
+		MetricCredentialSourceTotal,
 		MetricRPCTotal,
 		MetricRPCDuration,
 	}

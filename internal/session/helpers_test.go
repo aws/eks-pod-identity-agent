@@ -131,6 +131,10 @@ type sessionFixture struct {
 	cache    *credcache.Cache
 	http     credentials.CredentialRetriever
 	provider *Provider
+	// sourceBase is the credential source counts when the fixture was built. The
+	// fork rule counts on the process-wide collector, which every other test in
+	// the binary also increments, so sourceCount reports the delta since here.
+	sourceBase map[string]float64
 	// minTtl is the cache's floor.
 	minTtl time.Duration
 	// tokenLife is how long each minted token lives on the fixture's clock.
@@ -226,6 +230,7 @@ func newSessionFixture(t *testing.T, configure ...func(*fixtureOpts)) *sessionFi
 		minter = opts.minter
 	}
 	opts.cache.Delegate = delegate
+	h.sourceBase = currentSourceCounts()
 	opts.cache.RefreshWith = RefreshWith(client, MinterTokens(minter))
 	h.cache = credcache.New(opts.cache)
 	h.http = credsretriever.NewCachedCredentialRetriever(credsretriever.CachedCredentialRetrieverOpts{
@@ -577,6 +582,25 @@ func (h *sessionFixture) cacheCount(result string) float64 {
 
 func (h *sessionFixture) exchangeCount(outcome, errLabel string) float64 {
 	return testutil.ToFloat64(h.provider.metrics.exchanges.WithLabelValues(outcome, errLabel))
+}
+
+// currentSourceCounts reads the credential source counter for every source
+// value, so a fixture can record a baseline and report deltas against it.
+func currentSourceCounts() map[string]float64 {
+	counts := map[string]float64{}
+	for _, source := range []string{
+		workloadidentity.CredentialSourceEKSAuth,
+		workloadidentity.CredentialSourceIMDSFirst,
+	} {
+		counts[source] = testutil.ToFloat64(promCredentialSource.WithLabelValues(source))
+	}
+	return counts
+}
+
+// sourceCount returns how many refreshes have been routed to source since the
+// fixture was built.
+func (h *sessionFixture) sourceCount(source string) float64 {
+	return testutil.ToFloat64(promCredentialSource.WithLabelValues(source)) - h.sourceBase[source]
 }
 
 // newTestSessionMetrics builds unregistered collectors with the production
