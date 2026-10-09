@@ -36,6 +36,8 @@ spec:
       serviceAccountName: {{ . }}
       {{- end }}
       hostNetwork: true
+      {{- /* Attestation needs the peer's PID: without it SO_PEERCRED reports 0. */}}
+      hostPID: true
       terminationGracePeriodSeconds: 30
       {{- with $top.Values.tolerations }}
       tolerations:
