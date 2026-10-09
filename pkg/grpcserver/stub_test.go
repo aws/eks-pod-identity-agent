@@ -10,6 +10,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -28,10 +29,12 @@ import (
 // both method shapes, because the middleware here is two implementations of the
 // same rule and a test of one proves nothing about the other.
 
-const (
-	stubServiceName  = "grpcserver.test.Stub"
-	stubUnaryMethod  = "/grpcserver.test.Stub/Unary"
-	stubStreamMethod = "/grpcserver.test.Stub/Stream"
+// The stub takes the Workload API's service name because the metadata gate applies to
+// that service only, and the interceptor tests need a method behind it.
+var (
+	stubServiceName  = workload.SpiffeWorkloadAPI_ServiceDesc.ServiceName
+	stubUnaryMethod  = "/" + stubServiceName + "/Unary"
+	stubStreamMethod = "/" + stubServiceName + "/Stream"
 )
 
 // stubService implements the stub. Both handlers default to succeeding; a test
