@@ -65,10 +65,9 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 // once per node: the Workload API handler and the Envoy SDS handler over the same
 // tiers, and the trust bundle tier, whose refresh loop runs beside the servers.
 //
-// Both handlers share one set of tiers rather than each building its own. A
-// workload that reaches the agent over both interfaces must be served the same
-// certificate from the same cache, and two sets of tiers would mean two
-// issuances, two leases and two renewal schedules for one pod.
+// One set of tiers for both handlers, so a workload reaching the agent over both
+// interfaces gets the same certificate from the same cache rather than two
+// issuances, two leases and two renewal schedules.
 type workloadIdentityTiers struct {
 	handler      *workloadapi.Handler
 	sdsHandler   *sds.Handler
@@ -157,10 +156,8 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		Attestor: attestor,
 		Certs:    certs,
 		Bundles:  bundleSource,
-		// Its own hub.ForRPC, under StreamSecrets' own label, so an Envoy stream
-		// and a FetchX509SVID stream never share a subscription series. There is
-		// no subscriber for FetchSecrets, which answers once and has no stream to
-		// wake.
+		// Its own hub.ForRPC, so an Envoy stream and a FetchX509SVID stream never
+		// share a subscription series. FetchSecrets has none: it answers once.
 		StreamSecretsSubscriber: hub.ForRPC(workloadidentity.RPCStreamSecrets),
 	})
 
@@ -168,9 +165,8 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 }
 
 // registerWorkloadIdentityServices returns the registration the workload identity
-// gRPC server runs before it accepts anything. Both services are real now, so no
-// stub is registered: the socket serves the SPIFFE Workload API and Envoy SDS
-// over the one listener.
+// gRPC server runs before it accepts anything. Both services are real now, so the
+// SDS stub is gone: one listener serves the SPIFFE Workload API and Envoy SDS.
 func registerWorkloadIdentityServices(handler *workloadapi.Handler, sdsHandler *sds.Handler) func(registrar grpc.ServiceRegistrar) {
 	return func(registrar grpc.ServiceRegistrar) {
 		handler.Register(registrar)

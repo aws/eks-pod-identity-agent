@@ -134,9 +134,8 @@ const (
 	// RPCStreamSecrets is the Envoy SDS StreamSecrets stream.
 	RPCStreamSecrets = "stream_secrets"
 	// RPCFetchSecrets is the unary Envoy SDS FetchSecrets. No sidecar calls it,
-	// since Envoy subscribes over the stream, so this label is expected to carry
-	// tooling and probes rather than mesh traffic. It is here because the RPC is
-	// served, and an RPC served under no label is one no dashboard can see.
+	// since Envoy subscribes over the stream, so expect tooling and probes here
+	// rather than mesh traffic.
 	RPCFetchSecrets = "fetch_secrets"
 )
 

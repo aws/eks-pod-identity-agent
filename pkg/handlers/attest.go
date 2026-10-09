@@ -8,15 +8,8 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// Attest resolves the caller from the connection the server's transport
-// credentials put in ctx, the only route to it.
-//
-// Shared by both interfaces on the socket, because a workload refused on one and
-// served on the other is the customer's to reverse engineer. Two identical copies
-// would pass their own packages' tests while drifting apart.
-//
-// Failures are ErrUnattestable rather than a status built here, which leaves the
-// gRPC code to StatusCode and gives the RPC metrics a real error label.
+// Attest resolves the caller from the connection in ctx. Failures are
+// ErrUnattestable.
 func Attest(ctx context.Context, attestor workloadidentity.Attestor) (*workloadidentity.Workload, error) {
 	conn, ok := grpcserver.ConnFromContext(ctx)
 	if !ok {
@@ -28,8 +21,7 @@ func Attest(ctx context.Context, attestor workloadidentity.Attestor) (*workloadi
 		return nil, err
 	}
 	if caller == nil {
-		// Nothing downstream nil-checks the workload, and a tier handed a nil one
-		// would panic the RPC rather than refuse it.
+		// A nil workload would panic a tier rather than refuse the RPC.
 		return nil, errors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
 	}
 

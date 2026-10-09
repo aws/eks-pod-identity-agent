@@ -19,12 +19,10 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -154,7 +152,7 @@ func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 		want = id
 	}
 
-	caller, err := h.attest(ctx)
+	caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +196,7 @@ func (h *Handler) validateJWTSVID(ctx context.Context, req *workload.ValidateJWT
 		return nil, wierrors.ErrInvalidRequest.Wrapf(nil, "a JWT-SVID must be specified")
 	}
 
-	caller, err := h.attest(ctx)
+	caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
 		return nil, err
 	}
@@ -237,13 +235,6 @@ func claimsStruct(claims map[string]any) (*structpb.Struct, error) {
 	return out, nil
 }
 
-// attest resolves the caller from the connection the server's transport
-// credentials put in ctx. Shared with the SDS handler as handlers.Attest, so a
-// workload cannot be refused on one interface and served on the other.
-func (h *Handler) attest(ctx context.Context) (*workloadidentity.Workload, error) {
-	return handlers.Attest(ctx, h.opts.Attestor)
-}
-
 // failUnary ends a unary call that failed: it records the failure, logs it and
 // maps the error onto a status. A call whose client left is not recorded: the
 // agent gave it no answer, and the tier error would only say the wait was cut short.
@@ -252,19 +243,8 @@ func failUnary(ctx context.Context, rpc string, start time.Time, err error) erro
 		return handlers.StatusErrorFromContext(ctx)
 	}
 	handlers.ObserveRPC(rpc, err, time.Since(start))
-	logFailure(ctx, rpc, err)
+	handlers.LogFailure(ctx, rpc, err)
 	return handlers.StatusError(err)
-}
-
-// logFailure logs an error the handler answers with. One it maps to Internal is
-// unexpected and logged as an error; the rest are refusals a caller can act on.
-func logFailure(ctx context.Context, rpc string, err error) {
-	log := logger.FromContext(ctx).WithField("rpc", rpc)
-	if handlers.StatusCode(err) == codes.Internal {
-		log.Errorf("Unexpected error serving the Workload API: %v", err)
-		return
-	}
-	log.Infof("Refusing the Workload API call: %v", err)
 }
 
 var _ workload.SpiffeWorkloadAPIServer = (*Handler)(nil)

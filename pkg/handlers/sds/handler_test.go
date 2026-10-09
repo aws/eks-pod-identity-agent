@@ -126,12 +126,10 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
-// serve starts the handler on a Unix socket and returns a client for it.
-//
-// The server is built with grpcserver.NewConnCredentials and nothing else: those
-// credentials are what puts the caller's connection on the context, which is the
-// only route to attestation. The rest of the production server's interceptor
-// chain is grpcserver's own to test.
+// serve starts the handler on a Unix socket and returns a client for it. Built
+// with grpcserver.NewConnCredentials and nothing else, since those credentials
+// put the caller's connection on the context, the only route to attestation. The
+// rest of the interceptor chain is grpcserver's own to test.
 func serve(t *testing.T, handler *Handler) secretv3.SecretDiscoveryServiceClient {
 	t.Helper()
 
@@ -391,13 +389,10 @@ func TestStreamSecrets_ValidationContextOnly(t *testing.T) {
 	g.Expect(h.certs.Calls()).To(BeZero(), "a validation context must not read the certificate source")
 }
 
-// TestStreamSecrets_NotEnrolledIsRefused pins the enrollment refusal on the code
-// the Workload API uses, which is SPIRE's PermissionDenied for a workload with no
-// identity.
-//
-// The refusal arrives from the subscription now rather than from a session: the
-// notification tier resolves the caller's provider, so a workload that names none
-// cannot subscribe, which is the same gate FetchX509SVID passes through.
+// TestStreamSecrets_NotEnrolledIsRefused pins the enrollment refusal on SPIRE's
+// PermissionDenied, as the Workload API uses. It arrives from the subscription,
+// which resolves the caller's provider, so this is the gate FetchX509SVID passes
+// through too.
 func TestStreamSecrets_NotEnrolledIsRefused(t *testing.T) {
 	g := NewWithT(t)
 
@@ -427,15 +422,11 @@ func TestStreamSecrets_UnknownResourceNameIsNotFound(t *testing.T) {
 	g.Expect(status.Convert(err).Message()).To(ContainSubstring("unknown resource name"))
 }
 
-// TestStreamSecrets_ColdStartBlocksThenServes pins the decided answer for the
-// window before any bundle has been fetched. The bundle tier reports a zero own
-// trust domain and a lease does not wait for a fetch, so the condition is real
-// and brief; the stream holds the request open across it rather than ending and
-// making Envoy come back, which is the agent-retries-first decision.
-//
-// The refusal underneath is ErrBundleUnavailable, which is what makes it
-// retryable. A status built in the handler would have no taxonomy member, so the
-// retry would read it as permanent.
+// TestStreamSecrets_ColdStartBlocksThenServes pins the window before any bundle
+// has been fetched: the tier reports a zero own trust domain and a lease does not
+// wait for a fetch, so the stream holds the request open rather than making Envoy
+// come back. The refusal underneath is ErrBundleUnavailable, which is what makes
+// it retryable; a status built in the handler would read as permanent.
 func TestStreamSecrets_ColdStartBlocksThenServes(t *testing.T) {
 	g := NewWithT(t)
 
@@ -925,13 +916,10 @@ func TestFetchSecrets_ServesBothSecretKindsInOneResponse(t *testing.T) {
 }
 
 // TestFetchSecrets_NamingNothingServesTheWildcardSet pins the xDS rule that an
-// empty resource list means everything, which upstream SPIRE applies on this
-// method. An empty string among the names is dropped before the count is taken,
-// so it reaches the same answer rather than an unknown-name error.
-//
-// The stream deliberately does not share the rule: its first request routinely
-// names nothing, and answering that with a private key the sidecar never asked
-// for would be the wrong way to read it.
+// empty resource list means everything, as SPIRE applies on this method, with an
+// empty string dropped before the count. The stream does not share the rule: its
+// first request routinely names nothing, and answering that with a private key
+// the sidecar never asked for would be wrong.
 func TestFetchSecrets_NamingNothingServesTheWildcardSet(t *testing.T) {
 	g := NewWithT(t)
 

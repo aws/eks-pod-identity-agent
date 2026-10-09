@@ -41,45 +41,34 @@ type Opts struct {
 	Bundles workloadidentity.BundleSource
 
 	// StreamSecretsSubscriber is how an open StreamSecrets learns its material
-	// changed. It should be built with Hub.ForRPC and
-	// workloadidentity.RPCStreamSecrets, so the subscription metrics spell the
-	// RPC as the RPC metrics do.
-	//
-	// There is no subscriber for FetchSecrets: a unary call answers once and has
-	// no stream to wake.
+	// changed. Build it with Hub.ForRPC and workloadidentity.RPCStreamSecrets, so
+	// the subscription metrics spell the RPC as the RPC metrics do. FetchSecrets
+	// has none: a unary call answers once and has no stream to wake.
 	StreamSecretsSubscriber workloadidentity.Subscriber
 }
 
 // No SessionProvider here, matching workloadapi.Opts: nothing in this package
-// signs a request, and the provider a subscription routes on is resolved inside
-// the notification tier from the attested workload. The enrollment refusal a
-// session used to carry now arrives from whichever tier resolves that provider,
-// which is what keeps it identical on both interfaces.
+// signs a request, and the notification tier resolves the provider.
 
 // Handler implements the Envoy Secret Discovery Service.
 //
 // UnimplementedSecretDiscoveryServiceServer is embedded by value because the
-// generated code requires it: the interface has an unexported method only that
-// struct provides, and registration panics on a nil pointer embed. Of the
-// service's three RPCs it now supplies only DeltaSecrets, which the method below
-// overrides to make the refusal legible.
+// generated code requires it: registration panics on a nil pointer embed.
 type Handler struct {
 	secretv3.UnimplementedSecretDiscoveryServiceServer
 
 	opts Opts
 
-	// backoff paces an RPC's retries of its own steps: attesting, leasing,
-	// subscribing and reading the tiers. A failed send to the caller is not
-	// retried, since the stream is already gone and Envoy will reconnect. Each
-	// RPC starts from a copy, so one stream's failures never slow another's.
+	// backoff paces an RPC's retries. Each RPC starts from a copy, so one
+	// stream's failures never slow another's.
 	backoff wait.Backoff
 }
 
-// retryBackoff is go-spiffe's own client backoff, one second doubling to thirty,
-// which workloadapi also uses. Matched rather than chosen: a blocked stream
-// should poll the tiers no harder than a client would poll the agent, and two
-// interfaces retrying the same tier at different rates would make a tier outage
-// read differently depending on which one a workload happened to use.
+// Steps is not a retry budget. Await retries until the context ends or the error
+// turns non-retryable, and Steps only bounds how many times the delay doubles:
+// once it reaches Cap, wait.delay zeroes Steps itself and every later call
+// returns the ceiling. It only has to exceed the five doublings from Duration to
+// Cap, since at zero the delay would never grow past a second.
 var retryBackoff = wait.Backoff{
 	Duration: time.Second,
 	Factor:   2,
@@ -99,68 +88,46 @@ func (h *Handler) Register(registrar grpc.ServiceRegistrar) {
 	secretv3.RegisterSecretDiscoveryServiceServer(registrar, h)
 }
 
-// DeltaSecrets is not served.
-//
-// Overridden rather than left to the embedded Unimplemented so the refusal names
-// the fix. DELTA_GRPC is a valid thing for a customer to write in an sds_config,
-// and a sidecar configured that way would otherwise sit without a certificate
-// with nothing on either side saying why. State-of-the-world is what Istio
-// generates and what this agent serves; incremental xDS buys a single-resource
-// subscription almost nothing, so it is deliberately absent rather than pending.
+// DeltaSecrets is not served. Overridden so the refusal names the fix, since a
+// sidecar configured for DELTA_GRPC would otherwise sit without a certificate.
 func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsServer) error {
 	return status.Error(codes.Unimplemented,
 		"this agent serves state-of-the-world SDS only: set api_type to GRPC, not DELTA_GRPC, in the sidecar's sds_config")
 }
 
-// FetchSecrets serves the same secrets StreamSecrets does, once, with nothing
-// subscribed behind them.
-//
-// No Envoy sidecar reaches it: Envoy's subscription machinery is stream-only, and
-// the unary method carries the REST binding (POST /v3/discovery:secrets), which
-// never arrives on a gRPC socket. Served for the callers that are not Envoy, such
-// as an operator asking what a pod would be handed or a one-shot library read,
-// and so that a method answering Unimplemented beside a stream serving identical
-// material does not read as a defect.
-//
-// It carries nothing that says when its answer stops being correct, so polling it
-// is not a substitute for StreamSecrets.
+// FetchSecrets serves the same secrets StreamSecrets does, once. No Envoy
+// sidecar reaches it, since Envoy only subscribes over the stream. It signals no
+// staleness, so polling it is not a substitute for StreamSecrets.
 func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
-	state := newRPCState(workloadidentity.RPCFetchSecrets, h.backoff)
+	state := handlers.NewRPCState(workloadidentity.RPCFetchSecrets, h.backoff)
 
 	resp, err := h.fetchSecrets(ctx, req)
 	if err != nil {
-		return nil, state.failed(ctx, err)
+		return nil, state.Failed(ctx, err)
 	}
-	state.answered()
+	state.Answered()
 
 	return resp, nil
 }
 
-// fetchSecrets is FetchSecrets without the metrics, so every path out of it
-// carries the error the tiers raised rather than a status built from it. The
-// caller above records it and maps it exactly once.
+// fetchSecrets is FetchSecrets without the metrics, returning the tiers' own
+// errors for the caller above to record and map exactly once. It takes no retry,
+// so nothing here maps on its own.
 func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
 	log := logger.FromContext(ctx)
 
-	// Nothing here is wrapped in a retry, unlike the stream. A unary caller is
-	// holding a call open and has its own deadline to spend, so a transient tier
-	// failure is answered rather than waited out: the code says it is worth
-	// retrying and the caller decides whether to. Blocking inside the call would
-	// spend a deadline we did not set on a wait the caller cannot see.
-	caller, err := h.caller(ctx)
+	// Nothing here retries, unlike the stream: a unary caller has its own
+	// deadline to spend, so a transient tier failure is answered with a retryable
+	// code and the caller decides.
+	caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
 		return nil, err
 	}
 
-	// Taken for the call rather than skipped, and it carries the enrollment
-	// refusal: the lease resolves the caller's provider, so a workload that names
-	// none is turned away here with the code the stream gives it, rather than
-	// being served a certificate the unary method found a way to reach.
-	//
-	// It also earns its keep on a cold provider. A one-shot read is still a read
-	// of that provider's bundles, and the first interest in one is what starts it
-	// being fetched and refreshed; without a lease, this call and every retry of
-	// it would answer the same way forever.
+	// The lease carries the enrollment refusal, so a workload naming no provider
+	// is turned away here with the code the stream gives it. It also starts the
+	// fetch on a cold provider, without which this call would answer the same way
+	// forever.
 	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
 	if err != nil {
 		return nil, err
@@ -192,63 +159,49 @@ func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 
 	log.Debugf("FetchSecrets served %d resource(s) to pod %s", len(resources), caller.PodUID)
 
-	// Every resource in one response, unlike the stream. The one-per-response
-	// rule there exists because Envoy's SdsApi is a singleton watch that reads
-	// resources[0]; a unary fetch has no watch, and the whole named set is what
-	// the method means.
-	//
-	// VersionInfo and Nonce are left empty deliberately. Both belong to the
-	// acknowledgement protocol, which needs a stream to acknowledge on: there is
-	// nothing here for a caller to ACK or NACK, and a nonce it echoed onto a
-	// stream later would be one that stream never issued. Upstream SPIRE leaves
-	// both unset on this path for the same reason.
+	// Every resource in one response: the stream's one-per-response rule is
+	// Envoy's singleton watch, and a unary fetch has none. VersionInfo and Nonce
+	// stay empty because acknowledgement needs a stream to acknowledge on.
 	return &discoveryv3.DiscoveryResponse{
 		TypeUrl:   SecretTypeURL,
 		Resources: resources,
 	}, nil
 }
 
-// StreamSecrets serves an Envoy sidecar its certificate and its validation
-// context, and pushes replacements on the same stream when either changes.
-//
-// The caller is attested once, when the stream opens, and every subsequent read,
-// the lease and the subscription are bound to that workload. A workload whose
-// provider cannot be named is ErrNotEnrolled from the subscription, which refuses
-// the stream with the code the Workload API uses for it.
+// StreamSecrets serves an Envoy sidecar its certificate and validation context,
+// and pushes replacements on the same stream when either changes. The caller is
+// attested once, when the stream opens, and the lease, the subscription and every
+// read are bound to that workload.
 func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecretsServer) error {
 	ctx := stream.Context()
-	state := newRPCState(workloadidentity.RPCStreamSecrets, h.backoff)
+	state := handlers.NewRPCState(workloadidentity.RPCStreamSecrets, h.backoff)
 
-	// The loop only ever exits with an error: a client disconnect, a server
-	// shutdown and a refusal all arrive as one, so there is no success return to
-	// account for here.
-	return state.failed(ctx, h.streamSecrets(ctx, stream, state))
+	// The loop only ever exits with an error, already mapped: a disconnect, a
+	// shutdown and a refusal all arrive as one.
+	return h.streamSecrets(ctx, stream, state)
 }
 
-// streamSecrets is StreamSecrets without the metrics, returning the tiers' own
-// errors for the caller above to record and map once.
-func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDiscoveryService_StreamSecretsServer, state *rpcState) error {
+// streamSecrets is StreamSecrets' loop. Await records and maps whatever ends it.
+func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDiscoveryService_StreamSecretsServer, state *handlers.RPCState) error {
 	log := logger.FromContext(ctx)
 
 	// Each setup step is awaited, so a transient failure before the first
-	// response blocks the stream rather than ending it. There is no signal
-	// channel to cut the wait short yet, which is why nil is passed: the
-	// subscription that would provide one is itself one of these steps.
+	// response blocks the stream rather than ending it. nil signals: the
+	// subscription that would provide them is itself one of these steps.
 	var caller *workloadidentity.Workload
-	if err := state.await(ctx, nil, func() (err error) {
-		caller, err = h.caller(ctx)
+	if err := state.Await(ctx, nil, func() (err error) {
+		caller, err = handlers.Attest(ctx, h.opts.Attestor)
 		return err
 	}); err != nil {
 		return err
 	}
 
-	// The lease is taken for the stream's life, not around each read. This
-	// stream reads the validation context only when it is signalled, so a
-	// provider whose bundles hold still would look unused to the bundle tier,
-	// which stops refreshing a provider with no open lease and would then miss
-	// the next rotation.
+	// Held for the stream's life, not around each read: this stream reads the
+	// validation context only when signalled, so a provider whose bundles hold
+	// still would look unused and stop being refreshed, missing the next
+	// rotation.
 	var releaseLease func()
-	if err := state.await(ctx, nil, func() (err error) {
+	if err := state.Await(ctx, nil, func() (err error) {
 		releaseLease, err = h.opts.Bundles.Lease(ctx, caller)
 		return err
 	}); err != nil {
@@ -256,17 +209,12 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 	}
 	defer releaseLease()
 
-	// Subscribed on every stream, including one that asks only for a validation
-	// context: Envoy can add a TlsCertificate to this same stream later, and a
-	// subscription taken out for bundles alone would never hear that
-	// certificate's renewals. The cost is that a context-only stream also wakes
-	// on its pod's renewals, which the dedupe below absorbs.
-	//
-	// SubscribeToJWTBundles is never called from here. Envoy does not consume JWT
-	// authorities, so a JWT key roll must not wake this stream at all.
+	// Subscribed on every stream, since Envoy can add a TlsCertificate later and
+	// a bundles-only subscription would miss its renewals. Never
+	// SubscribeToJWTBundles: Envoy does not consume JWT authorities.
 	var signals <-chan struct{}
 	var releaseSub func()
-	if err := state.await(ctx, nil, func() (err error) {
+	if err := state.Await(ctx, nil, func() (err error) {
 		signals, releaseSub, err = h.opts.StreamSecretsSubscriber.SubscribeToWorkloadMaterial(ctx, caller)
 		return err
 	}); err != nil {
@@ -287,40 +235,32 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 		select {
 		case <-ctx.Done():
 			// A client disconnect and a server shutdown both arrive here.
-			return handlers.StatusErrorFromContext(ctx)
+			return state.Ended(ctx)
 
 		case <-signals:
-			// The channel arrives primed, so the first signal can land before
-			// Envoy has named anything, and then this reads nothing. Intended:
-			// the first request is answered from a fresh read of what it names.
-			//
-			// Each pass sends what it reads now, not what the signal carried, so
-			// a slow stream is never handed a superseded credential. Safe to
-			// retry for the same reason: the dedupe suppresses whatever an
-			// earlier attempt already sent unchanged.
-			if err := state.await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
+			// The channel arrives primed, so a signal can land before Envoy has
+			// named anything. Each pass sends what it reads now, not what the
+			// signal carried, so a slow stream never gets superseded material.
+			if err := state.Await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
 				return err
 			}
 
 		case received, ok := <-requests:
 			if !ok {
-				// The receive side closed without the context ending, which
-				// means Envoy half-closed the stream. Nothing more is coming, so
-				// wait for the context rather than spinning on a closed channel.
+				// Envoy half-closed. Nothing more is coming, so wait for the
+				// context rather than spin on a closed channel.
 				requests = nil
 				continue
 			}
 			if received.err != nil {
-				// io.EOF is a clean half-close and anything else is a broken
-				// stream; neither is this handler's failure to report, and the
-				// context's own status is the right answer for both.
-				return handlers.StatusErrorFromContext(ctx)
+				// A clean half-close or a broken stream; neither is this
+				// handler's failure, and the context's status answers both.
+				return state.Ended(ctx)
 			}
-			// Applying the request and sending for it are separate steps so that
-			// only the send is retried. Re-applying a request after a partial
-			// send would re-run the stale-nonce rule against a nonce that send
-			// had already advanced, and the request would read as stale: the
-			// resources it still wanted would go unserved until the next signal.
+			// Applying and sending are separate so only the send is retried.
+			// Re-applying after a partial send would re-run the stale-nonce rule
+			// against a nonce that send already advanced, leaving the resources
+			// it still wanted unserved until the next signal.
 			send, err := s.applyRequest(log, received.req)
 			if err != nil {
 				return err
@@ -328,19 +268,11 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 			if !send {
 				continue
 			}
-			if err := state.await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
+			if err := state.Await(ctx, signals, func() error { return s.sendNamed(ctx) }); err != nil {
 				return err
 			}
 		}
 	}
-}
-
-// caller attests the process on the other end of the connection. Shared with the
-// Workload API handler as handlers.Attest, deliberately: a workload refused on
-// one interface and served on the other would be the customer's to reverse
-// engineer.
-func (h *Handler) caller(ctx context.Context) (*workloadidentity.Workload, error) {
-	return handlers.Attest(ctx, h.opts.Attestor)
 }
 
 // received is one result from the receive side of the stream.
@@ -349,14 +281,9 @@ type received struct {
 	err error
 }
 
-// recvLoop reads the stream on a goroutine of its own, because Recv blocks and
-// this handler has to wait on notifications at the same time.
-//
-// The goroutine ends when Recv fails, which it does as soon as the stream's
-// context is cancelled, and gRPC cancels that context when the handler returns.
-// So a handler that returns for any reason, including an abrupt client
-// disconnect, leaves nothing behind. The send selects on ctx.Done so the final
-// result cannot block forever on a channel nobody is reading.
+// recvLoop reads the stream on its own goroutine, because Recv blocks and this
+// handler waits on notifications too. It ends when Recv fails, which gRPC causes
+// by cancelling the context on return, so no handler exit leaks it.
 func recvLoop(ctx context.Context, stream secretv3.SecretDiscoveryService_StreamSecretsServer) <-chan received {
 	out := make(chan received, 1)
 
@@ -388,30 +315,24 @@ type streamState struct {
 	stream  secretv3.SecretDiscoveryService_StreamSecretsServer
 	caller  *workloadidentity.Workload
 
-	// rpc is the stream's metrics state, so the first response can be recorded
-	// where it is sent. Shared with the method that will end the stream, which is
-	// what keeps one stream to one observation.
-	rpc *rpcState
+	// rpc is the stream's metrics state, shared with the method that ends the
+	// stream, which is what keeps one stream to one observation.
+	rpc *handlers.RPCState
 
 	// named is what Envoy is currently subscribed to, in request order, rebuilt
-	// from each request it sends. State-of-the-world means a request carries the
-	// whole set of interests rather than a change to it.
+	// from each request: state-of-the-world means a request carries the whole set
+	// of interests rather than a change to it.
 	named []resource
 
-	// lastSent is the secret last put on this stream per resource name, which is
-	// what the dedupe compares against. The notification tier leaves dedupe to
-	// its handlers and its signals may be spurious, and on an X.509 rotation this
-	// handler wakes for every stream of the provider at once.
+	// lastSent is the secret last put on this stream per resource name, which the
+	// dedupe compares against. Needed because the notification tier leaves dedupe
+	// to its handlers, and an X.509 rotation wakes every stream of the provider.
 	lastSent map[string]*tlsv3.Secret
 
-	// sent counts responses sent on this stream and supplies both the version and
-	// the nonce.
-	//
-	// One counter is enough. The version has to be monotonic per stream and must
-	// not be derived from the material, and the nonce has to be unique per
-	// response; since a response is only ever sent when something changed, the
-	// two increment together. Deriving both from one counter makes it impossible
-	// for them to disagree.
+	// sent counts responses and supplies both the version and the nonce. The
+	// version must be monotonic per stream and the nonce unique per response, and
+	// a response is only sent when something changed, so one counter cannot let
+	// the two disagree.
 	sent uint64
 
 	// lastNonce is the nonce on the most recent response. A request echoing
@@ -421,14 +342,12 @@ type streamState struct {
 
 // applyRequest applies one DiscoveryRequest to the stream's state and reports
 // whether anything should be sent for it. It reads no tier and sends nothing, so
-// it is never retried; the send that follows it is.
-//
-// The acknowledgement protocol is not optional politeness: getting it wrong
-// produces a stream that appears to work and then stops updating.
+// it is never retried; the send that follows it is. Getting the acknowledgement
+// protocol wrong produces a stream that appears to work and then stops updating.
 func (s *streamState) applyRequest(log *logrus.Entry, req *discoveryv3.DiscoveryRequest) (bool, error) {
-	// A rejection arrives as a request carrying an error detail. Logged and the
-	// stream continues: rolling back would re-send material Envoy just refused,
-	// and retrying would send the same bytes again.
+	// A rejection arrives as a request carrying an error detail. Logged, and the
+	// stream continues: rolling back or retrying would both re-send what Envoy
+	// just refused.
 	if detail := req.GetErrorDetail(); detail != nil {
 		log.Warnf("Envoy rejected SDS version %s for %v: %s",
 			req.GetVersionInfo(), req.GetResourceNames(), detail.GetMessage())
@@ -440,13 +359,10 @@ func (s *streamState) applyRequest(log *logrus.Entry, req *discoveryv3.Discovery
 		return false, status.Error(codes.NotFound, err.Error())
 	}
 
-	// A request echoing anything but the latest nonce is acknowledging a
-	// superseded response, and re-serving it would re-send everything.
-	//
-	// Only ignored when the named set is unchanged, though: Envoy also sends a
-	// request when its interest changes, and with one resource per response there
-	// can be several in flight, so an interest change can legitimately carry an
-	// older nonce. Dropping that would leave a named resource unserved forever.
+	// A request echoing anything but the latest nonce acknowledges a superseded
+	// response. Only ignored when the named set is unchanged: with one resource
+	// per response several can be in flight, so an interest change can carry an
+	// older nonce, and dropping it would leave that resource unserved forever.
 	stale := req.GetResponseNonce() != "" && req.GetResponseNonce() != s.lastNonce
 	if stale && sameResources(s.named, requested) {
 		return false, nil
@@ -457,14 +373,9 @@ func (s *streamState) applyRequest(log *logrus.Entry, req *discoveryv3.Discovery
 	return true, nil
 }
 
-// sendNamed re-reads and sends every resource Envoy has named, one response each.
-//
-// One resource per DiscoveryResponse. Envoy's SdsApi is a singleton subscription
-// that reads only the first resource and rejects a name that is not the one it
-// asked for, and Envoy's mux layer hands each watch only the resources matching
-// its own name, calling onConfigUpdate only when it found one. So a response
-// carrying a subset does not read as a deletion of the names it omits, which is
-// what makes one-at-a-time safe rather than merely conservative.
+// sendNamed re-reads and sends every resource Envoy has named, one per response:
+// its SdsApi reads only the first resource and rejects a name it did not ask for,
+// and a subset does not read as a deletion of the names it omits.
 func (s *streamState) sendNamed(ctx context.Context) error {
 	for _, r := range s.named {
 		secret, err := s.handler.buildSecret(ctx, s.caller, r)
@@ -473,11 +384,8 @@ func (s *streamState) sendNamed(ctx context.Context) error {
 		}
 
 		if proto.Equal(secret, s.lastSent[r.name]) {
-			// Sending an identical resource under a new version makes Envoy do
-			// work for nothing. This is the overlap the provider-keyed routing
-			// cannot remove: a stream woken by its own pod's renewal whose
-			// validation context did not change, and one woken by a rotation
-			// whose certificate did not.
+			// Absorbs the wakes provider-keyed routing cannot: a pod renewal
+			// that left the validation context alone, and the reverse.
 			continue
 		}
 
@@ -506,15 +414,14 @@ func (s *streamState) send(secret *tlsv3.Secret) error {
 		TypeUrl:     SecretTypeURL,
 		Nonce:       nonce,
 	}); err != nil {
-		// A send failure is a broken or closed stream, which already carries its
-		// own status. Marked as a send so the metrics leave it uncounted and
-		// return it unwrapped, which keeps a disconnect reported as such.
-		return sendError{err: err}
+		// A broken or closed stream, which already carries its own status.
+		// Marked as a send so the metrics leave it uncounted.
+		return handlers.SendError{Err: err}
 	}
 
-	// The stream has answered. Only the first one counts, so a long-lived stream
-	// pushing rotations stays one RPC.
-	s.rpc.answered()
+	// Only the first answer counts, so a long-lived stream pushing rotations
+	// stays one RPC.
+	s.rpc.Answered()
 
 	if s.lastSent == nil {
 		s.lastSent = make(map[string]*tlsv3.Secret, len(s.named))
@@ -534,11 +441,13 @@ func (h *Handler) buildSecret(ctx context.Context, caller *workloadidentity.Work
 			return nil, err
 		}
 		if len(svids) == 0 {
-			// The tier promises exactly one, so an empty slice is a tier defect
-			// rather than a caller problem.
+			// The tier promises exactly one, so empty is a tier defect.
 			return nil, pkgerrors.ErrIssuanceFailed.Wrapf(nil,
 				"the certificate source returned no X.509-SVID for %q", r.name)
 		}
+		// Always exactly one: WISE issues one SVID per workload, so there is
+		// never a second to choose from. CertSource is plural only because
+		// FetchX509SVID returns a repeated field.
 		return tlsCertificateSecret(r.name, svids[0])
 
 	case kindValidationContext:
@@ -563,31 +472,23 @@ func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity
 		return nil, err
 	}
 	if bundles == nil {
-		// A tier answering with neither a set nor an error, which the lookup
-		// below would otherwise panic on. Read as an empty set, so it falls to
-		// the NotFound at the end of this function.
+		// Neither a set nor an error, which the lookup below would panic on.
+		// Read as empty so it falls to the NotFound at the end.
 		bundles = x509bundle.NewSet()
 	}
 
 	domain := r.trustDomain
 
 	if domain.IsZero() {
-		// The ROOTCA case: the caller's own domain, which only the bundle tier
-		// knows.
+		// The ROOTCA case: the caller's own domain, which only the tier knows.
 		domain, err = h.opts.Bundles.OwnTrustDomain(ctx, caller)
 		if err != nil {
 			return nil, err
 		}
 		if domain.IsZero() {
-			// The tier answers the zero trust domain until a bundle for the
-			// provider has been fetched, and a lease does not wait for one.
-			//
-			// ErrBundleUnavailable rather than a status built here, because this
-			// is the cold start and it is exactly what a retry fixes: the lease
-			// taken above is what starts the fetch, so the stream blocks for one
-			// backoff and then serves. A hand-built Unavailable would carry no
-			// taxonomy member, so IsRetryable would read it as permanent and end
-			// the stream, and the metric would label it none.
+			// Zero until a bundle has been fetched, which a lease does not wait
+			// for. ErrBundleUnavailable because a retry fixes it; a hand-built
+			// Unavailable would read as permanent and end the stream.
 			return nil, pkgerrors.ErrBundleUnavailable.Wrapf(nil,
 				"the trust domain for %q is not known yet, because no trust bundle has been fetched for this workload's provider", r.name)
 		}
@@ -595,9 +496,8 @@ func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity
 
 	bundle, ok := bundles.Get(domain)
 	if !ok || len(bundle.X509Authorities()) == 0 {
-		// A name the customer wrote that this provider has no anchors for.
-		// NotFound rather than Unavailable: no retry produces a trust domain the
-		// provider does not federate with.
+		// NotFound rather than Unavailable: no retry produces a trust domain
+		// the provider does not federate with.
 		return nil, status.Errorf(codes.NotFound,
 			"no trust anchors for trust domain %q", domain.Name())
 	}
@@ -605,16 +505,9 @@ func (h *Handler) validationBundle(ctx context.Context, caller *workloadidentity
 	return bundle, nil
 }
 
-// parseRequestedResources parses every name on a request, rejecting the whole
-// request if any name is unserveable.
-//
-// Rejecting the whole request rather than the names it understood: Envoy's
-// subscription is state-of-the-world, so a partial answer would leave it
-// subscribed to a name nothing will ever answer, with no error to explain it.
-//
-// Duplicates are dropped. Envoy has been known to name the same resource twice
-// on one request, and serving it twice would mean two responses and two nonces
-// for one subscription.
+// parseRequestedResources parses every name on a request, rejecting all of them
+// if one is unserveable, since a partial answer leaves Envoy waiting. Duplicates
+// are dropped: serving one twice would mean two nonces for one subscription.
 func parseRequestedResources(names []string) ([]resource, error) {
 	resources := make([]resource, 0, len(names))
 	seen := make(map[string]struct{}, len(names))
@@ -635,16 +528,10 @@ func parseRequestedResources(names []string) ([]resource, error) {
 	return resources, nil
 }
 
-// requestedOrAll parses the names on a unary request, treating a request that
-// names nothing as a request for everything.
-//
-// Empty meaning everything is the xDS wildcard rule, which SPIRE also applies
-// here. Empty strings are dropped before the count, for the same parity: a caller
-// sending one gets the wildcard rather than an error.
-//
-// Not shared with the stream. An Envoy stream opens before it knows what it
-// wants and its first request routinely names nothing, so reading that as "send
-// everything" would push a private key at a sidecar that asked for neither.
+// requestedOrAll parses the names on a unary request, treating one that names
+// nothing as a request for everything, the xDS wildcard rule. Not shared with the
+// stream, whose first request routinely names nothing: reading that as everything
+// would push a private key at a sidecar that asked for neither.
 func requestedOrAll(names []string) ([]resource, error) {
 	named := make([]string, 0, len(names))
 	for _, name := range names {
@@ -660,14 +547,10 @@ func requestedOrAll(names []string) ([]resource, error) {
 	return parseRequestedResources(named)
 }
 
-// allResources is the wildcard set: the workload's own certificate and its own
-// trust anchors, which is everything this agent can serve without the caller
-// naming a trust domain.
-//
-// The spiffe://<own domain> form is left out rather than included, because it
-// would repeat ROOTCA's bytes under a second name. Federation is out of scope, so
-// there is no other domain to enumerate; when it arrives, the federated domains
-// belong in this set, which is what makes the wildcard worth having.
+// allResources is the wildcard set: everything this agent can serve without the
+// caller naming a trust domain. The spiffe://<own domain> form is left out
+// because it would repeat ROOTCA's bytes under a second name. Federated domains
+// belong here when federation arrives.
 func allResources() []resource {
 	return []resource{
 		{name: ResourceNameTLSCertificate, kind: kindTLSCertificate},
@@ -676,8 +559,11 @@ func allResources() []resource {
 }
 
 // sameResources reports whether two parsed resource sets name the same things in
-// the same order. Order is part of it because the sets come from Envoy in request
-// order and a reordering is not worth distinguishing from a change.
+// the same order. Order counts because a reordering is not worth distinguishing
+// from a change.
+// sameResources reports whether two parsed resource sets name the same things in
+// the same order. Deliberately not sorted first: a reorder then reads as an
+// interest change, and serving one costs a dedupe pass that sends nothing.
 func sameResources(a, b []resource) bool {
 	if len(a) != len(b) {
 		return false

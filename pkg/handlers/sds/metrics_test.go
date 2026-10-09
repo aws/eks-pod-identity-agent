@@ -14,12 +14,9 @@ import (
 )
 
 // rpcTotal reads one series of workload_identity_rpc_total off the default
-// registry, where promauto registered it, returning zero for a series that does
-// not exist yet.
-//
-// Read by name through the gatherer rather than through the collector, because the
-// collector is unexported in pkg/handlers and this package is deliberately not
-// given a second registration of the same metric name, which would panic.
+// registry, returning zero for a series that does not exist yet. By name through
+// the gatherer, because the collector is unexported in pkg/handlers and a second
+// registration of the same name would panic.
 func rpcTotal(t *testing.T, rpc, outcome, errLabel string) float64 {
 	t.Helper()
 
