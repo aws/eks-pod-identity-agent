@@ -10,8 +10,8 @@ This agent is required for EKS pods to get granular IAM permissions with EKS Pod
 
 ## Update below Env to your cluster and region in values.yaml
 
-* `EKS_CLUSTER_NAME` 
-* `AWS_REGION_NAME`
+- `EKS_CLUSTER_NAME`
+- `AWS_REGION_NAME`
 
 ## Installing the Chart
 
@@ -41,6 +41,7 @@ The following table lists the configurable parameters for this chart and their d
 | `imagePullSecrets`        | Docker registry pull secret                             | `[]`                     |
 | `init.additionalArgs`     | Additional arguments to pass to the init-container      | (see `values.yaml`)      |
 | `init.create`             | Specifies whether init-container should be created      | `true`                   |
+| `init.resources`          | Resources for the init-container                        | `{}`                     |
 | `nameOverride`            | Override the name of the chart                          | `eks-pod-identity-agent` |
 | `nodeSelector`            | Node labels for pod assignment                          | `{}`                     |
 | `podAnnotations`          | annotations to add to each pod                          | `{}`                     |
