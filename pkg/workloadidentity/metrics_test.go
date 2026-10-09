@@ -28,7 +28,7 @@ const labelConstantPrefix = "Label"
 
 // valueConstantPrefixes marks the constants that carry a label value. Every one
 // of them has to be in labelValueSets, so the lower_snake_case check sees it.
-var valueConstantPrefixes = []string{"Outcome", "Format", "CacheTier", "CacheResult", "Reason", "RPC", "Delivery"}
+var valueConstantPrefixes = []string{"Outcome", "Format", "CacheTier", "CacheResult", "CredentialSource", "Reason", "RPC", "Delivery"}
 
 // prometheusMetricName is the metric name grammar Prometheus enforces.
 var prometheusMetricName = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
@@ -49,6 +49,7 @@ var labelNames = []string{
 	LabelDelivery,
 	LabelTier,
 	LabelResult,
+	LabelSource,
 }
 
 // labelValueSets is every label value set this package declares, keyed by the
@@ -61,6 +62,7 @@ var labelValueSets = map[string][]string{
 	"tier":     {CacheTierToken, CacheTierSession, CacheTierX509SVID, CacheTierJWTSVID, CacheTierBundle},
 	"result":   {CacheResultHit, CacheResultMiss, CacheResultExpired, CacheResultEvicted},
 	"delivery": {DeliverySignalled, DeliveryCoalesced},
+	"source":   {CredentialSourceEKSAuth, CredentialSourceIMDSFirst},
 	"rpc": {
 		RPCFetchX509SVID,
 		RPCFetchX509Bundles,
@@ -301,6 +303,7 @@ func TestMetricNames_Declared_MatchesExpectedListExactly(t *testing.T) {
 		"workload_identity_subscriptions_active",
 		"workload_identity_notification_total",
 		"workload_identity_cache_total",
+		"workload_identity_credential_source_total",
 		"workload_identity_rpc_total",
 		"workload_identity_rpc_duration_seconds",
 	}
@@ -352,6 +355,7 @@ func TestMetricNames_ByInstrumentKind_HasExpectedSuffix(t *testing.T) {
 		{name: "bundle change counter", metric: MetricBundleChangeTotal, wantSuffix: "_total"},
 		{name: "notification counter", metric: MetricNotificationTotal, wantSuffix: "_total"},
 		{name: "cache counter", metric: MetricCacheTotal, wantSuffix: "_total"},
+		{name: "credential source counter", metric: MetricCredentialSourceTotal, wantSuffix: "_total"},
 		{name: "rpc counter", metric: MetricRPCTotal, wantSuffix: "_total"},
 		{name: "rpc histogram", metric: MetricRPCDuration, wantSuffix: "_duration_seconds"},
 		// The only gauge carries neither suffix, because it is a level rather

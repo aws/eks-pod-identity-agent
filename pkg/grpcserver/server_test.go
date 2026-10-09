@@ -33,8 +33,8 @@ import (
 // Every method answers Unimplemented for now, which is the point: the request
 // travels the whole path, through the credentials and the interceptor chain, and
 // comes back with the status the registered handler produced. A method the agent does
-// not serve yet is distinguishable from one it will never serve, and the same call
-// without the SPIFFE header is refused before it reaches a handler at all.
+// not serve yet is distinguishable from one it will never serve, and a Workload API
+// call without the SPIFFE header is refused before it reaches a handler at all.
 //
 // The methods are named by string rather than through a generated client, so one pair
 // of helpers drives every service with an empty message, which decodes as any request.
@@ -83,9 +83,11 @@ func TestNew_ServesTheStubServicesOverTheSocket(t *testing.T) {
 	g.Expect(receive(withHeader(ctx), streamMethod)).To(Equal(codes.Unimplemented))
 	g.Expect(receive(withHeader(ctx), sdsStreamMethod)).To(Equal(codes.Unimplemented))
 
-	// and the gate still stands in front of all of them
+	// and the gate stands in front of the Workload API, but not of SDS, which Envoy
+	// calls without the header
 	g.Expect(invoke(ctx, unaryMethod)).To(Equal(codes.InvalidArgument))
 	g.Expect(receive(ctx, streamMethod)).To(Equal(codes.InvalidArgument))
+	g.Expect(receive(ctx, sdsStreamMethod)).To(Equal(codes.Unimplemented))
 
 	// A service nothing registered is Unimplemented too, but it says so differently,
 	// and that difference is what registering the real descriptors buys: a client

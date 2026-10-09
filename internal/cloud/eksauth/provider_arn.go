@@ -1,6 +1,6 @@
 package eksauth
 
-// The released SDK (eksauth v1.11.7) doesn't model the response member
+// The released SDK (eksauth v1.16.4) doesn't model the response member
 // workloadIdentityProviderArn, which EKS Auth sets only on an enrolled vend, so
 // GetIamCredentials installs this middleware to read it off the raw body.
 // Delete this file when the SDK ships the field at launch, and read

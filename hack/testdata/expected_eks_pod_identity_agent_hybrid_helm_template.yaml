@@ -33,6 +33,7 @@ spec:
       automountServiceAccountToken: true
       priorityClassName: system-node-critical
       hostNetwork: true
+      hostPID: true
       terminationGracePeriodSeconds: 30
       tolerations:
         - operator: Exists
@@ -155,6 +156,7 @@ spec:
       automountServiceAccountToken: true
       priorityClassName: system-node-critical
       hostNetwork: true
+      hostPID: true
       terminationGracePeriodSeconds: 30
       tolerations:
         - operator: Exists

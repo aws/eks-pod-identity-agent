@@ -23,13 +23,15 @@ import (
 
 // NewAttestor builds a fully wired Attestor from a shared node-credentialed
 // client and the resolved node name. It starts the node-scoped pod store and
-// blocks until its cache syncs or ctx is done.
-func NewAttestor(ctx context.Context, clientset kubernetes.Interface, nodeName string) (workloadidentity.Attestor, error) {
+// blocks until its cache syncs or ctx is done. It also returns the store, so a
+// tier that tracks pod presence and deletion, such as the JWT-SVID source (T8),
+// watches the same cache the attestor resolves callers from.
+func NewAttestor(ctx context.Context, clientset kubernetes.Interface, nodeName string) (workloadidentity.Attestor, *PodStore, error) {
 	pods, err := NewPodStore(ctx, clientset, nodeName)
 	if err != nil {
-		return nil, fmt.Errorf("starting node-scoped pod store: %w", err)
+		return nil, nil, fmt.Errorf("starting node-scoped pod store: %w", err)
 	}
 	logger.FromContext(ctx).Infof("attestation: pod store synced for node %q", nodeName)
 
-	return New(nodeName, pods, NewCgroupResolver()), nil
+	return New(nodeName, pods, NewCgroupResolver()), pods, nil
 }

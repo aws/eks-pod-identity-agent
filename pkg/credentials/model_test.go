@@ -1,6 +1,7 @@
 package credentials
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -8,6 +9,35 @@ import (
 
 	. "github.com/onsi/gomega"
 )
+
+func TestCredentialMetadata_Source(t *testing.T) {
+	tests := []struct {
+		name       string
+		meta       CredentialMetadata
+		wantSource CredentialSource
+		wantAssoc  string
+	}{
+		{
+			name:       "IMDS source",
+			meta:       CredentialMetadata{Association: "assoc-1", CredSource: SourceIMDS},
+			wantSource: SourceIMDS,
+			wantAssoc:  "assoc-1",
+		},
+		{
+			name:       "Auth Service source",
+			meta:       CredentialMetadata{Association: "assoc-2", CredSource: SourceAuthService},
+			wantSource: SourceAuthService,
+			wantAssoc:  "assoc-2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(tt.meta.Source()).To(Equal(tt.wantSource))
+			g.Expect(tt.meta.AssociationId()).To(Equal(tt.wantAssoc))
+		})
+	}
+}
 
 func TestEksCredentialsResponse_Serialization(t *testing.T) {
 	var (
@@ -51,27 +81,115 @@ func TestEksCredentialsResponse_Serialization(t *testing.T) {
 	}
 }
 
-// TestEksCredentialsResponse_SerializationLeavesOutTheProviderArn pins that the
-// credentials the handler marshals for a pod are the same bytes whether or not
-// EKS Auth decorated the session.
-func TestEksCredentialsResponse_SerializationLeavesOutTheProviderArn(t *testing.T) {
-	g := NewWithT(t)
-	response := EksCredentialsResponse{
-		AccessKeyId:     "some-access-key",
-		SecretAccessKey: "some-secret-key",
-		Token:           "some-token",
-		AccountId:       "some-account-id",
-		Expiration:      SdkCompliantExpirationTime{time.Date(1996, 3, 27, 7, 45, 23, 123_456_789, time.UTC)},
+func TestGetPodUIDFromToken(t *testing.T) {
+	// Build a valid unsigned JWT with pod UID
+	validToken := buildTestToken(t, map[string]interface{}{
+		"kubernetes.io": map[string]interface{}{
+			"pod": map[string]interface{}{
+				"uid": "test-pod-uid-123",
+			},
+		},
+	})
+
+	tests := []struct {
+		name    string
+		token   string
+		wantUID string
+		wantErr string
+	}{
+		{
+			name:    "valid token returns pod UID",
+			token:   validToken,
+			wantUID: "test-pod-uid-123",
+		},
+		{
+			name:    "malformed JWT",
+			token:   "not-a-jwt",
+			wantErr: "cannot parse service account token",
+		},
+		{
+			name:    "missing kubernetes.io claims",
+			token:   buildTestToken(t, map[string]interface{}{"foo": "bar"}),
+			wantErr: "token missing kubernetes.io claims",
+		},
+		{
+			name: "missing pod claims",
+			token: buildTestToken(t, map[string]interface{}{
+				"kubernetes.io": map[string]interface{}{"serviceaccount": "sa"},
+			}),
+			wantErr: "token missing pod claims",
+		},
+		{
+			name: "missing pod uid",
+			token: buildTestToken(t, map[string]interface{}{
+				"kubernetes.io": map[string]interface{}{
+					"pod": map[string]interface{}{"name": "my-pod"},
+				},
+			}),
+			wantErr: "token missing pod uid",
+		},
 	}
-	decorated := response
-	decorated.ProviderArn = "arn:aws:iam::111122223333:workload-identity-provider/example"
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			uid, err := GetPodUIDFromToken(tt.token)
+			if tt.wantErr != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(tt.wantErr))
+			} else {
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(uid).To(Equal(tt.wantUID))
+			}
+		})
+	}
+}
 
-	want, err := json.Marshal(response)
-	g.Expect(err).NotTo(HaveOccurred())
-	got, err := json.Marshal(decorated)
-	g.Expect(err).NotTo(HaveOccurred())
+func TestGetExpiryFromToken(t *testing.T) {
+	exp := time.Unix(1_900_000_000, 0)
 
-	g.Expect(got).To(Equal(want))
-	g.Expect(string(got)).NotTo(ContainSubstring(decorated.ProviderArn))
-	g.Expect(string(got)).NotTo(ContainSubstring("ProviderArn"))
+	tests := []struct {
+		name    string
+		token   string
+		wantExp time.Time
+		wantErr string
+	}{
+		{"valid token returns exp", buildTestToken(t, map[string]interface{}{"exp": exp.Unix()}), exp, ""},
+		{"malformed JWT", "not-a-jwt", time.Time{}, "cannot parse service account token"},
+		{"missing exp", buildTestToken(t, map[string]interface{}{"foo": "bar"}), time.Time{}, "token missing exp claim"},
+		{"exp not a number", buildTestToken(t, map[string]interface{}{"exp": "soon"}), time.Time{}, "cannot parse token expiry"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			got, err := GetExpiryFromToken(tt.token)
+			if tt.wantErr != "" {
+				g.Expect(err).To(MatchError(ContainSubstring(tt.wantErr)))
+				return
+			}
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(got).To(BeTemporally("==", tt.wantExp))
+		})
+	}
+}
+
+// buildTestToken creates an unsigned JWT with the given claims.
+func buildTestToken(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+	header := base64RawURL(t, `{"alg":"none","typ":"JWT"}`)
+	payload := base64RawURL(t, mustJSON(t, claims))
+	return header + "." + payload + "."
+}
+
+func base64RawURL(t *testing.T, s string) string {
+	t.Helper()
+	return base64.RawURLEncoding.EncodeToString([]byte(s))
+}
+
+func mustJSON(t *testing.T, v interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON: %v", err)
+	}
+	return string(b)
 }

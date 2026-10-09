@@ -1,7 +1,8 @@
 package eksauth
 
-// These tests run the real SDK client, built by NewService, against the fake
-// EKS Auth in eksauthtest. They're in-package so they can assert on the
+// Most of these tests run the real SDK client, built by NewService, against the
+// fake EKS Auth in eksauthtest; the upstream tests from capturingRoundTripper on
+// build a service directly. They're in-package so they can assert on the
 // unexported client and middleware, which only works while eksauthtest doesn't
 // import this package.
 
@@ -10,7 +11,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -25,8 +29,10 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	. "github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth/eksauthtest"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
@@ -51,7 +57,7 @@ func credentialsRequest() *credentials.EksCredentialsRequest {
 
 // getIamCredentials calls GetIamCredentials on a new client for cfg.
 func getIamCredentials(ctx context.Context, cfg aws.Config) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
-	return NewService(cfg).GetIamCredentials(ctx, credentialsRequest())
+	return NewService(ctx, cfg, false).GetIamCredentials(ctx, credentialsRequest())
 }
 
 func TestGetIamCredentials_DecodesEveryFieldOfAnEnrolledSession(t *testing.T) {
@@ -71,11 +77,11 @@ func TestGetIamCredentials_DecodesEveryFieldOfAnEnrolledSession(t *testing.T) {
 		Token:           session.SessionToken,
 		AccountId:       eksauthtest.AccountID,
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: testExpiration},
-		ProviderArn:     session.ProviderArn,
 	}))
-	g.Expect(got.ProviderArn).ToNot(BeEmpty())
 	g.Expect(metadata).ToNot(BeNil())
 	g.Expect(metadata.AssociationId()).To(Equal(session.AssociationID))
+	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
+	g.Expect(metadata.ProviderArn()).ToNot(BeEmpty())
 }
 
 func TestGetIamCredentials_LeavesProviderArnEmptyWhenTheMemberIsAbsent(t *testing.T) {
@@ -97,6 +103,7 @@ func TestGetIamCredentials_LeavesProviderArnEmptyWhenTheMemberIsAbsent(t *testin
 		Expiration:      credentials.SdkCompliantExpirationTime{Time: testExpiration},
 	}))
 	g.Expect(metadata.AssociationId()).To(Equal(session.AssociationID))
+	g.Expect(metadata.ProviderArn()).To(BeEmpty())
 }
 
 func TestGetIamCredentials_TreatsANullMemberAsAbsent(t *testing.T) {
@@ -106,9 +113,9 @@ func TestGetIamCredentials_TreatsANullMemberAsAbsent(t *testing.T) {
 	document[providerArnMember] = nil
 	fake.SetRawResponse(http.StatusOK, mustJSON(t, document))
 
-	got, _, err := getIamCredentials(context.Background(), fake.Config())
+	got, metadata, err := getIamCredentials(context.Background(), fake.Config())
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(got.ProviderArn).To(BeEmpty())
+	g.Expect(metadata.ProviderArn()).To(BeEmpty())
 	g.Expect(got.AccessKeyId).To(Equal(eksauthtest.EnrolledSession(testExpiration).AccessKeyID))
 }
 
@@ -131,7 +138,7 @@ func TestGetIamCredentials_ReadsAMistypedMemberAsAbsent(t *testing.T) {
 
 			got, metadata, err := getIamCredentials(context.Background(), fake.Config())
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(got.ProviderArn).To(BeEmpty())
+			g.Expect(metadata.ProviderArn()).To(BeEmpty())
 			session := eksauthtest.EnrolledSession(testExpiration)
 			g.Expect(got.AccessKeyId).To(Equal(session.AccessKeyID))
 			g.Expect(got.SecretAccessKey).To(Equal(session.SecretAccessKey))
@@ -148,7 +155,7 @@ func TestGetIamCredentials_ReadsAMistypedMemberAsAbsent(t *testing.T) {
 func TestGetIamCredentials_IgnoresMembersItDoesNotRead(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
-	svc := NewService(fake.Config())
+	svc := NewService(context.Background(), fake.Config(), false)
 
 	fake.SetRawResponse(http.StatusOK, mustJSON(t, successDocument()))
 	want, wantMetadata, err := svc.GetIamCredentials(context.Background(), credentialsRequest())
@@ -163,7 +170,7 @@ func TestGetIamCredentials_IgnoresMembersItDoesNotRead(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(got).To(Equal(want))
 	g.Expect(metadata.AssociationId()).To(Equal(wantMetadata.AssociationId()))
-	g.Expect(got.ProviderArn).To(Equal(eksauthtest.EnrolledSession(testExpiration).ProviderArn))
+	g.Expect(metadata.ProviderArn()).To(Equal(eksauthtest.EnrolledSession(testExpiration).ProviderArn))
 }
 
 func TestGetIamCredentials_SendsTheOperationSignedByTheNode(t *testing.T) {
@@ -184,7 +191,9 @@ func TestGetIamCredentials_SendsTheOperationSignedByTheNode(t *testing.T) {
 
 	var body map[string]any
 	g.Expect(json.Unmarshal(request.Body, &body)).To(Succeed())
-	g.Expect(body).To(Equal(map[string]any{"token": testToken}), "the body carries the token and nothing else")
+	// The service is built with node metadata off, so the request names no zone.
+	g.Expect(body).To(Equal(map[string]any{"token": testToken}),
+		"the body carries the token and nothing else")
 
 	// Signed by the node credentials, for the eks-auth service in the
 	// configured region.
@@ -354,10 +363,10 @@ func TestGetIamCredentials_DecodesTheFirstValueAsTheSDKDoes(t *testing.T) {
 	fake := eksauthtest.New(t)
 	fake.SetRawResponse(http.StatusOK, append(mustJSON(t, successDocument()), []byte(" trailing")...))
 
-	got, _, err := getIamCredentials(context.Background(), fake.Config())
+	got, metadata, err := getIamCredentials(context.Background(), fake.Config())
 	g.Expect(err).ToNot(HaveOccurred())
 	session := eksauthtest.EnrolledSession(testExpiration)
-	g.Expect(got.ProviderArn).To(Equal(session.ProviderArn))
+	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
 	g.Expect(got.AccessKeyId).To(Equal(session.AccessKeyID))
 }
 
@@ -387,10 +396,10 @@ func TestGetIamCredentials_ReadsTheMemberOffTheAttemptThatSucceeded(t *testing.T
 		})
 	}
 
-	got, _, err := getIamCredentials(context.Background(), cfg)
+	_, metadata, err := getIamCredentials(context.Background(), cfg)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(fake.Calls()).To(Equal(2))
-	g.Expect(got.ProviderArn).To(Equal(session.ProviderArn))
+	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
 }
 
 func TestGetIamCredentials_ReturnsWhenTheContextEnds(t *testing.T) {
@@ -439,7 +448,7 @@ func assumeRoleInput() *awseksauth.AssumeRoleForPodIdentityInput {
 func TestWorkloadIdentityProviderArnMiddleware_RunsInsideTheOperationDeserializer(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
-	client := NewService(fake.Config()).(*service).eksAuthService
+	client := NewService(context.Background(), fake.Config(), false).(*service).eksAuthService
 	middlewareID := workloadIdentityProviderArnMiddleware{}.ID()
 
 	var ids []string
@@ -461,7 +470,7 @@ func TestWorkloadIdentityProviderArnMiddleware_RunsInsideTheOperationDeserialize
 func TestWorkloadIdentityProviderArnMiddleware_IsInstalledPerCallOnly(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
-	svc := NewService(fake.Config()).(*service)
+	svc := NewService(context.Background(), fake.Config(), false).(*service)
 	client := svc.eksAuthService
 	apiOptionsBefore := len(client.Options().APIOptions)
 
@@ -531,9 +540,226 @@ func (b *syncBuffer) String() string {
 func captureLog(t *testing.T) *syncBuffer {
 	t.Helper()
 	buf := &syncBuffer{}
+	// The level is pinned too, since a test that calls logger.Initialize leaves a
+	// quieter global behind.
 	global := logger.FromContext(context.Background()).Logger
-	previous := global.Out
+	previous, previousLevel := global.Out, global.GetLevel()
 	global.SetOutput(buf)
-	t.Cleanup(func() { global.SetOutput(previous) })
+	global.SetLevel(logrus.TraceLevel)
+	t.Cleanup(func() {
+		global.SetOutput(previous)
+		global.SetLevel(previousLevel)
+	})
 	return buf
+}
+
+// capturingRoundTripper records the outbound request body so tests can assert
+// which fields were serialized and sent to EKS Auth.
+type capturingRoundTripper struct {
+	capturedBody string
+	response     string
+}
+
+func (c *capturingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		bodyBytes, _ := io.ReadAll(req.Body)
+		c.capturedBody = string(bodyBytes)
+	}
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(c.response)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}, nil
+}
+
+// newTestService builds a service backed by a capturing HTTP transport so we can
+// inspect exactly what is sent to the Auth API.
+func newTestService(rt http.RoundTripper, nodeMetadata *imds.NodeMetadata) *service {
+	cfg := aws.Config{
+		Region:      "us-west-2",
+		Credentials: aws.AnonymousCredentials{},
+		HTTPClient:  &http.Client{Transport: rt},
+	}
+	client := awseksauth.NewFromConfig(cfg, func(o *awseksauth.Options) {
+		o.BaseEndpoint = aws.String("https://eks-auth.us-west-2.amazonaws.com")
+		// Avoid retries so the capturing transport sees exactly one call.
+		o.Retryer = aws.NopRetryer{}
+	})
+	return &service{
+		eksAuthService: client,
+		nodeMetadata:   nodeMetadata,
+	}
+}
+
+const validAssumeRoleResponse = `{
+  "credentials": {
+    "accessKeyId": "ASIATEST",
+    "secretAccessKey": "secret",
+    "sessionToken": "token",
+    "expiration": 1893456000
+  },
+  "assumedRoleUser": {
+    "arn": "arn:aws:sts::123456789012:assumed-role/my-role/session",
+    "assumeRoleId": "AROAEXAMPLE:session"
+  },
+  "podIdentityAssociation": {
+    "associationId": "a-abc123",
+    "associationArn": "arn:aws:eks:us-west-2:123456789012:podidentityassociation/cluster/a-abc123"
+  },
+  "subject": {
+    "namespace": "default",
+    "serviceAccount": "my-sa"
+  }
+}`
+
+func TestGetIamCredentials_NodeMetadataSerialization(t *testing.T) {
+	testCases := []struct {
+		name          string
+		nodeMetadata  *imds.NodeMetadata
+		expectPresent []string
+		expectAbsent  []string
+	}{
+		{
+			name: "zone present is serialized",
+			nodeMetadata: &imds.NodeMetadata{
+				Zone: "usw2-az1",
+			},
+			expectPresent: []string{"usw2-az1"},
+		},
+		{
+			name:          "nil node metadata omits zone",
+			nodeMetadata:  nil,
+			expectPresent: []string{"jwt-token"},
+			expectAbsent:  []string{"zone"},
+		},
+		{
+			name: "empty zone is not present",
+			nodeMetadata: &imds.NodeMetadata{
+				Zone: "",
+			},
+			expectPresent: []string{"jwt-token"},
+			expectAbsent:  []string{"usw2-az1"},
+		},
+		{
+			name:          "all-empty non-nil struct still produces a valid request",
+			nodeMetadata:  &imds.NodeMetadata{},
+			expectPresent: []string{"jwt-token"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			rt := &capturingRoundTripper{response: validAssumeRoleResponse}
+			svc := newTestService(rt, tc.nodeMetadata)
+
+			_, _, err := svc.GetIamCredentials(context.Background(), &credentials.EksCredentialsRequest{
+				ClusterName:         "test-cluster",
+				ServiceAccountToken: "jwt-token",
+			})
+
+			g.Expect(err).NotTo(HaveOccurred())
+			for _, s := range tc.expectPresent {
+				g.Expect(rt.capturedBody).To(ContainSubstring(s))
+			}
+			for _, s := range tc.expectAbsent {
+				g.Expect(rt.capturedBody).NotTo(ContainSubstring(s))
+			}
+		})
+	}
+}
+
+func TestGetIamCredentials_ReturnsParsedCredentials(t *testing.T) {
+	g := NewWithT(t)
+
+	rt := &capturingRoundTripper{response: validAssumeRoleResponse}
+	svc := newTestService(rt, &imds.NodeMetadata{Zone: "z"})
+
+	resp, meta, err := svc.GetIamCredentials(context.Background(), &credentials.EksCredentialsRequest{
+		ClusterName:         "test-cluster",
+		ServiceAccountToken: "jwt-token",
+	})
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(resp.AccessKeyId).To(Equal("ASIATEST"))
+	g.Expect(resp.AccountId).To(Equal("123456789012"))
+	g.Expect(meta.AssociationId()).To(Equal("a-abc123"))
+}
+
+// TestGetIamCredentials_ReturnsAuthServiceSource verifies that GetIamCredentials for
+// the EKS Auth Service delegate returns the correct source.
+func TestGetIamCredentials_ReturnsAuthServiceSource(t *testing.T) {
+	g := NewWithT(t)
+	logger.Initialize("error")
+	const associationID = "a-1234567890abcdef0"
+
+	// Use an httptest server to simulate an AssumeRoleForPodIdentity call, forcing
+	// GetIamCredentials to construct ResponseMetadata.
+	// Response format per the EKS Auth AssumeRoleForPodIdentity API:
+	// https://docs.aws.amazon.com/eks/latest/APIReference/API_auth_AssumeRoleForPodIdentity.html#API_auth_AssumeRoleForPodIdentity_ResponseSyntax
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+			"assumedRoleUser": {
+				"arn": "arn:aws:sts::123456789012:assumed-role/my-role/session",
+				"assumeRoleId": "AROA1234567890EXAMPLE:session"
+			},
+			"audience": "pods.eks.amazonaws.com",
+			"credentials": {
+				"accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+				"secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				"sessionToken": "FwoGZXIvYXdzEBY",
+				"expiration": 1924905600
+			},
+			"podIdentityAssociation": {
+				"associationArn": "arn:aws:eks:us-west-2:123456789012:podidentityassociation/my-cluster/%s",
+				"associationId": "%s"
+			},
+			"subject": {
+				"namespace": "default",
+				"serviceAccount": "my-sa"
+			}
+		}`, associationID, associationID)
+	}))
+	defer server.Close()
+
+	client := awseksauth.NewFromConfig(aws.Config{
+		Region: "us-west-2",
+		Credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "fake", SecretAccessKey: "fake", SessionToken: "fake"}, nil
+		}),
+	}, func(o *awseksauth.Options) {
+		o.BaseEndpoint = aws.String(server.URL)
+	})
+
+	svc := &service{eksAuthService: client}
+	resp, meta, err := svc.GetIamCredentials(context.Background(), &credentials.EksCredentialsRequest{
+		ClusterName:         "my-cluster",
+		ServiceAccountToken: "fake-token",
+	})
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(meta.Source()).To(Equal(credentials.SourceAuthService))
+	g.Expect(meta.AssociationId()).To(Equal(associationID))
+	g.Expect(resp.AccessKeyId).To(Equal("AKIAIOSFODNN7EXAMPLE"))
+	g.Expect(resp.AccountId).To(Equal("123456789012"))
+}
+
+// TestNewService_IMDSDisabled_SkipsMetadataFetch verifies that when the IMDS
+// feature is disabled, NewService does not fetch node metadata
+func TestNewService_IMDSDisabled_SkipsMetadataFetch(t *testing.T) {
+	g := NewWithT(t)
+	logger.Initialize("error")
+
+	cfg := aws.Config{
+		Region:      "us-west-2",
+		Credentials: aws.AnonymousCredentials{},
+	}
+
+	iface := NewService(context.Background(), cfg, false)
+
+	svc, ok := iface.(*service)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(svc.nodeMetadata).To(BeNil())
 }

@@ -2,24 +2,25 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/sirupsen/logrus"
-	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/attestation"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/kube"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/material/bundle"
+	jwttier "go.amzn.com/eks/eks-pod-identity-agent/internal/material/jwt"
 	x509tier "go.amzn.com/eks/eks-pod-identity-agent/internal/material/x509"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/notify"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/session"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/tokenminter"
-	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers/sds"
@@ -27,18 +28,78 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
+// workloadIdentityClients is what workload identity reaches the API server with,
+// built once by createServers before the credential manager: the node client, the
+// node name it authenticates as, and T4's cached token minter. The minter is the
+// one token cache, shared by the session tier's exchanges and the credential
+// cache's refreshes.
+type workloadIdentityClients struct {
+	clientset kubernetes.Interface
+	nodeName  string
+	minter    workloadidentity.TokenMinter
+}
+
+// newNodeClient builds the node client from the kubelet's kubeconfig. Tests
+// replace it.
+var newNodeClient = kube.NewNodeClient
+
+// newWorkloadIdentityClients builds the clients when workload identity is on,
+// blocking until the node name resolves. Off, it builds nothing and returns nil,
+// so boot needs neither the API server nor the kubelet's kubeconfig.
+func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
+	if !opts.Enabled {
+		return nil, nil
+	}
+	clientset, err := newNodeClient("")
+	if err != nil {
+		return nil, err
+	}
+	return buildWorkloadIdentityClients(ctx, opts, clientset)
+}
+
+// buildWorkloadIdentityClients is newWorkloadIdentityClients past the node
+// client, so a test can drive it with a fake clientset. The node name's retry
+// comes first, so the minter's pre-flight reaches an API server that has answered.
+func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
+	clientset kubernetes.Interface) (*workloadIdentityClients, error) {
+	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
+	if err != nil {
+		return nil, err
+	}
+	// It refuses a --max-cache-size of zero, which the credential endpoint's cache
+	// reads as no caching.
+	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{MaxCacheSize: opts.MaxCacheSize})
+	if err != nil {
+		return nil, fmt.Errorf("building the token minter: %w", err)
+	}
+	return &workloadIdentityClients{clientset: clientset, nodeName: nodeName, minter: minter}, nil
+}
+
+// credentialTokens is the token source the credential cache refreshes with: the
+// shared minter's, or nil with workload identity off.
+func (c *workloadIdentityClients) credentialTokens() credcache.TokenSource {
+	if c == nil {
+		return nil
+	}
+	return session.MinterTokens(c.minter)
+}
+
 // workloadIdentityServers is what the workload identity feature runs: the gRPC
-// server on its socket and the trust bundle refresh loop. Off, it builds nothing,
-// so boot needs neither the API server nor the kubelet's kubeconfig. On, it blocks
-// until the pod store syncs, so a node the agent cannot attest on fails the boot.
-func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) ([]runnable, error) {
+// server on its socket and the trust bundle refresh loop, over the clients
+// createServers built. Off, it builds nothing. On, it blocks until the pod store
+// syncs, so a node the agent cannot attest on fails the boot.
+func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
+	clients *workloadIdentityClients) ([]runnable, error) {
 	if !opts.Enabled {
 		logger.FromContext(ctx).Infof("Workload identity is off (--%s=false), so %s is not served",
 			handlers.FlagEnableWorkloadIdentity, configuration.WorkloadIdentitySocketPath)
 		return nil, nil
 	}
+	if clients == nil {
+		return nil, errors.New("workload identity is on, but its clients weren't built")
+	}
 
-	tiers, err := newWorkloadIdentityTiers(ctx, opts)
+	tiers, err := newWorkloadIdentityTiers(ctx, opts, clients)
 	if err != nil {
 		return nil, fmt.Errorf("building the workload identity tiers: %w", err)
 	}
@@ -63,7 +124,8 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 
 // workloadIdentityTiers is what the workload identity socket serves from, built
 // once per node: the Workload API handler and the Envoy SDS handler over the same
-// tiers, and the trust bundle tier, whose refresh loop runs beside the servers.
+// tiers, the trust bundle tier, whose refresh loop runs beside the servers, and
+// the session tier they share.
 //
 // One set of tiers for both handlers, so a workload reaching the agent over both
 // interfaces gets the same certificate from the same cache rather than two
@@ -72,46 +134,37 @@ type workloadIdentityTiers struct {
 	handler      *workloadapi.Handler
 	sdsHandler   *sds.Handler
 	bundleSource *bundle.Registry
+	// sessions is read only by tests, which mint through it.
+	sessions *session.Provider
 }
 
-// newWorkloadIdentityTiers builds the tiers over the node credential. It blocks
-// until the node name resolves and the pod store syncs, since nothing can be
-// attested before then, and it needs the kubelet's kubeconfig on the node.
-func newWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) (*workloadIdentityTiers, error) {
-	clientset, err := kube.NewNodeClient("")
-	if err != nil {
-		return nil, err
-	}
-	return buildWorkloadIdentityTiers(ctx, opts, clientset, sts.NewService(opts.Cfg))
+// newWorkloadIdentityTiers builds the tiers over clients and a new STS client. It
+// blocks until the pod store syncs, since nothing can be attested before then.
+func newWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
+	clients *workloadIdentityClients) (*workloadIdentityTiers, error) {
+	return buildWorkloadIdentityTiers(ctx, opts, clients, sts.NewService(opts.Cfg))
 }
 
-// buildWorkloadIdentityTiers is newWorkloadIdentityTiers past the clients, so a
-// test can drive the wiring with a fake clientset and STS. One hub serves the
-// node: the bundle and X.509-SVID tiers publish to it, and each stream subscribes
+// buildWorkloadIdentityTiers is newWorkloadIdentityTiers past the STS client, so
+// a test can drive the wiring with fake clients and STS. One hub serves the node:
+// the bundle and X.509-SVID tiers publish to it, and each stream subscribes
 // through its own hub.ForRPC under that RPC's constant.
-func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts, clientset kubernetes.Interface, stsClient sts.Iface) (*workloadIdentityTiers, error) {
-	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
-	if err != nil {
-		return nil, err
-	}
-	attestor, err := attestation.NewAttestor(ctx, clientset, nodeName)
+func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
+	clients *workloadIdentityClients, stsClient sts.Iface) (*workloadIdentityTiers, error) {
+	attestor, pods, err := attestation.NewAttestor(ctx, clients.clientset, clients.nodeName)
 	if err != nil {
 		return nil, err
 	}
 
-	// Shares the attestor's node client. It refuses a --max-cache-size of zero,
-	// which the credentials path reads as no caching.
-	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{MaxCacheSize: opts.MaxCacheSize})
-	if err != nil {
-		return nil, fmt.Errorf("building the token minter: %w", err)
-	}
-
-	// PLACEHOLDER(T5): the session tier's API without its implementation, which
-	// answers every session ErrSessionUnavailable until T5 lands. Cache is the
-	// credentials path's shared cache, which T5 builds once for every bind host.
-	sessionProvider, err := credsretriever.NewSessionProvider(credsretriever.SessionProviderOpts{
+	// Cache is the credential cache every bind host serves from, so one session
+	// per pod serves both the HTTP endpoint and this socket. The tier refuses a
+	// nil cache, which either caching flag at zero yields. Minter is the one the
+	// cache refreshes with.
+	sessionProvider, err := session.New(session.Opts{
 		ClusterName: opts.ClusterName,
-		Minter:      minter,
+		Minter:      clients.minter,
+		Cache:       opts.CredentialCache,
+		EKSAuth:     opts.EKSAuth,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the session tier: %w", err)
@@ -143,10 +196,24 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		return nil, fmt.Errorf("building the X.509-SVID tier: %w", err)
 	}
 
+	// Watches the attestor's pod store, so a deleted pod's tokens go with it.
+	tokens, err := jwttier.New(jwttier.Opts{
+		Issuer:          stsClient,
+		SessionProvider: sessionProvider,
+		PodStore:        pods,
+		MaxCacheSize:    opts.MaxCacheSize,
+		Duration:        opts.JWTSVIDDuration,
+		RenewalFraction: opts.SVIDRenewalFraction,
+		RenewalJitter:   opts.SVIDRenewalJitter,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("building the JWT-SVID tier: %w", err)
+	}
+
 	handler := workloadapi.New(workloadapi.Opts{
 		Attestor:              attestor,
 		Certs:                 certs,
-		Tokens:                unimplementedTokenSource{},
+		Tokens:                tokens,
 		Bundles:               bundleSource,
 		X509SVIDSubscriber:    hub.ForRPC(workloadidentity.RPCFetchX509SVID),
 		X509BundlesSubscriber: hub.ForRPC(workloadidentity.RPCFetchX509Bundles),
@@ -161,7 +228,12 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		StreamSecretsSubscriber: hub.ForRPC(workloadidentity.RPCStreamSecrets),
 	})
 
-	return &workloadIdentityTiers{handler: handler, sdsHandler: sdsHandler, bundleSource: bundleSource}, nil
+	return &workloadIdentityTiers{
+		handler:      handler,
+		sdsHandler:   sdsHandler,
+		bundleSource: bundleSource,
+		sessions:     sessionProvider,
+	}, nil
 }
 
 // registerWorkloadIdentityServices returns the registration the workload identity
@@ -189,15 +261,3 @@ func (l backgroundLoop) ListenUntilContextCancelled(ctx context.Context) { l.run
 func (l backgroundLoop) Addr() string { return l.name }
 
 var _ runnable = backgroundLoop{}
-
-// unimplementedTokenSource stands in for the JWT-SVID tier until T8 lands. Every
-// call fails retryably, so FetchJWTSVID answers Unavailable.
-//
-// PLACEHOLDER(T8): replace with the internal/material/jwt source.
-type unimplementedTokenSource struct{}
-
-func (unimplementedTokenSource) JWTSVIDs(context.Context, *workloadidentity.Workload, []string) ([]*jwtsvid.SVID, error) {
-	return nil, wierrors.ErrIssuanceFailed.Wrapf(nil, "the JWT-SVID tier is not implemented yet")
-}
-
-var _ workloadidentity.TokenSource = unimplementedTokenSource{}

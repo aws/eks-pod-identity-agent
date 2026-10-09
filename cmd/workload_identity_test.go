@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"github.com/golang-jwt/jwt/v5"
 	. "github.com/onsi/gomega"
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"golang.org/x/time/rate"
@@ -21,13 +22,17 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
@@ -42,20 +47,40 @@ var wiOpts = handlers.WorkloadIdentityServerOpts{
 	ClusterName:         "test-cluster",
 	MaxCacheSize:        100,
 	X509SVIDDuration:    12 * time.Hour,
+	JWTSVIDDuration:     time.Hour,
 	SVIDRenewalFraction: 0.5,
 	SVIDRenewalJitter:   0.1,
+	// Sweep an hour away: building the tiers caches nothing, so there's nothing to refresh.
+	CredentialCache: credcache.New(credcache.Opts{
+		Delegate: wiNoExchange{}, RenewalTtl: time.Hour, MaxSize: 100, CleanupInterval: time.Hour,
+	}),
+	EKSAuth: wiNoExchange{},
 }
+
+// wiNoExchange stands in for EKS Auth. Building the tiers exchanges nothing, so
+// it fails every call.
+type wiNoExchange struct{}
+
+func (wiNoExchange) GetIamCredentials(context.Context, *credentials.EksCredentialsRequest) (
+	*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
+	return nil, nil, errors.New("wiNoExchange exchanges no tokens")
+}
+
+func (wiNoExchange) String() string                       { return "wi-no-exchange" }
+func (wiNoExchange) IsIrrecoverable(error) (string, bool) { return "Unknown", false }
 
 // wiNodeClientset is a fake clientset whose SelfSubjectReview reports username,
 // which is how the API server names the identity the agent presented. It also
 // records the field selector of every pod list, so a test can see which node the
-// pod store was scoped to.
+// pod store was scoped to, and answers every TokenRequest with an hour-long JWT
+// naming the pod, counting them.
 type wiNodeClientset struct {
 	*fake.Clientset
 
 	mu            sync.Mutex
 	podSelectors  []string
 	podListsTotal int
+	tokens        []string
 }
 
 func newWINodeClientset(username string) *wiNodeClientset {
@@ -64,6 +89,20 @@ func newWINodeClientset(username string) *wiNodeClientset {
 		return true, &authenticationv1.SelfSubjectReview{
 			Status: authenticationv1.SelfSubjectReviewStatus{UserInfo: authenticationv1.UserInfo{Username: username}},
 		}, nil
+	})
+	c.PrependReactor("create", "serviceaccounts", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		create, ok := action.(k8stesting.CreateActionImpl)
+		if !ok || action.GetSubresource() != "token" {
+			return false, nil, nil
+		}
+		request := create.GetObject().(*authenticationv1.TokenRequest).DeepCopy()
+		expires := time.Now().Add(time.Hour)
+		request.Status.Token = wiPodToken(action.GetNamespace(), create.Name, request, expires)
+		request.Status.ExpirationTimestamp = metav1.NewTime(expires)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.tokens = append(c.tokens, request.Status.Token)
+		return true, request, nil
 	})
 	// Not handled, so the default tracker still answers the list with no pods.
 	c.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
@@ -82,6 +121,32 @@ func (c *wiNodeClientset) podLists() (int, []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.podListsTotal, append([]string(nil), c.podSelectors...)
+}
+
+// tokenRequests returns every token the clientset's TokenRequests answered, in
+// order.
+func (c *wiNodeClientset) tokenRequests() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.tokens...)
+}
+
+// wiPodToken is the unsigned JWT the API server would mint for request: its
+// kubernetes.io claims name the bound pod and the ServiceAccount in namespace.
+func wiPodToken(namespace, serviceAccount string, request *authenticationv1.TokenRequest, expires time.Time) string {
+	ref := request.Spec.BoundObjectRef
+	token, err := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
+		"exp": expires.Unix(),
+		"kubernetes.io": map[string]any{
+			"namespace":      namespace,
+			"pod":            map[string]any{"name": ref.Name, "uid": string(ref.UID)},
+			"serviceaccount": map[string]any{"name": serviceAccount},
+		},
+	}).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		panic(err)
+	}
+	return token
 }
 
 // wiCountingFetcher is an STS client that counts calls and never answers, so a
@@ -105,9 +170,26 @@ func (f *wiCountingFetcher) GetWebIdentityToken(context.Context, aws.Credentials
 	return nil, errors.New("wiCountingFetcher issues no tokens")
 }
 
+// wiClients builds the workload identity clients as createServers does, over
+// client.
+func wiClients(t *testing.T, ctx context.Context, client kubernetes.Interface) *workloadIdentityClients {
+	t.Helper()
+	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
+	NewWithT(t).Expect(err).ToNot(HaveOccurred())
+	return clients
+}
+
 // wiBuildTiers builds the tiers as production does over a node-identity fake
 // clientset. The pod store's informer runs under a context cancelled at cleanup.
 func wiBuildTiers(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCountingFetcher) {
+	t.Helper()
+	tiers, client, fetcher, _ := wiBuildTiersAndClients(t)
+	return tiers, client, fetcher
+}
+
+// wiBuildTiersAndClients is wiBuildTiers that also returns the clients the tiers
+// were built over.
+func wiBuildTiersAndClients(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCountingFetcher, *workloadIdentityClients) {
 	t.Helper()
 	g := NewWithT(t)
 
@@ -116,10 +198,11 @@ func wiBuildTiers(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCo
 
 	client := newWINodeClientset("system:node:" + wiTestNode)
 	fetcher := &wiCountingFetcher{}
-	tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, client, fetcher)
+	clients := wiClients(t, ctx, client)
+	tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, clients, fetcher)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(tiers).ToNot(BeNil())
-	return tiers, client, fetcher
+	return tiers, client, fetcher, clients
 }
 
 // TestBuildWorkloadIdentityTiers_ANodeIdentity_BuildsEveryTier covers the boot
@@ -142,10 +225,11 @@ func TestBuildWorkloadIdentityTiers_ANodeIdentity_BuildsEveryTier(t *testing.T) 
 	g.Expect(fetcher.calls.Load()).To(BeZero())
 }
 
-// TestBuildWorkloadIdentityTiers_ANonNodeIdentity_Fails proves a client that is not
-// the node fails the boot before the pod store starts, since nothing it listed
-// would be scoped by what the Node authorizer enforces.
-func TestBuildWorkloadIdentityTiers_ANonNodeIdentity_Fails(t *testing.T) {
+// TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails proves a client that
+// is not the node fails the boot before the minter's pre-flight and before any
+// pod store starts, since nothing it listed would be scoped by what the Node
+// authorizer enforces.
+func TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails(t *testing.T) {
 	testCases := []struct {
 		name     string
 		username string
@@ -162,18 +246,59 @@ func TestBuildWorkloadIdentityTiers_ANonNodeIdentity_Fails(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			client := newWINodeClientset(tc.username)
-			fetcher := &wiCountingFetcher{}
 
-			tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, client, fetcher)
+			clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
 
 			g.Expect(err).To(MatchError(ContainSubstring("not a node identity")))
 			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the boot waited instead of failing at once")
-			g.Expect(tiers).To(BeNil())
+			g.Expect(clients).To(BeNil())
+			g.Expect(csiDriverReads(client)).To(BeZero(), "the pre-flight must not run for a client that is not the node")
 			lists, _ := client.podLists()
 			g.Expect(lists).To(BeZero(), "no pod store is started for a client that is not the node")
-			g.Expect(fetcher.calls.Load()).To(BeZero())
 		})
 	}
+}
+
+// TestBuildWorkloadIdentityClients_ThePreflightWaitsForTheNodeName proves a
+// transient API server failure at boot is absorbed by the node name's retry, not
+// failed by the minter's CSIDriver pre-flight: the API server refuses everything
+// until the first SelfSubjectReview it answers.
+func TestBuildWorkloadIdentityClients_ThePreflightWaitsForTheNodeName(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := newWINodeClientset("system:node:" + wiTestNode)
+	var reviews atomic.Int32
+	client.PrependReactor("create", "selfsubjectreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if reviews.Add(1) == 1 {
+			return true, nil, errors.New("connection refused")
+		}
+		return false, nil, nil
+	})
+	client.PrependReactor("get", "csidrivers", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if reviews.Load() < 2 {
+			return true, nil, errors.New("connection refused")
+		}
+		return false, nil, nil
+	})
+
+	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(clients.nodeName).To(Equal(wiTestNode))
+	g.Expect(reviews.Load()).To(Equal(int32(2)), "the node name was retried once")
+	g.Expect(csiDriverReads(client)).To(Equal(1))
+}
+
+// csiDriverReads counts the CSIDriver reads client has seen.
+func csiDriverReads(client *wiNodeClientset) int {
+	reads := 0
+	for _, action := range client.Actions() {
+		if action.Matches("get", "csidrivers") {
+			reads++
+		}
+	}
+	return reads
 }
 
 // wiServe serves the production registration over a temporary socket and dials it.
@@ -228,10 +353,6 @@ func wiFirstRecv[R any](stream interface{ Recv() (R, error) }, err error) error 
 // both services through the server cmd builds. The test process is not a pod, so
 // each in-scope method refuses at attestation with PermissionDenied; only the two
 // WIT methods, which this agent does not serve, answer Unimplemented.
-//
-// Nothing is a stub here any more: the socket carries the SPIFFE Workload API and
-// Envoy SDS over one listener, which is what makes this the wiring's definition of
-// done rather than a placeholder check.
 func TestRegisterWorkloadIdentityServices_ServesBothInterfaces(t *testing.T) {
 	tiers, _, fetcher := wiBuildTiers(t)
 	conn := wiServe(t, tiers)
@@ -245,6 +366,8 @@ func TestRegisterWorkloadIdentityServices_ServesBothInterfaces(t *testing.T) {
 		// wantMessage is part of the status message, for a refusal that has to
 		// come from the attestor rather than from a tier or the gate.
 		wantMessage string
+		// withoutHeader leaves out the SPIFFE header, as Envoy does on SDS.
+		withoutHeader bool
 	}{
 		{
 			name: "ValidateJWTSVID",
@@ -311,6 +434,17 @@ func TestRegisterWorkloadIdentityServices_ServesBothInterfaces(t *testing.T) {
 		// over either interface is turned away for the same reason, with the
 		// same code.
 		{
+			name: "FetchX509SVID without the SPIFFE header",
+			call: func(ctx context.Context) error {
+				return wiFirstRecv(client.FetchX509SVID(ctx, &workload.X509SVIDRequest{}))
+			},
+			wantCode:      codes.InvalidArgument,
+			wantMessage:   grpcserver.SpiffeSecurityHeader,
+			withoutHeader: true,
+		},
+		// SDS reaches its stub without the header, which the gate asks of the
+		// Workload API only: Envoy sends none.
+		{
 			name: "SDS StreamSecrets",
 			call: func(ctx context.Context) error {
 				return wiFirstRecv(sds.StreamSecrets(ctx))
@@ -335,7 +469,9 @@ func TestRegisterWorkloadIdentityServices_ServesBothInterfaces(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			ctx = metadata.AppendToOutgoingContext(ctx, grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue)
+			if !tc.withoutHeader {
+				ctx = metadata.AppendToOutgoingContext(ctx, grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue)
+			}
 
 			err := tc.call(ctx)
 
@@ -408,66 +544,121 @@ func TestBackgroundLoop_TheTrustBundleRefreshStopsAtShutdown(t *testing.T) {
 	g.Eventually(returned, 10*time.Second).Should(BeClosed())
 }
 
-// TestUnimplementedSources_FailRetryably pins what the placeholder for T8
-// answers: a retryable ErrIssuanceFailed, so FetchJWTSVID answers Unavailable
-// rather than Internal.
-func TestUnimplementedSources_FailRetryably(t *testing.T) {
-	caller := &workloadidentity.Workload{PodUID: "pod-uid", PodName: "pod", Namespace: "default", ServiceAccount: "sa", NodeName: wiTestNode}
-	testCases := []struct {
-		name string
-		call func(ctx context.Context) (any, error)
-	}{
-		{
-			name: "token source",
-			call: func(ctx context.Context) (any, error) {
-				return unimplementedTokenSource{}.JWTSVIDs(ctx, caller, []string{"spiffe://example.org/audience"})
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			got, err := tc.call(context.Background())
-
-			g.Expect(got).To(BeNil())
-			g.Expect(err).To(MatchError(wierrors.ErrIssuanceFailed))
-			g.Expect(wierrors.IsRetryable(err)).To(BeTrue())
-			g.Expect(err.Error()).To(ContainSubstring("not implemented"))
-			g.Expect(handlers.StatusCode(err)).To(Equal(codes.Unavailable))
-		})
-	}
-}
-
-// TestBuildWorkloadIdentityTiers_NoCacheBound_FailsBuildingTheMinter proves the
-// token minter is built with the tiers: it refuses --max-cache-size 0, which the
-// credentials path accepts as no caching, and names the flag.
-func TestBuildWorkloadIdentityTiers_NoCacheBound_FailsBuildingTheMinter(t *testing.T) {
+// TestBuildWorkloadIdentityClients_NoCacheBound_FailsBuildingTheMinter proves
+// the token minter is built with the clients: it refuses --max-cache-size 0,
+// which the credential endpoint's cache accepts as no caching, and names the flag.
+func TestBuildWorkloadIdentityClients_NoCacheBound_FailsBuildingTheMinter(t *testing.T) {
 	g := NewWithT(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	opts := wiOpts
 	opts.MaxCacheSize = 0
 
-	tiers, err := buildWorkloadIdentityTiers(ctx, opts, newWINodeClientset("system:node:"+wiTestNode), &wiCountingFetcher{})
+	clients, err := buildWorkloadIdentityClients(ctx, opts, newWINodeClientset("system:node:"+wiTestNode))
 
+	g.Expect(err).To(MatchError(ContainSubstring("building the token minter")))
+	g.Expect(err).To(MatchError(ContainSubstring("--max-cache-size")))
+	g.Expect(clients).To(BeNil())
+}
+
+// TestBuildWorkloadIdentityTiers_NoCredentialCache_FailsBuildingTheSessionTier
+// proves the session tier is built over the credential cache cmd hands it: with
+// none, which --max-credential-retention-before-renewal 0 yields, the build
+// fails naming both flags that turn the cache off.
+func TestBuildWorkloadIdentityTiers_NoCredentialCache_FailsBuildingTheSessionTier(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	opts := wiOpts
+	opts.CredentialCache = nil
+
+	tiers, err := buildWorkloadIdentityTiers(ctx, opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
+		&wiCountingFetcher{})
+
+	g.Expect(err).To(MatchError(ContainSubstring("building the session tier")))
+	g.Expect(err).To(MatchError(ContainSubstring("--max-credential-retention-before-renewal")))
 	g.Expect(err).To(MatchError(ContainSubstring("--max-cache-size")))
 	g.Expect(tiers).To(BeNil())
 }
 
+// TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSource
+// proves the JWT-SVID source is built with the tiers over the attestor's pod
+// store: a zero lifetime, which Validate would have refused, fails the build.
+func TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSource(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	opts := wiOpts
+	opts.JWTSVIDDuration = 0
+
+	tiers, err := buildWorkloadIdentityTiers(ctx, opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
+		&wiCountingFetcher{})
+
+	g.Expect(err).To(MatchError(ContainSubstring("building the JWT-SVID tier")))
+	g.Expect(tiers).To(BeNil())
+}
+
 // TestWorkloadIdentityServers_Off_BuildsNothing proves the feature off builds no
-// tier and binds no socket, so boot reaches neither the API server nor the
-// kubelet's kubeconfig, which this host does not have either.
+// node client, no token source for the credential cache, no tier and no socket,
+// so boot reaches neither the API server nor the kubelet's kubeconfig.
 func TestWorkloadIdentityServers_Off_BuildsNothing(t *testing.T) {
 	g := NewWithT(t)
+	builds := countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))
 	opts := wiOpts
 	opts.Enabled = false
 
-	servers, err := workloadIdentityServers(context.Background(), opts)
+	clients, err := newWorkloadIdentityClients(context.Background(), opts)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(clients).To(BeNil())
+	g.Expect(clients.credentialTokens()).To(BeNil(), "the credential cache gets no token source")
+	servers, err := workloadIdentityServers(context.Background(), opts, clients)
 
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(servers).To(BeEmpty())
+	g.Expect(builds.Load()).To(BeZero(), "no node client may be built with workload identity off")
+}
+
+// TestNewWorkloadIdentityClients_On_BuildsOneNodeClient proves the feature on
+// builds the node client once, from the default kubeconfig, and the minter over
+// it.
+func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
+	g := NewWithT(t)
+	client := newWINodeClientset("system:node:" + wiTestNode)
+	builds := countNodeClientBuilds(t, client)
+
+	clients, err := newWorkloadIdentityClients(t.Context(), wiOpts)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(builds.Load()).To(Equal(int32(1)))
+	g.Expect(clients.clientset).To(BeIdenticalTo(client))
+	g.Expect(clients.minter).ToNot(BeNil())
+	g.Expect(clients.credentialTokens()).ToNot(BeNil())
+}
+
+// TestWorkloadIdentityServers_OnWithoutClients_Fails proves the feature on never
+// builds the tiers over clients createServers didn't build.
+func TestWorkloadIdentityServers_OnWithoutClients_Fails(t *testing.T) {
+	servers, err := workloadIdentityServers(t.Context(), wiOpts, nil)
+
+	NewWithT(t).Expect(err).To(MatchError(ContainSubstring("clients weren't built")))
+	NewWithT(t).Expect(servers).To(BeEmpty())
+}
+
+// countNodeClientBuilds makes newNodeClient count its calls and answer client,
+// for the rest of the test.
+func countNodeClientBuilds(t *testing.T, client kubernetes.Interface) *atomic.Int32 {
+	t.Helper()
+	var builds atomic.Int32
+	original := newNodeClient
+	newNodeClient = func(kubeconfigPath string) (kubernetes.Interface, error) {
+		builds.Add(1)
+		if kubeconfigPath != "" {
+			t.Errorf("the node client must come from the default kubeconfig, got %q", kubeconfigPath)
+		}
+		return client, nil
+	}
+	t.Cleanup(func() { newNodeClient = original })
+	return &builds
 }
 
 // TestServerCmd_EnableWorkloadIdentity_IsOnByDefault pins the feature flag: on by
@@ -483,4 +674,26 @@ func TestServerCmd_EnableWorkloadIdentity_IsOnByDefault(t *testing.T) {
 	g.Expect(serverCmd.Flags().Set(handlers.FlagEnableWorkloadIdentity, "false")).To(Succeed())
 	t.Cleanup(func() { _ = serverCmd.Flags().Set(handlers.FlagEnableWorkloadIdentity, flag.DefValue) })
 	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).Enabled).To(BeFalse())
+}
+
+// TestWorkloadIdentityClients_TheSessionTierAndTheCredentialCacheShareOneMinter
+// proves the credential cache's token source and the session tier mint through
+// one token cache: a token the tier's exchange minted is what the cache's
+// source is handed for the same pod, with no second TokenRequest.
+func TestWorkloadIdentityClients_TheSessionTierAndTheCredentialCacheShareOneMinter(t *testing.T) {
+	g := NewWithT(t)
+	tiers, client, _, clients := wiBuildTiersAndClients(t)
+	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
+
+	_, err := tiers.sessions.Session(t.Context(), w)
+	g.Expect(err).To(MatchError(wierrors.ErrSessionUnavailable), "wiNoExchange refuses the exchange after the mint")
+	minted := client.tokenRequests()
+	g.Expect(minted).To(HaveLen(1), "the session tier's exchange mints once")
+
+	token, err := clients.credentialTokens().Token(t.Context(),
+		&credentials.EksCredentialsRequest{ClusterName: wiOpts.ClusterName, ServiceAccountToken: minted[0]})
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(token).To(Equal(minted[0]), "the cache's source must be served from the token cache the tier filled")
+	g.Expect(client.tokenRequests()).To(HaveLen(1), "no second TokenRequest")
 }

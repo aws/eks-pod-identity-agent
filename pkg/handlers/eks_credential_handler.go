@@ -11,8 +11,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth"
+	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/session"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 
@@ -37,6 +40,17 @@ type EksCredentialHandlerOpts struct {
 	MaxCacheSize       int
 	RefreshQPS         int
 	EndpointOverridden bool
+	EnableIMDS         bool
+	// CredentialRetriever, when set, is used as is, so callers can share one
+	// cache, and every field but ClusterName is then ignored. When nil, the
+	// handler builds its own with NewCredentialManager.
+	CredentialRetriever credentials.CredentialRetriever
+	// WorkloadIdentityTokens is set by cmd, with workload identity on, to the
+	// token source over the shared token minter. The cache then refreshes every
+	// entry EKS Auth decorated through EKS Auth, swapping its token close to
+	// expiry for one from it. Every other entry, and every entry while it's nil,
+	// refreshes through the general delegate with its stored token.
+	WorkloadIdentityTokens credcache.TokenSource
 }
 
 var (
@@ -46,36 +60,102 @@ var (
 	}, []string{"code"})
 )
 
-func NewEksCredentialHandler(opts EksCredentialHandlerOpts) *EksCredentialHandler {
-	credentialsRetriever := eksauth.NewService(opts.Cfg)
+// NewEksCredentialHandler builds the handler over opts.CredentialRetriever, or
+// over NewCredentialManager(ctx, opts).Retriever when that's nil.
+func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts) *EksCredentialHandler {
+	credentialsRetriever := opts.CredentialRetriever
+	if credentialsRetriever == nil {
+		credentialsRetriever = NewCredentialManager(ctx, opts).Retriever
+	}
+	return &EksCredentialHandler{
+		RequestValidator:    validation.DefaultCredentialValidator{},
+		ClusterName:         opts.ClusterName,
+		CredentialRetriever: credentialsRetriever,
+	}
+}
 
-	tv, err := validation.NewTokenValidator(context.Background())
+// CredentialManager holds what serves pod credentials: the retriever the
+// handler serves from, the cache under it and the EKS Auth client. A caller other
+// than the handler uses the cache and EKS Auth directly rather than through the
+// handler's retriever.
+type CredentialManager struct {
+	// Retriever is what the handler serves from: the cache's retriever over the
+	// delegates, or the delegates alone when caching is off.
+	Retriever credentials.CredentialRetriever
+	// Cache stores credentials by pod UID. Nil when
+	// --max-credential-retention-before-renewal or --max-cache-size is zero.
+	Cache *credcache.Cache
+	// EKSAuth is the EKS Auth client, the authoritative delegate.
+	EKSAuth credentials.CredentialRetriever
+}
+
+// NewCredentialManager builds the EKS Auth client, the [imds, eksauth] chain when
+// opts.EnableIMDS is set and IMDS answers, and, unless CredentialRenewal or
+// MaxCacheSize is zero, the cache and its retriever with a token validator. It
+// reads every field of opts but CredentialRetriever. cmd calls it once, so every
+// bind host and the workload identity tiers share one cache.
+func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) CredentialManager {
+	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
+	log := logger.FromContext(ctx)
+	credentialsRetriever := eksauth.NewService(ctx, opts.Cfg, opts.EnableIMDS)
+
+	var authSvc credentials.CredentialRetriever = credentialsRetriever
+
+	// IMDS credential discovery is feature-flagged, default disabled
+	if opts.EnableIMDS {
+		// Check if IMDS is present on the node
+		if imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+			// If so, configure the agent's credential delegates to be a chain of [imds, eksAuth]
+			log.Info("IMDS available: using [imds, eksauth] chained retriever")
+			imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
+			credentialsRetriever = credsretriever.NewChainedRetriever(imdsSvc, credentialsRetriever)
+		} else {
+			log.Info("IMDS not available on node: using eksauth-only retriever")
+		}
+	}
+
+	tv, err := validation.NewTokenValidator(ctx)
 	if err != nil {
-		log := logger.FromContext(context.Background())
 		log.Infof("failed to initialize token validator: %v", err)
 	}
 	if tv != nil {
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	if opts.CredentialRenewal != 0 && opts.MaxCacheSize != 0 {
-		retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
-			Delegate:              credentialsRetriever,
-			CredentialsRenewalTtl: opts.CredentialRenewal,
-			MaxCacheSize:          opts.MaxCacheSize,
-			RefreshQPS:            opts.RefreshQPS,
-		}
-		if tv != nil {
-			retrieverOpts.TokenValidator = tv
-		}
-		credentialsRetriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
-	}
+	return newCredentialManager(opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+}
 
-	return &EksCredentialHandler{
-		RequestValidator:    validation.DefaultCredentialValidator{},
-		ClusterName:         opts.ClusterName,
-		CredentialRetriever: credentialsRetriever,
+// newCredentialManager is NewCredentialManager over delegates it's given: general
+// serves the handler without a cache and refreshes the cache, and authSvc serves
+// misses. With opts.WorkloadIdentityTokens set, authSvc also refreshes decorated
+// entries. cacheOpts carries the cache options only tests set.
+func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
+	general, authSvc credentials.CredentialRetriever, tv *validation.TokenValidator) CredentialManager {
+	manager := CredentialManager{Retriever: general, EKSAuth: authSvc}
+	if opts.CredentialRenewal == 0 || opts.MaxCacheSize == 0 {
+		return manager
 	}
+	cacheOpts.Delegate = general
+	// Off, the agent issues nothing from a decorated session, so even a
+	// decorated entry refreshes through general and IMDS keeps static stability.
+	// On, only decorated entries refresh through authSvc with a current token.
+	if opts.WorkloadIdentityTokens != nil {
+		cacheOpts.RefreshWith = session.RefreshWith(authSvc, opts.WorkloadIdentityTokens)
+	}
+	cacheOpts.RenewalTtl = opts.CredentialRenewal
+	cacheOpts.MaxSize = opts.MaxCacheSize
+	cacheOpts.RefreshQPS = opts.RefreshQPS
+	manager.Cache = credcache.New(cacheOpts)
+	retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
+		Cache:                 manager.Cache,
+		Delegate:              general,
+		AuthoritativeDelegate: authSvc,
+	}
+	if tv != nil {
+		retrieverOpts.TokenValidator = tv
+	}
+	manager.Retriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
+	return manager
 }
 
 func (h *EksCredentialHandler) ConfigureHandler(register func(pattern string, handlerFunc http.HandlerFunc)) {
