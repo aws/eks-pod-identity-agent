@@ -18,10 +18,9 @@ const (
 )
 
 // WaitForSocket blocks until the Unix socket at path accepts a connection, or ctx ends.
-// The driver registers only after the agent's socket answers, so a pod scheduled before
-// the agent serves, or with workload identity off, waits in ContainerCreating rather than
-// starting with an empty socket directory. A connect rather than a stat, so a socket left
-// by a killed agent does not count.
+// Registering only after the agent answers leaves a pod scheduled too early in
+// ContainerCreating rather than started with an empty socket directory. A connect rather
+// than a stat, so a socket left by a killed agent does not count.
 func WaitForSocket(ctx context.Context, log *logrus.Entry, path string) error {
 	for attempt := 0; ; attempt++ {
 		conn, err := net.DialTimeout("unix", path, waitDialTimeout)

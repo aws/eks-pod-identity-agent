@@ -1,11 +1,11 @@
 // Package csidriver is the CSI node plugin for spiffe.csi.eks.amazonaws.com, run as a
 // sidecar of the Pod Identity Agent by cmd/eks-pod-identity-csi-driver. It bind mounts
-// the agent's socket directory into enrolled pods, so they reach the socket without a
-// hostPath, which a restricted Pod Security Standard forbids.
+// the agent's socket directory into enrolled pods, so they reach it without a hostPath,
+// which a restricted Pod Security Standard forbids.
 //
-// The CSI Identity and Node services are upstream spiffe-csi's (pkg/driver). This package
-// adds what spiffe-csi leaves to node-driver-registrar: the kubelet registration handshake,
-// on its own socket, and the lifecycle of both sockets.
+// The CSI Identity and Node services are upstream spiffe-csi's (pkg/driver). This adds
+// what spiffe-csi leaves to node-driver-registrar: the kubelet registration handshake,
+// on its own socket, and both sockets' lifecycle.
 package csidriver
 
 import (
@@ -26,6 +26,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 const (
@@ -121,7 +122,7 @@ func New(opts Opts) (*Driver, error) {
 
 	plugin := grpc.NewServer()
 	csi.RegisterIdentityServer(plugin, node)
-	csi.RegisterNodeServer(plugin, nodeServer{node})
+	csi.RegisterNodeServer(plugin, spiffeCsiDriver{node})
 
 	refused := make(chan string, 1)
 	registration := grpc.NewServer()
@@ -150,13 +151,26 @@ func nodeConfig(opts Opts) spiffecsi.Config {
 	}
 }
 
-// nodeServer is the upstream node service reporting no capabilities. Upstream reports
-// GET_VOLUME_STATS, which has the kubelet poll every volume each minute for statistics a
-// socket directory does not have.
-type nodeServer struct{ *spiffecsi.Driver }
+// spiffeCsiDriver is upstream's node service with three methods replaced. The two
+// mounts are counted, since upstream exports no metrics, and no capabilities are
+// reported, since upstream's GET_VOLUME_STATS has the kubelet poll every volume each
+// minute for statistics a socket directory does not have.
+type spiffeCsiDriver struct{ *spiffecsi.Driver }
 
-func (nodeServer) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+func (spiffeCsiDriver) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	return &csi.NodeGetCapabilitiesResponse{}, nil
+}
+
+func (n spiffeCsiDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	resp, err := n.Driver.NodePublishVolume(ctx, req)
+	recordMount(workloadidentity.OperationPublish, err)
+	return resp, err
+}
+
+func (n spiffeCsiDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	resp, err := n.Driver.NodeUnpublishVolume(ctx, req)
+	recordMount(workloadidentity.OperationUnpublish, err)
+	return resp, err
 }
 
 // Run serves both sockets until ctx is cancelled, the kubelet refuses the registration or

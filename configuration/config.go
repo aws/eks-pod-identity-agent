@@ -99,25 +99,16 @@ const (
 const isolatedRegionInfix = "-iso"
 
 // IsIsolatedRegion reports whether region belongs to an isolated partition, where
-// workload identity is not enabled and so the CSIDriver object is not installed.
-//
-// An empty region reads as not isolated: that deployment set no region at all, which is
-// already broken for every other AWS call the agent makes, and defaulting it to isolated
-// would silently turn the feature off rather than fail.
+// workload identity is not enabled. An empty region reads as not isolated, since
+// defaulting it to isolated would turn the feature off silently rather than fail.
 func IsIsolatedRegion(region string) bool {
 	return strings.Contains(region, isolatedRegionInfix)
 }
 
-// Kubelet paths for the CSI node service. The layout is the kubelet's, and the chart
-// mounts each of them into the driver at the same path it has on the host.
-//
-// That equality is load-bearing: the endpoint reported at registration is opened by the
-// kubelet in the host mount namespace and bound by the driver in its own. Mounting them
-// elsewhere means reporting a path the kubelet cannot open, and the symptom is a plugin
-// that registers and is never called.
-//
-// Constants, not flags: the driver cannot discover a different kubelet root, and the
-// chart is the one place a distro that moved it has to be dealt with.
+// Kubelet paths for the CSI node service. The chart mounts each at the path it has on
+// the host, which is load-bearing: the kubelet opens the registered endpoint in the host
+// mount namespace, so a different mount path reports one it cannot open and the plugin
+// registers and is never called.
 const (
 	// KubeletPluginDir serves the CSI Identity and Node services. The kubelet convention
 	// is one directory per driver, named after it.

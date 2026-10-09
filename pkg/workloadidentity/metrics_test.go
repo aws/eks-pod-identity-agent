@@ -28,7 +28,7 @@ const labelConstantPrefix = "Label"
 
 // valueConstantPrefixes marks the constants that carry a label value. Every one
 // of them has to be in labelValueSets, so the lower_snake_case check sees it.
-var valueConstantPrefixes = []string{"Outcome", "Format", "CacheTier", "CacheResult", "CredentialSource", "Reason", "RPC", "Delivery"}
+var valueConstantPrefixes = []string{"Outcome", "Format", "CacheTier", "CacheResult", "CredentialSource", "Operation", "Reason", "RPC", "Delivery"}
 
 // prometheusMetricName is the metric name grammar Prometheus enforces.
 var prometheusMetricName = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
@@ -50,6 +50,7 @@ var labelNames = []string{
 	LabelTier,
 	LabelResult,
 	LabelSource,
+	LabelOperation,
 }
 
 // labelValueSets is every label value set this package declares, keyed by the
@@ -57,12 +58,13 @@ var labelNames = []string{
 // TestDeclaredConstants_EveryValueConstant_IsCoveredByLabelValueSets, so a value
 // constant missing from these sets fails rather than going unchecked.
 var labelValueSets = map[string][]string{
-	"outcome":  {OutcomeSuccess, OutcomeFailure},
-	"format":   {FormatX509SVID, FormatJWTSVID},
-	"tier":     {CacheTierToken, CacheTierSession, CacheTierX509SVID, CacheTierJWTSVID, CacheTierBundle},
-	"result":   {CacheResultHit, CacheResultMiss, CacheResultExpired, CacheResultEvicted},
-	"delivery": {DeliverySignalled, DeliveryCoalesced},
-	"source":   {CredentialSourceEKSAuth, CredentialSourceIMDSFirst},
+	"outcome":   {OutcomeSuccess, OutcomeFailure},
+	"format":    {FormatX509SVID, FormatJWTSVID},
+	"tier":      {CacheTierToken, CacheTierSession, CacheTierX509SVID, CacheTierJWTSVID, CacheTierBundle},
+	"result":    {CacheResultHit, CacheResultMiss, CacheResultExpired, CacheResultEvicted},
+	"delivery":  {DeliverySignalled, DeliveryCoalesced},
+	"source":    {CredentialSourceEKSAuth, CredentialSourceIMDSFirst},
+	"operation": {OperationPublish, OperationUnpublish},
 	"rpc": {
 		RPCFetchX509SVID,
 		RPCFetchX509Bundles,
@@ -306,6 +308,8 @@ func TestMetricNames_Declared_MatchesExpectedListExactly(t *testing.T) {
 		"workload_identity_credential_source_total",
 		"workload_identity_rpc_total",
 		"workload_identity_rpc_duration_seconds",
+		"workload_identity_volume_mount_total",
+		"workload_identity_registration_total",
 	}
 
 	// The count comes from the declared constants, so adding a metric constant
@@ -358,6 +362,8 @@ func TestMetricNames_ByInstrumentKind_HasExpectedSuffix(t *testing.T) {
 		{name: "credential source counter", metric: MetricCredentialSourceTotal, wantSuffix: "_total"},
 		{name: "rpc counter", metric: MetricRPCTotal, wantSuffix: "_total"},
 		{name: "rpc histogram", metric: MetricRPCDuration, wantSuffix: "_duration_seconds"},
+		{name: "volume mount counter", metric: MetricVolumeMountTotal, wantSuffix: "_total"},
+		{name: "registration counter", metric: MetricRegistrationTotal, wantSuffix: "_total"},
 		// The only gauge carries neither suffix, because it is a level rather
 		// than an accumulation or an observation.
 		{name: "subscriptions gauge", metric: MetricSubscriptionsActive, wantSuffix: ""},

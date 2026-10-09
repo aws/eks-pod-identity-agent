@@ -50,6 +50,8 @@ func (s *registrationServer) GetInfo(ctx context.Context, _ *pluginregistration.
 func (s *registrationServer) NotifyRegistrationStatus(ctx context.Context, status *pluginregistration.RegistrationStatus) (*pluginregistration.RegistrationStatusResponse, error) {
 	log := logger.FromContext(ctx)
 
+	recordRegistration(status.GetPluginRegistered())
+
 	if status.GetPluginRegistered() {
 		log.Infof("Kubelet registered CSI driver %s", s.driverName)
 		return &pluginregistration.RegistrationStatusResponse{}, nil
