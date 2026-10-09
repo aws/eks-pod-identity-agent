@@ -1,4 +1,9 @@
 {{- $top := . -}}
+{{- /*
+Whether this install gets the workload identity CSI driver sidecar and socket mount; see
+the helper and "Workload identity CSI driver" in the chart README.
+*/ -}}
+{{- $workloadIdentityCSI := eq (include "eks-pod-identity-agent.workloadIdentityCSI" $top) "true" -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -118,13 +123,16 @@ spec:
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
-          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumeMounts }}
           volumeMounts:
-          {{- end }}
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: ca-bundle
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
+          {{- end }}
+          {{- if $workloadIdentityCSI }}
+          {{- /* The agent binds its socket here; the CSI driver sidecar publishes it. */}}
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
           {{- end }}
           {{- if $daemonset.volumeMounts }}
           {{- toYaml $daemonset.volumeMounts | nindent 10}}
@@ -160,14 +168,80 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
-      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumes }}
+        {{- if $workloadIdentityCSI }}
+        {{- /*
+        The workload identity CSI node plugin, a separate binary in the agent's image. It is
+        privileged, because Kubernetes allows Bidirectional propagation only there, so the
+        agent above does not have to be. Each kubelet mountPath must equal its host path.
+        See "Workload identity CSI driver" in the chart README.
+        */}}
+        - name: {{ $top.Chart.Name }}-csi-driver
+          image: {{ include "eks-pod-identity-agent.image" $ }}
+          imagePullPolicy: {{ $top.Values.image.pullPolicy }}
+          command: {{ $top.Values.csiDriver.command }}
+          {{- if $top.Values.csiDriver.additionalArgs }}
+          args:
+            {{- range $key, $value := $top.Values.csiDriver.additionalArgs }}
+            - {{ $key | quote }}
+            - {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          env:
+          {{- /* The CSI node ID, from the downward API. */}}
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          volumeMounts:
+          {{- /* Read-only, so every bind of it is read-only on the host as well. */}}
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            readOnly: true
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          {{- /* Bidirectional, so the kubelet sees the bind mounts made in this container. */}}
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml $top.Values.csiDriver.resources | nindent 12 }}
+        {{- end }}
       volumes:
-      {{- end }}
         {{- if contains "-iso" $top.Values.env.AWS_REGION }}
         - name: ca-bundle
           hostPath:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
+        {{- end }}
+        {{- if $workloadIdentityCSI }}
+        {{- /*
+        Workload identity CSI volumes. The hostPath types are deliberate; see the chart
+        README.
+        */}}
+        - name: workload-identity-socket-dir
+          hostPath:
+            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            type: DirectoryOrCreate
+        {{- /* Holds the CSI plugin socket. */}}
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        {{- /* Watched by the kubelet for plugin registration. */}}
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        {{- /* Where every publish target lives. Strict Directory, unlike the two above. */}}
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         {{- end }}
         {{- if $daemonset.volumes }}
         {{- toYaml $daemonset.volumes | nindent 8}}

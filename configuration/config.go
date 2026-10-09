@@ -107,3 +107,34 @@ const isolatedRegionInfix = "-iso"
 func IsIsolatedRegion(region string) bool {
 	return strings.Contains(region, isolatedRegionInfix)
 }
+
+// Kubelet paths for the CSI node service. The layout is the kubelet's, and the chart
+// mounts each of them into the driver at the same path it has on the host.
+//
+// That equality is load-bearing: the endpoint reported at registration is opened by the
+// kubelet in the host mount namespace and bound by the driver in its own. Mounting them
+// elsewhere means reporting a path the kubelet cannot open, and the symptom is a plugin
+// that registers and is never called.
+//
+// Constants, not flags: the driver cannot discover a different kubelet root, and the
+// chart is the one place a distro that moved it has to be dealt with.
+const (
+	// KubeletPluginDir serves the CSI Identity and Node services. The kubelet convention
+	// is one directory per driver, named after it.
+	KubeletPluginDir = "/var/lib/kubelet/plugins/" + WorkloadIdentityCSIDriver
+
+	// KubeletPluginSocketPath is the endpoint reported to the kubelet at registration.
+	KubeletPluginSocketPath = KubeletPluginDir + "/csi.sock"
+
+	// KubeletPluginRegistrationDir is watched by the kubelet. A socket appearing here is
+	// the only thing that advertises the driver to it.
+	KubeletPluginRegistrationDir = "/var/lib/kubelet/plugins_registry"
+
+	// KubeletRegistrationSocketPath serves the registration handshake. The name carries
+	// the driver so the directory can hold one socket per plugin.
+	KubeletRegistrationSocketPath = KubeletPluginRegistrationDir + "/" + WorkloadIdentityCSIDriver + "-reg.sock"
+
+	// KubeletPodsDir roots the per-pod volume directories. Every publish target lives
+	// under it, which is what lets the node service refuse one that does not.
+	KubeletPodsDir = "/var/lib/kubelet/pods"
+)

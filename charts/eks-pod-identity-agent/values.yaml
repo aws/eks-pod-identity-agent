@@ -149,6 +149,16 @@ image:
 
 imagePullSecrets: []
 
+# The workload identity CSI node plugin, run as a sidecar of the agent outside isolated
+# regions. The binary ships in the agent's image from the first release after v0.2.4, so
+# image.tag (or image.override) has to name such a release. See "Workload identity CSI
+# driver" in the chart README.
+csiDriver:
+  additionalArgs:
+    "-v": "info"
+  command: "['/go-runner', '/eks-pod-identity-csi-driver']"
+  resources: {}
+
 init:
   additionalArgs:
     "-v": "trace"
