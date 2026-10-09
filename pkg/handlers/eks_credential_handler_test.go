@@ -158,7 +158,7 @@ func TestNewCredentialManager_CacheRefreshesThroughTheGeneralDelegate(t *testing
 	general := &recordingRetriever{name: "chained-retriever", accessKeyId: "AKIA-REFRESHED"}
 	authSvc := &recordingRetriever{name: "eks-auth", accessKeyId: "AKIA-MISS"}
 	const renewal = 50 * time.Millisecond
-	manager := newCredentialManager(EksCredentialHandlerOpts{
+	manager := newCredentialManager(context.Background(), EksCredentialHandlerOpts{
 		CredentialRenewal: renewal,
 		// One pod, and a size the cache's QPS check passes at this renewal TTL.
 		MaxCacheSize: 1,
