@@ -121,3 +121,32 @@ spec:
       volumes:
         - emptyDir: {}
           name: jwk-cache
+---
+# Source: eks-pod-identity-agent/templates/csidriver.yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
+  # webhook names on an enrolled pod's volume.
+  name: spiffe.csi.eks.amazonaws.com
+  labels:
+    helm.sh/chart: eks-pod-identity-agent-1.2.0
+    app.kubernetes.io/name: eks-pod-identity-agent
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.1.6"
+    app.kubernetes.io/managed-by: Helm
+    app: eks-pod-identity-agent
+spec:
+  # A node-local bind mount: nothing for the attach/detach controller to do.
+  attachRequired: false
+  # The node service needs the pod's identity in the volume context to publish.
+  podInfoOnMount: true
+  # Inline ephemeral only. No PersistentVolume for this driver.
+  volumeLifecycleModes:
+    - Ephemeral
+  # Read-only bind mount, nothing to chown.
+  fsGroupPolicy: None
+  # Declared so a node identity is permitted to mint a ServiceAccount token for this
+  # audience; see the chart README. Matches configuration.EksAuthAudience.
+  tokenRequests:
+    - audience: pods.eks.amazonaws.com

@@ -1,5 +1,7 @@
 package configuration
 
+import "strings"
+
 const (
 	DefaultIpv6TargetHost = "fd00:ec2::23"
 	DefaultIpv4TargetHost = "169.254.170.23"
@@ -90,3 +92,18 @@ const (
 	// path validates on a token a pod presents.
 	EksAuthAudience = "pods.eks.amazonaws.com"
 )
+
+// isolatedRegionInfix matches every isolated partition's region names: us-iso-*,
+// us-isob-*, eu-isoe-*, us-isof-*. The chart's own gate is the same literal in Helm
+// (contains "-iso"), since a template cannot read a Go constant.
+const isolatedRegionInfix = "-iso"
+
+// IsIsolatedRegion reports whether region belongs to an isolated partition, where
+// workload identity is not enabled and so the CSIDriver object is not installed.
+//
+// An empty region reads as not isolated: that deployment set no region at all, which is
+// already broken for every other AWS call the agent makes, and defaulting it to isolated
+// would silently turn the feature off rather than fail.
+func IsIsolatedRegion(region string) bool {
+	return strings.Contains(region, isolatedRegionInfix)
+}
