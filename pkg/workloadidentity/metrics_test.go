@@ -70,6 +70,7 @@ var labelValueSets = map[string][]string{
 		RPCFetchJWTBundles,
 		RPCValidateJWTSVID,
 		RPCStreamSecrets,
+		RPCFetchSecrets,
 	},
 	"reason": {
 		ReasonNotUnixSocket,

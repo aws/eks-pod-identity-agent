@@ -23,6 +23,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/tokenminter"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers/sds"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers/workloadapi"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -108,7 +109,7 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	// the package, since this server's streams are held open by design.
 	server, err := grpcserver.New(grpcserver.Opts{
 		SocketPath: configuration.WorkloadIdentitySocketPath,
-		Register:   registerWorkloadIdentityServices(tiers.handler),
+		Register:   registerWorkloadIdentityServices(tiers.handler, tiers.sdsHandler),
 	})
 	if err != nil {
 		return nil, err
@@ -122,10 +123,16 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 }
 
 // workloadIdentityTiers is what the workload identity socket serves from, built
-// once per node: the Workload API handler over its tiers, the trust bundle tier,
-// whose refresh loop runs beside the servers, and the session tier they share.
+// once per node: the Workload API handler and the Envoy SDS handler over the same
+// tiers, the trust bundle tier, whose refresh loop runs beside the servers, and
+// the session tier they share.
+//
+// One set of tiers for both handlers, so a workload reaching the agent over both
+// interfaces gets the same certificate from the same cache rather than two
+// issuances, two leases and two renewal schedules.
 type workloadIdentityTiers struct {
 	handler      *workloadapi.Handler
+	sdsHandler   *sds.Handler
 	bundleSource *bundle.Registry
 	// sessions is read only by tests, which mint through it.
 	sessions *session.Provider
@@ -212,18 +219,30 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		X509BundlesSubscriber: hub.ForRPC(workloadidentity.RPCFetchX509Bundles),
 		JWTBundlesSubscriber:  hub.ForRPC(workloadidentity.RPCFetchJWTBundles),
 	})
-	return &workloadIdentityTiers{handler: handler, bundleSource: bundleSource, sessions: sessionProvider}, nil
+	sdsHandler := sds.New(sds.Opts{
+		Attestor: attestor,
+		Certs:    certs,
+		Bundles:  bundleSource,
+		// Its own hub.ForRPC, so an Envoy stream and a FetchX509SVID stream never
+		// share a subscription series. FetchSecrets has none: it answers once.
+		StreamSecretsSubscriber: hub.ForRPC(workloadidentity.RPCStreamSecrets),
+	})
+
+	return &workloadIdentityTiers{
+		handler:      handler,
+		sdsHandler:   sdsHandler,
+		bundleSource: bundleSource,
+		sessions:     sessionProvider,
+	}, nil
 }
 
 // registerWorkloadIdentityServices returns the registration the workload identity
-// gRPC server runs before it accepts anything.
-//
-// PLACEHOLDER(T11): the SDS stub answers every method with Unimplemented until the
-// SDS handler replaces it here.
-func registerWorkloadIdentityServices(handler *workloadapi.Handler) func(registrar grpc.ServiceRegistrar) {
+// gRPC server runs before it accepts anything. Both services are real now, so the
+// SDS stub is gone: one listener serves the SPIFFE Workload API and Envoy SDS.
+func registerWorkloadIdentityServices(handler *workloadapi.Handler, sdsHandler *sds.Handler) func(registrar grpc.ServiceRegistrar) {
 	return func(registrar grpc.ServiceRegistrar) {
 		handler.Register(registrar)
-		grpcserver.RegisterStubSDS(registrar)
+		sdsHandler.Register(registrar)
 	}
 }
 

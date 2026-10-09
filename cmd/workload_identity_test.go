@@ -316,7 +316,7 @@ func wiServe(t *testing.T, tiers *workloadIdentityTiers) *grpc.ClientConn {
 	srv, err := grpcserver.New(grpcserver.Opts{
 		SocketPath:     filepath.Join(dir, "agent.sock"),
 		ShutdownWait:   time.Second,
-		Register:       registerWorkloadIdentityServices(tiers.handler),
+		Register:       registerWorkloadIdentityServices(tiers.handler, tiers.sdsHandler),
 		RequestLimiter: rate.NewLimiter(rate.Inf, 0),
 	})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -349,13 +349,11 @@ func wiFirstRecv[R any](stream interface{ Recv() (R, error) }, err error) error 
 	return err
 }
 
-// TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub calls every
-// Workload API method through the server cmd builds. The test process is not a pod,
-// so the real handler refuses each in-scope method at attestation with
-// PermissionDenied, where the stub would have answered Unimplemented. The WIT methods
-// and SDS stay Unimplemented until their handlers land, and a Workload API call
-// without the SPIFFE header stops at the gate.
-func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *testing.T) {
+// TestRegisterWorkloadIdentityServices_ServesBothInterfaces calls every method on
+// both services through the server cmd builds. The test process is not a pod, so
+// each in-scope method refuses at attestation with PermissionDenied; only the two
+// WIT methods, which this agent does not serve, answer Unimplemented.
+func TestRegisterWorkloadIdentityServices_ServesBothInterfaces(t *testing.T) {
 	tiers, _, fetcher := wiBuildTiers(t)
 	conn := wiServe(t, tiers)
 	client := workload.NewSpiffeWorkloadAPIClient(conn)
@@ -430,6 +428,11 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 			},
 			wantCode: codes.Unimplemented,
 		},
+		// Both SDS methods are served now, so they refuse at attestation like
+		// the Workload API RPCs above rather than answering Unimplemented. That
+		// they refuse identically is the point: a workload reaching the socket
+		// over either interface is turned away for the same reason, with the
+		// same code.
 		{
 			name: "FetchX509SVID without the SPIFFE header",
 			call: func(ctx context.Context) error {
@@ -446,8 +449,8 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 			call: func(ctx context.Context) error {
 				return wiFirstRecv(sds.StreamSecrets(ctx))
 			},
-			wantCode:      codes.Unimplemented,
-			withoutHeader: true,
+			wantCode:    codes.PermissionDenied,
+			wantMessage: "attestation refused",
 		},
 		{
 			name: "SDS FetchSecrets",
@@ -455,8 +458,8 @@ func TestRegisterWorkloadIdentityServices_ServesTheHandlerBesideTheSDSStub(t *te
 				_, err := sds.FetchSecrets(ctx, nil)
 				return err
 			},
-			wantCode:      codes.Unimplemented,
-			withoutHeader: true,
+			wantCode:    codes.PermissionDenied,
+			wantMessage: "attestation refused",
 		},
 	}
 

@@ -145,6 +145,10 @@ const (
 	RPCValidateJWTSVID = "validate_jwt_svid"
 	// RPCStreamSecrets is the Envoy SDS StreamSecrets stream.
 	RPCStreamSecrets = "stream_secrets"
+	// RPCFetchSecrets is the unary Envoy SDS FetchSecrets. No sidecar calls it,
+	// since Envoy subscribes over the stream, so expect tooling and probes here
+	// rather than mesh traffic.
+	RPCFetchSecrets = "fetch_secrets"
 )
 
 // Values for LabelDelivery, how one change notification reached a subscription.
