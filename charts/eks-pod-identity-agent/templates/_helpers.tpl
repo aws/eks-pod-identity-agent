@@ -100,6 +100,6 @@ Resolve the ServiceAccount name to set on the pod.
 CSI driver sidecar and the agent's socket directory mount. Isolated regions do not, where
 workload identity is not enabled. The gate is chart-only.
 */}}
-{{- define "eks-pod-identity-agent.workloadIdentityCSI" -}}
+{{- define "eks-pod-identity-agent.enableWorkloadIdentityCSI" -}}
 {{- not (contains "-iso" .Values.env.AWS_REGION) -}}
 {{- end }}

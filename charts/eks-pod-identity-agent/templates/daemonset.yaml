@@ -3,7 +3,7 @@
 Whether this install gets the workload identity CSI driver sidecar and socket mount; see
 the helper and "Workload identity CSI driver" in the chart README.
 */ -}}
-{{- $workloadIdentityCSI := eq (include "eks-pod-identity-agent.workloadIdentityCSI" $top) "true" -}}
+{{- $enableWorkloadIdentityCSI := eq (include "eks-pod-identity-agent.enableWorkloadIdentityCSI" $top) "true" -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -129,7 +129,7 @@ spec:
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
           {{- end }}
-          {{- if $workloadIdentityCSI }}
+          {{- if $enableWorkloadIdentityCSI }}
           {{- /* The agent binds its socket here; the CSI driver sidecar publishes it. */}}
           - name: workload-identity-socket-dir
             mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
@@ -168,7 +168,7 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
-        {{- if $workloadIdentityCSI }}
+        {{- if $enableWorkloadIdentityCSI }}
         {{- /*
         The workload identity CSI node plugin, a separate binary in the agent's image. It is
         privileged, because Kubernetes allows Bidirectional propagation only there, so the
@@ -178,14 +178,11 @@ spec:
         - name: {{ $top.Chart.Name }}-csi-driver
           image: {{ include "eks-pod-identity-agent.image" $ }}
           imagePullPolicy: {{ $top.Values.image.pullPolicy }}
-          command: {{ $top.Values.csiDriver.command }}
-          {{- if $top.Values.csiDriver.additionalArgs }}
+          {{- /* Not a values knob: this container is privileged. */}}
+          command: ['/go-runner', '/eks-pod-identity-csi-driver']
           args:
-            {{- range $key, $value := $top.Values.csiDriver.additionalArgs }}
-            - {{ $key | quote }}
-            - {{ $value | quote }}
-            {{- end }}
-          {{- end }}
+            - "-v"
+            - "info"
           env:
           {{- /* The CSI node ID, from the downward API. */}}
           - name: NODE_NAME
@@ -193,7 +190,6 @@ spec:
               fieldRef:
                 fieldPath: spec.nodeName
           volumeMounts:
-          {{- /* Read-only, so every bind of it is read-only on the host as well. */}}
           - name: workload-identity-socket-dir
             mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
             readOnly: true
@@ -218,7 +214,7 @@ spec:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
         {{- end }}
-        {{- if $workloadIdentityCSI }}
+        {{- if $enableWorkloadIdentityCSI }}
         {{- /*
         Workload identity CSI volumes. The hostPath types are deliberate; see the chart
         README.

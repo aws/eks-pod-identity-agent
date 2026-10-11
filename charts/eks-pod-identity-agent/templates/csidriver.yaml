@@ -8,7 +8,7 @@ See "Workload identity CSI driver" in the chart README for why the chart owns th
 why it is inert on clusters not using workload identity, which fields are immutable, and
 what the tokenRequests declaration is for.
 */}}
-{{- if not (contains "-iso" .Values.env.AWS_REGION) }}
+{{- if eq (include "eks-pod-identity-agent.enableWorkloadIdentityCSI" .) "true" }}
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:

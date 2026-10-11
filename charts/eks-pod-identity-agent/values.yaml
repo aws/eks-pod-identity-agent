@@ -154,9 +154,6 @@ imagePullSecrets: []
 # image.tag (or image.override) has to name such a release. See "Workload identity CSI
 # driver" in the chart README.
 csiDriver:
-  additionalArgs:
-    "-v": "info"
-  command: "['/go-runner', '/eks-pod-identity-csi-driver']"
   resources: {}
 
 init:

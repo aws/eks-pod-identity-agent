@@ -35,7 +35,6 @@ The following table lists the configurable parameters for this chart and their d
 |---------------------------|---------------------------------------------------------|--------------------------|
 | `affinity`                | Map of node/pod affinities                              | (see `values.yaml`)      |
 | `agent.additionalArgs`    | Additional arguments to pass to the agent-container     | (see `values.yaml`)      |
-| `csiDriver.additionalArgs`| Additional arguments to pass to the CSI driver sidecar  | (see `values.yaml`)      |
 | `csiDriver.resources`     | Resources for the CSI driver sidecar                    | `{}`                     |
 | `env`                     | List of environment variables.                          | (see `values.yaml`)      |
 | `fullnameOverride`        | Override the fullname of the chart                      | `eks-pod-identity-agent` |
@@ -59,18 +58,16 @@ containing the values for the above parameters.
 The chart installs a cluster-scoped `CSIDriver` named `spiffe.csi.eks.amazonaws.com`, served by
 the `eks-pod-identity-agent-csi-driver` sidecar of each agent pod. It publishes the workload
 identity socket into pods the EKS Pod Identity webhook has enrolled. The sidecar runs
-`/eks-pod-identity-csi-driver`, a separate binary in the agent's image; its CSI node service is
-upstream [spiffe-csi](https://github.com/spiffe/spiffe-csi)'s, and it registers with the kubelet
-itself instead of through `node-driver-registrar`.
+`/eks-pod-identity-csi-driver`, a separate binary in the agent's image.
 
 **Why the object is required.** Kubernetes 1.33's `ServiceAccountNodeAudienceRestriction` only
 lets a node identity mint a ServiceAccount token for an audience the target pod already
-references — through a projected volume, or through the `tokenRequests` of a CSI driver the pod
-mounts. Enrolled pods mount this driver, so this one declaration makes the agent's
-`TokenRequest` permissible fleet-wide with no change to any pod spec.
+references — through a projected volume, or through the `tokenRequests` of a CSI driver one of
+its volumes names. Enrolled pods carry a CSI volume naming this driver, so this one declaration
+makes the agent's `TokenRequest` permissible fleet-wide with no change to any pod spec.
 
-There is no values knob. On a cluster not using workload identity the object is inert, since
-only enrolled pods mount the driver. It is not rendered in isolated regions.
+There is no values knob. On a cluster not using workload identity the object is inert, since no
+pod has a volume naming it. It is not rendered in isolated regions.
 
 The sidecar registers only once the agent's socket answers, so enrolled pods wait in
 `ContainerCreating` rather than start with an empty socket directory. After registration an
