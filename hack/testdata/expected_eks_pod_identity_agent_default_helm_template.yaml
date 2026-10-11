@@ -92,6 +92,8 @@ spec:
           - name: AWS_REGION
             value: "AWS_REGION_NAME"
           volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
           - mountPath: /var/lib/eks-pod-identity-agent
             name: jwk-cache
           securityContext:
@@ -118,6 +120,79 @@ spec:
               scheme: HTTP
             initialDelaySeconds: 1
             timeoutSeconds: 10
+        - name: eks-pod-identity-agent-csi-driver
+          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/eks/eks-pod-identity-agent:v0.1.20
+          imagePullPolicy: Always
+          command: ['/go-runner', '/eks-pod-identity-csi-driver']
+          args:
+            - "-v"
+            - "info"
+          env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            readOnly: true
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          resources:
+            {}
       volumes:
+        - name: workload-identity-socket-dir
+          hostPath:
+            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            type: DirectoryOrCreate
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         - emptyDir: {}
           name: jwk-cache
+---
+# Source: eks-pod-identity-agent/templates/csidriver.yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
+  # webhook names on an enrolled pod's volume.
+  name: spiffe.csi.eks.amazonaws.com
+  labels:
+    helm.sh/chart: eks-pod-identity-agent-1.2.0
+    app.kubernetes.io/name: eks-pod-identity-agent
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "0.1.6"
+    app.kubernetes.io/managed-by: Helm
+    app: eks-pod-identity-agent
+spec:
+  # A node-local bind mount: nothing for the attach/detach controller to do.
+  attachRequired: false
+  # The node service needs the pod's identity in the volume context to publish.
+  podInfoOnMount: true
+  # Inline ephemeral only. No PersistentVolume for this driver.
+  volumeLifecycleModes:
+    - Ephemeral
+  # Read-only bind mount, nothing to chown.
+  fsGroupPolicy: None
+  # Declared so a node identity is permitted to mint a ServiceAccount token for this
+  # audience; see the chart README. Matches configuration.EksAuthAudience.
+  tokenRequests:
+    - audience: pods.eks.amazonaws.com

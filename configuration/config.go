@@ -1,5 +1,7 @@
 package configuration
 
+import "strings"
+
 const (
 	DefaultIpv6TargetHost = "fd00:ec2::23"
 	DefaultIpv4TargetHost = "169.254.170.23"
@@ -89,4 +91,41 @@ const (
 	// that mint to be permitted, and the audience the existing AWS credentials
 	// path validates on a token a pod presents.
 	EksAuthAudience = "pods.eks.amazonaws.com"
+)
+
+// isolatedRegionInfix matches every isolated partition's region names: us-iso-*,
+// us-isob-*, eu-isoe-*, us-isof-*. The chart's own gate is the same literal in Helm
+// (contains "-iso"), since a template cannot read a Go constant.
+const isolatedRegionInfix = "-iso"
+
+// IsIsolatedRegion reports whether region belongs to an isolated partition, where
+// workload identity is not enabled. An empty region reads as not isolated, since
+// defaulting it to isolated would turn the feature off silently rather than fail.
+func IsIsolatedRegion(region string) bool {
+	return strings.Contains(region, isolatedRegionInfix)
+}
+
+// Kubelet paths for the CSI node service. The chart mounts each at the path it has on
+// the host, which is load-bearing: the kubelet opens the registered endpoint in the host
+// mount namespace, so a different mount path reports one it cannot open and the plugin
+// registers and is never called.
+const (
+	// KubeletPluginDir serves the CSI Identity and Node services. The kubelet convention
+	// is one directory per driver, named after it.
+	KubeletPluginDir = "/var/lib/kubelet/plugins/" + WorkloadIdentityCSIDriver
+
+	// KubeletPluginSocketPath is the endpoint reported to the kubelet at registration.
+	KubeletPluginSocketPath = KubeletPluginDir + "/csi.sock"
+
+	// KubeletPluginRegistrationDir is watched by the kubelet. A socket appearing here is
+	// the only thing that advertises the driver to it.
+	KubeletPluginRegistrationDir = "/var/lib/kubelet/plugins_registry"
+
+	// KubeletRegistrationSocketPath serves the registration handshake. The name carries
+	// the driver so the directory can hold one socket per plugin.
+	KubeletRegistrationSocketPath = KubeletPluginRegistrationDir + "/" + WorkloadIdentityCSIDriver + "-reg.sock"
+
+	// KubeletPodsDir roots the per-pod volume directories. Every publish target lives
+	// under it, which is what lets the node service refuse one that does not.
+	KubeletPodsDir = "/var/lib/kubelet/pods"
 )

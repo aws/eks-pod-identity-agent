@@ -178,7 +178,7 @@ type Opts struct {
 // bound is worth reporting where the process can still exit non-zero, and a caller
 // holding a Server knows the socket already exists, so nothing has to poll for it.
 func New(opts Opts) (*Server, error) {
-	lis, err := listen(opts.SocketPath)
+	lis, err := ListenUnix(opts.SocketPath, SocketMode)
 	if err != nil {
 		return nil, err
 	}
@@ -383,17 +383,16 @@ func (s *Server) RemoveSocket() {
 		_ = s.lis.Close()
 	}
 
-	if err := unlinkIfStale(s.socketPath); err != nil {
+	if err := UnlinkIfStale(s.socketPath); err != nil {
 		logger.FromContext(context.Background()).Warnf("Leaving %s in place: %v", s.socketPath, err)
 	}
 }
 
-// listen prepares the path and binds it.
-//
-// The order is forced. The parent directory has to exist before the bind, a stale
-// socket has to be gone before the bind, and the mode can only be set after it,
-// because the bind is what creates the inode.
-func listen(path string) (net.Listener, error) {
+// ListenUnix prepares the path, binds it and leaves the socket with mode. The directory
+// and a stale socket are dealt with before the bind and the mode after, since the bind
+// creates the inode. Shared by the agent's workload identity socket (SocketMode) and the
+// CSI driver binary's kubelet-only sockets (0600).
+func ListenUnix(path string, mode os.FileMode) (net.Listener, error) {
 	if path == "" {
 		return nil, errors.New("grpcserver: no socket path configured")
 	}
@@ -402,7 +401,7 @@ func listen(path string) (net.Listener, error) {
 		return nil, err
 	}
 
-	if err := unlinkIfStale(path); err != nil {
+	if err := UnlinkIfStale(path); err != nil {
 		return nil, err
 	}
 
@@ -411,15 +410,14 @@ func listen(path string) (net.Listener, error) {
 		return nil, fmt.Errorf("unable to listen on %s: %w", path, err)
 	}
 
-	// The bind applies the process umask and never chmods, and the mode cannot be
-	// set before the bind either, because there is no inode to chmod until the bind
-	// creates one. The window between the two is safe while SocketMode is more
-	// permissive than the umask allows, since during it the socket is stricter than
-	// it ends up rather than looser. Tightening SocketMode below what the umask
-	// gives would mean forcing the umask before the bind instead.
-	if err := os.Chmod(path, SocketMode); err != nil {
+	// The bind applies the umask and never chmods, and there is no inode to chmod until
+	// it runs. For a mode more permissive than the umask the window is on the strict
+	// side. For the CSI sockets' 0600 this chmod tightens what the bind created, so the
+	// window is permissive for as long as these two lines take — and their only caller
+	// is the kubelet.
+	if err := os.Chmod(path, mode); err != nil {
 		_ = lis.Close()
-		return nil, fmt.Errorf("unable to set mode %04o on %s: %w", SocketMode, path, err)
+		return nil, fmt.Errorf("unable to set mode %04o on %s: %w", mode, path, err)
 	}
 
 	return lis, nil
@@ -475,7 +473,7 @@ var dialSocket = func(path string, timeout time.Duration) (net.Conn, error) {
 	return net.DialTimeout("unix", path, timeout)
 }
 
-// unlinkIfStale removes the socket at path if it is a socket nothing is listening
+// UnlinkIfStale removes the socket at path if it is a socket nothing is listening
 // on, and reports why it did not otherwise.
 //
 // A socket file survives an ungraceful exit, and net.Listen on a path that exists
@@ -493,7 +491,10 @@ var dialSocket = func(path string, timeout time.Duration) (net.Conn, error) {
 // and the second unlinking the first's fresh socket. Closing it needs a lock file
 // beside the socket, and it is not closed here: the agent is a DaemonSet with one
 // pod per node and the kubelet does not run two.
-func unlinkIfStale(path string) error {
+//
+// Exported for internal/csidriver, which unlinks its two sockets on the way out and
+// needs the same guard.
+func UnlinkIfStale(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		// The ordinary case, on a first boot and after a graceful stop.

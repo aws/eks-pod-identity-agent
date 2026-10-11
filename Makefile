@@ -13,6 +13,7 @@ GOOS?=$(shell go env GOOS)
 GOARCH?=$(shell go env GOARCH)
 OUTPUT := _output/$(GOARCH)
 BINARY := $(OUTPUT)/bin/eks-pod-identity-agent
+CSI_DRIVER_BINARY := $(OUTPUT)/bin/eks-pod-identity-csi-driver
 
 # Directories
 TOOLS_DIR := hack/tools
@@ -57,6 +58,10 @@ build:
 		-X 'k8s.io/component-base/version/verflag.programName=eks-pod-identity-agent' \
 		-X 'go.amzn.com/eks/eks-pod-identity-agent/configuration.AgentVersion=$(VERSION)' " \
 		-o $(BINARY) .
+	@echo "Building eks-pod-identity-csi-driver for $(shell go env GOOS)/$(GOARCH)"
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build \
+		-ldflags "-X 'go.amzn.com/eks/eks-pod-identity-agent/configuration.AgentVersion=$(VERSION)'" \
+		-o $(CSI_DRIVER_BINARY) ./cmd/eks-pod-identity-csi-driver
 
 # Run the agent locally
 .PHONY: dev

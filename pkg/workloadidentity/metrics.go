@@ -67,6 +67,15 @@ const (
 	MetricRPCTotal = "workload_identity_rpc_total"
 	// MetricRPCDuration observes served RPC latency. T10,T11: {rpc, outcome}.
 	MetricRPCDuration = "workload_identity_rpc_duration_seconds"
+	// MetricVolumeMountTotal counts CSI publishes and unpublishes of the socket
+	// directory. T12: {operation, outcome}.
+	MetricVolumeMountTotal = "workload_identity_volume_mount_total"
+	// MetricRegistrationTotal counts what the kubelet decided about the CSI node
+	// plugin. T12: {outcome}.
+	//
+	// Separate from the mount metric because a refusal is terminal rather than
+	// retried: no publish follows it, so every enrolled pod on the node fails.
+	MetricRegistrationTotal = "workload_identity_registration_total"
 )
 
 // Label names for the metrics above.
@@ -105,6 +114,9 @@ const (
 	// LabelSource carries the credential source a refresh was routed to, one of
 	// the CredentialSource values. It is on MetricCredentialSourceTotal only.
 	LabelSource = "source"
+	// LabelOperation carries which half of a paired operation ran, one of the
+	// Operation values. It is on MetricVolumeMountTotal only.
+	LabelOperation = "operation"
 )
 
 // Values for LabelOutcome.
@@ -193,6 +205,15 @@ const (
 	CacheResultEvicted = "evicted"
 )
 
+// Values for LabelOperation, naming which half of a paired operation ran.
+const (
+	// OperationPublish is a NodePublishVolume, mounting the socket directory
+	// into a pod.
+	OperationPublish = "publish"
+	// OperationUnpublish is a NodeUnpublishVolume, unmounting it again.
+	OperationUnpublish = "unpublish"
+)
+
 // Values for LabelSource, naming where a refresh was routed.
 //
 // These name the route the enrollment decision picked, not the source that
@@ -269,5 +290,7 @@ func MetricNames() []string {
 		MetricCredentialSourceTotal,
 		MetricRPCTotal,
 		MetricRPCDuration,
+		MetricVolumeMountTotal,
+		MetricRegistrationTotal,
 	}
 }
