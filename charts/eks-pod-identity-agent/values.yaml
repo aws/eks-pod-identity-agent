@@ -149,10 +149,16 @@ image:
 
 imagePullSecrets: []
 
-# The workload identity CSI node plugin, run as a sidecar of the agent outside isolated
-# regions. The binary ships in the agent's image from the first release after v0.2.4, so
-# image.tag (or image.override) has to name such a release. See "Workload identity CSI
-# driver" in the chart README.
+# Workload identity: the agent's socket, the CSI driver sidecar that publishes it, the
+# CSIDriver object and the host PID namespace attestation needs. Off by default. Isolated
+# regions never get it, whatever this says. Not usable yet: the chart doesn't give the agent
+# a node credential, so turning it on crash-loops the agent. See "Workload identity" in the
+# chart README.
+workloadIdentity:
+  enabled: false
+
+# The workload identity CSI node plugin, run as a sidecar of the agent when workload
+# identity is on.
 csiDriver:
   resources: {}
 

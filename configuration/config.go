@@ -99,8 +99,9 @@ const (
 const isolatedRegionInfix = "-iso"
 
 // IsIsolatedRegion reports whether region belongs to an isolated partition, where
-// workload identity is not enabled. An empty region reads as not isolated, since
-// defaulting it to isolated would turn the feature off silently rather than fail.
+// the chart doesn't enable workload identity. Nothing in the agent calls it; it is
+// the Go definition the chart's region gate is tested against. An empty region
+// reads as not isolated.
 func IsIsolatedRegion(region string) bool {
 	return strings.Contains(region, isolatedRegionInfix)
 }

@@ -181,7 +181,8 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	// bound, fails the boot before anything is serving.
 	workloadIdentity, err := workloadIdentityServers(ctx, workloadIdentityOpts, wiClients)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("building the workload identity servers (--%s=false turns workload identity off): %w",
+			handlers.FlagEnableWorkloadIdentity, err)
 	}
 	return append(servers, workloadIdentity...), nil
 }
@@ -197,7 +198,8 @@ func buildSharedCredentialManager(ctx context.Context, credentialOpts *handlers.
 	workloadIdentityOpts *handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
 	wiClients, err := newWorkloadIdentityClients(ctx, *workloadIdentityOpts)
 	if err != nil {
-		return nil, fmt.Errorf("building the workload identity clients: %w", err)
+		return nil, fmt.Errorf("building the workload identity clients (--%s=false turns workload identity off): %w",
+			handlers.FlagEnableWorkloadIdentity, err)
 	}
 	credentialOpts.WorkloadIdentityTokens = wiClients.credentialTokens()
 	shareCredentialManager(newCredentialManager(ctx, *credentialOpts), credentialOpts, workloadIdentityOpts)
@@ -276,8 +278,8 @@ func init() {
 	serverCmd.Flags().BoolVar(&enableIMDSCredentials, "enable-imds-credentials", false,
 		"Enable consuming credentials from IMDS when available on the node")
 
-	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, true,
-		"Serve SPIFFE workload identity on its socket. Set false to turn it off, and boot needs neither the API server nor the kubelet's kubeconfig")
+	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, false,
+		"Serve SPIFFE workload identity on its socket. Off by default, and then boot needs neither the API server nor the kubelet's kubeconfig. On, the agent exits at boot if it can't reach the API server as the node")
 
 	// Workload identity. Each requested SVID lifetime is a ceiling and not a
 	// grant: STS issues the least of what is asked for and what it allows, and

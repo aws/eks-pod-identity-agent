@@ -49,11 +49,31 @@ The following table lists the configurable parameters for this chart and their d
 | `resources`               | Resources for the agent container                       | `{}`                     |
 | `tolerations`             | Optional deployment tolerations                         | `all`                    |
 | `updateStrategy`          | Optional update strategy                                | `type: RollingUpdate`    |
+| `workloadIdentity.enabled`| Serve workload identity (not usable yet; see below)     | `false`                  |
 
 Specify each parameter using the `--set key=value[,key=value]` argument to `helm install` or provide a YAML file
 containing the values for the above parameters.
 
-## Workload identity CSI driver
+## Workload identity
+
+Off by default. `workloadIdentity.enabled: true` passes `--enable-workload-identity=true` to
+the agent and adds everything below: the agent's socket directory, the CSI driver sidecar, the
+`CSIDriver` object, and `hostPID: true`, which attestation needs to read a caller's PID.
+Isolated regions never get any of it, whatever the value says. Turn it on only with an image
+built with workload identity, which ships `/eks-pod-identity-csi-driver`. Images without it
+(every release through v0.2.5) reject the flag and crash-loop.
+
+Not usable yet. With it on, the agent builds its node client from
+`/var/lib/kubelet/kubeconfig`, which this chart doesn't mount, so every agent pod exits at boot
+and crash-loops, taking the Pod Identity credential endpoint on that node down with it. The
+node credential comes in a later change. With it off, the rendered manifest has no workload
+identity piece at all.
+
+Pass the flag through this value, not `agent.additionalArgs`. That map renders a key and its
+value as two arguments, and the agent reads a bare `--enable-workload-identity` as true and
+ignores a separate `false`.
+
+### CSI driver
 
 The chart installs a cluster-scoped `CSIDriver` named `spiffe.csi.eks.amazonaws.com`, served by
 the `eks-pod-identity-agent-csi-driver` sidecar of each agent pod. It publishes the workload
@@ -66,8 +86,9 @@ references — through a projected volume, or through the `tokenRequests` of a C
 its volumes names. Enrolled pods carry a CSI volume naming this driver, so this one declaration
 makes the agent's `TokenRequest` permissible fleet-wide with no change to any pod spec.
 
-There is no values knob. On a cluster not using workload identity the object is inert, since no
-pod has a volume naming it. It is not rendered in isolated regions.
+It's rendered only when workload identity is on. Turning workload identity off deletes it and
+removes the sidecar, so first stop enrolling pods and roll the enrolled ones: a pod whose
+volume names this driver can't unmount it once the driver is gone and stays `Terminating`.
 
 The sidecar registers only once the agent's socket answers, so enrolled pods wait in
 `ContainerCreating` rather than start with an empty socket directory. After registration an

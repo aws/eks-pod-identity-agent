@@ -661,19 +661,39 @@ func countNodeClientBuilds(t *testing.T, client kubernetes.Interface) *atomic.In
 	return &builds
 }
 
-// TestServerCmd_EnableWorkloadIdentity_IsOnByDefault pins the feature flag: on by
-// default, and its value reaches the options the wiring reads.
-func TestServerCmd_EnableWorkloadIdentity_IsOnByDefault(t *testing.T) {
+// TestServerCmd_EnableWorkloadIdentity_IsOffByDefault pins the feature flag: off by
+// default, so an agent upgraded with no new flags boots as before, and its value
+// reaches the options the wiring reads.
+func TestServerCmd_EnableWorkloadIdentity_IsOffByDefault(t *testing.T) {
 	g := NewWithT(t)
 
 	flag := serverCmd.Flags().Lookup(handlers.FlagEnableWorkloadIdentity)
 	g.Expect(flag).ToNot(BeNil())
-	g.Expect(flag.DefValue).To(Equal("true"))
-	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).Enabled).To(BeTrue())
-
-	g.Expect(serverCmd.Flags().Set(handlers.FlagEnableWorkloadIdentity, "false")).To(Succeed())
-	t.Cleanup(func() { _ = serverCmd.Flags().Set(handlers.FlagEnableWorkloadIdentity, flag.DefValue) })
+	g.Expect(flag.DefValue).To(Equal("false"))
 	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).Enabled).To(BeFalse())
+
+	g.Expect(serverCmd.Flags().Set(handlers.FlagEnableWorkloadIdentity, "true")).To(Succeed())
+	t.Cleanup(func() { _ = serverCmd.Flags().Set(handlers.FlagEnableWorkloadIdentity, flag.DefValue) })
+	g.Expect(newWorkloadIdentityServerOpts(aws.Config{}).Enabled).To(BeTrue())
+}
+
+// TestBuildSharedCredentialManager_OnAndFailing_NamesTheOptOut proves a failure
+// building the workload identity clients, which is fatal, tells the operator which
+// flag turns the feature off.
+func TestBuildSharedCredentialManager_OnAndFailing_NamesTheOptOut(t *testing.T) {
+	g := NewWithT(t)
+	original := newNodeClient
+	newNodeClient = func(string) (kubernetes.Interface, error) {
+		return nil, errors.New("no kubeconfig")
+	}
+	t.Cleanup(func() { newNodeClient = original })
+	credentialOpts := handlers.EksCredentialHandlerOpts{ClusterName: "test-cluster"}
+	workloadIdentityOpts := wiOpts
+
+	_, err := buildSharedCredentialManager(t.Context(), &credentialOpts, &workloadIdentityOpts)
+
+	g.Expect(err).To(MatchError(ContainSubstring("no kubeconfig")))
+	g.Expect(err).To(MatchError(ContainSubstring("--" + handlers.FlagEnableWorkloadIdentity + "=false")))
 }
 
 // TestWorkloadIdentityClients_TheSessionTierAndTheCredentialCacheShareOneMinter

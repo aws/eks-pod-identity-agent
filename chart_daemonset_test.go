@@ -20,16 +20,28 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 )
 
+// workloadIdentityChartPath renders the chart with workload identity on and all three
+// DaemonSets created. A hybrid node runs the same binary and kubelet layout, so it carries
+// the wiring too.
+const workloadIdentityChartPath = "hack/testdata/expected_eks_pod_identity_agent_workload_identity_helm_template.yaml"
+
 // renderedChartPaths is every scenario make helm-verify renders that gets the CSI wiring.
-// A hybrid node runs the same binary and kubelet layout, so it carries it too. The isolated
-// region rendering is deliberately absent and is asserted against separately.
-var renderedChartPaths = []string{
+var renderedChartPaths = []string{workloadIdentityChartPath}
+
+// workloadIdentityOffChartPaths is every scenario that must carry no workload identity
+// piece: the defaults, and an isolated region that asked for it.
+var workloadIdentityOffChartPaths = []string{
 	"hack/testdata/expected_eks_pod_identity_agent_default_helm_template.yaml",
 	"hack/testdata/expected_eks_pod_identity_agent_hybrid_helm_template.yaml",
 	"hack/testdata/expected_eks_pod_identity_agent_hybrid_bottlerocket_helm_template.yaml",
+	"hack/testdata/expected_eks_pod_identity_agent_iso_helm_template.yaml",
 }
+
+// enableWorkloadIdentityArg is the single token the chart passes to turn the feature on.
+const enableWorkloadIdentityArg = "--" + handlers.FlagEnableWorkloadIdentity + "=true"
 
 func daemonSetsFromRenderedChart(t *testing.T, path string) []appsv1.DaemonSet {
 	t.Helper()
@@ -299,9 +311,45 @@ func TestChartDaemonSetSetsTheNodeNameFromTheDownwardAPI(t *testing.T) {
 	}
 }
 
-// TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion is the DaemonSet half of the region
-// gate: no sidecar, so no privileged container and no kubelet or socket directory mounts.
-func TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion(t *testing.T) {
+// workloadIdentityArgs returns the agent's arguments that name the workload identity flag.
+func workloadIdentityArgs(agent corev1.Container) []string {
+	var found []string
+	for _, arg := range agent.Args {
+		if strings.HasPrefix(arg, "--"+handlers.FlagEnableWorkloadIdentity) {
+			found = append(found, arg)
+		}
+	}
+	return found
+}
+
+// TestChartDaemonSetTurnsWorkloadIdentityOnWithOneToken covers what the agent sees. The
+// flag is off by default, so the chart has to pass it, and as one token: a bare bool flag
+// parses as true and a separate "false" is silently dropped. Attestation also needs the
+// host PID namespace, or SO_PEERCRED reports 0.
+func TestChartDaemonSetTurnsWorkloadIdentityOnWithOneToken(t *testing.T) {
+	daemonSets := daemonSetsFromRenderedChart(t, workloadIdentityChartPath)
+	if len(daemonSets) != 3 {
+		t.Fatalf("%s renders %d DaemonSets, want the cloud, hybrid and hybrid-bottlerocket ones",
+			workloadIdentityChartPath, len(daemonSets))
+	}
+	for _, daemonSet := range daemonSets {
+		args := workloadIdentityArgs(mustContainer(t, daemonSet, agentContainerName))
+		if !slices.Equal(args, []string{enableWorkloadIdentityArg}) {
+			t.Errorf("%s: DaemonSet %s passes the agent %v, want exactly %q",
+				workloadIdentityChartPath, daemonSet.Name, args, enableWorkloadIdentityArg)
+		}
+		if !daemonSet.Spec.Template.Spec.HostPID {
+			t.Errorf("%s: DaemonSet %s does not run in the host PID namespace, so attestation sees PID 0",
+				workloadIdentityChartPath, daemonSet.Name)
+		}
+	}
+}
+
+// TestChartDaemonSetOmitsWorkloadIdentityWhenOff is the DaemonSet half of the gate: no flag,
+// no sidecar, so no privileged container, no kubelet or socket directory mounts, and no host
+// PID namespace. An image without workload identity rejects the flag, so its absence is what
+// keeps the default chart working with every agent release.
+func TestChartDaemonSetOmitsWorkloadIdentityWhenOff(t *testing.T) {
 	absent := []string{
 		configuration.WorkloadIdentitySocketMountPath,
 		configuration.KubeletPluginDir,
@@ -309,23 +357,32 @@ func TestChartDaemonSetOmitsTheCSIWiringInAnIsolatedRegion(t *testing.T) {
 		configuration.KubeletPodsDir,
 	}
 
-	for _, daemonSet := range daemonSetsFromRenderedChart(t, isolatedRegionChartPath) {
-		if container(daemonSet, csiDriverContainerName) != nil {
-			t.Errorf("%s: DaemonSet %s runs the CSI driver sidecar, which an isolated region does not use",
-				isolatedRegionChartPath, daemonSet.Name)
-		}
-		agent := mustContainer(t, daemonSet, agentContainerName)
-		if privileged(agent) {
-			t.Errorf("%s: DaemonSet %s runs the agent privileged", isolatedRegionChartPath, daemonSet.Name)
-		}
-		for _, path := range absent {
-			if mountAt(agent, path) != nil {
-				t.Errorf("%s: DaemonSet %s mounts %s in the agent", isolatedRegionChartPath, daemonSet.Name, path)
+	for _, chartPath := range workloadIdentityOffChartPaths {
+		for _, daemonSet := range daemonSetsFromRenderedChart(t, chartPath) {
+			if container(daemonSet, csiDriverContainerName) != nil {
+				t.Errorf("%s: DaemonSet %s runs the CSI driver sidecar with workload identity off",
+					chartPath, daemonSet.Name)
 			}
-			for _, volume := range daemonSet.Spec.Template.Spec.Volumes {
-				if volume.HostPath != nil && volume.HostPath.Path == path {
-					t.Errorf("%s: DaemonSet %s declares host volume %s for %s, which nothing in this rendering "+
-						"consumes", isolatedRegionChartPath, daemonSet.Name, volume.Name, path)
+			if daemonSet.Spec.Template.Spec.HostPID {
+				t.Errorf("%s: DaemonSet %s runs in the host PID namespace, which only attestation needs",
+					chartPath, daemonSet.Name)
+			}
+			agent := mustContainer(t, daemonSet, agentContainerName)
+			if args := workloadIdentityArgs(agent); len(args) != 0 {
+				t.Errorf("%s: DaemonSet %s passes the agent %v with workload identity off", chartPath, daemonSet.Name, args)
+			}
+			if privileged(agent) {
+				t.Errorf("%s: DaemonSet %s runs the agent privileged", chartPath, daemonSet.Name)
+			}
+			for _, path := range absent {
+				if mountAt(agent, path) != nil {
+					t.Errorf("%s: DaemonSet %s mounts %s in the agent", chartPath, daemonSet.Name, path)
+				}
+				for _, volume := range daemonSet.Spec.Template.Spec.Volumes {
+					if volume.HostPath != nil && volume.HostPath.Path == path {
+						t.Errorf("%s: DaemonSet %s declares host volume %s for %s, which nothing in this rendering "+
+							"consumes", chartPath, daemonSet.Name, volume.Name, path)
+					}
 				}
 			}
 		}

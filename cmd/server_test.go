@@ -211,6 +211,27 @@ func TestCreateServers_WorkloadIdentityOff_BuildsNoNodeClient(t *testing.T) {
 	g.Expect(builds.Load()).To(BeZero(), "no node client may be built with workload identity off")
 }
 
+// TestCreateServers_WorkloadIdentityServersFailing_NamesTheOptOut proves a failure
+// building the workload identity servers, which is fatal, names the opt-out flag.
+// A zero credential manager gives the session tier a nil cache, which it refuses.
+func TestCreateServers_WorkloadIdentityServersFailing_NamesTheOptOut(t *testing.T) {
+	g := NewWithT(t)
+	countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))
+	originalEnabled, originalCluster := enableWorkloadIdentity, clusterName
+	enableWorkloadIdentity, clusterName = true, "test-cluster"
+	t.Cleanup(func() { enableWorkloadIdentity, clusterName = originalEnabled, originalCluster })
+	originalManager := newCredentialManager
+	newCredentialManager = func(context.Context, handlers.EksCredentialHandlerOpts) handlers.CredentialManager {
+		return handlers.CredentialManager{}
+	}
+	t.Cleanup(func() { newCredentialManager = originalManager })
+
+	_, err := createServers(t.Context(), aws.Config{})
+
+	g.Expect(err).To(MatchError(ContainSubstring("building the workload identity servers")))
+	g.Expect(err).To(MatchError(ContainSubstring("--" + handlers.FlagEnableWorkloadIdentity + "=false")))
+}
+
 // TestBuildSharedCredentialManager_Off_GivesTheCacheNoTokenSource proves the
 // credential manager is built without the workload identity token source when
 // the feature is off, so its cache refreshes every entry through the general

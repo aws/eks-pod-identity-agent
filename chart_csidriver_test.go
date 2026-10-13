@@ -20,9 +20,9 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 )
 
-// renderedChartPath is the default rendering, which is what an EKS cluster gets. The
-// object has no values knob, so it appears here unconditionally.
-const renderedChartPath = "hack/testdata/expected_eks_pod_identity_agent_default_helm_template.yaml"
+// renderedChartPath is the rendering with workload identity on, the only one that carries
+// the object.
+const renderedChartPath = workloadIdentityChartPath
 
 // csiDriverFromRenderedChart pulls the single CSIDriver document out of the rendered
 // chart. A missing object fails rather than skips: the chart is the installer of record.
@@ -119,39 +119,36 @@ func TestChartCSIDriverSpecMatchesTheNodeServiceItDescribes(t *testing.T) {
 	}
 }
 
-// isolatedRegionChartPath is the same chart rendered for an isolated region, where the
-// workload identity CSI node service is not run.
-const isolatedRegionChartPath = "hack/testdata/expected_eks_pod_identity_agent_iso_helm_template.yaml"
+// TestChartOmitsTheCSIDriverWithWorkloadIdentityOff is the other half of the gate. With
+// workload identity off, or in an isolated region, nothing serves the driver, so an object
+// advertising it would let the webhook enroll a pod whose volume nothing ever publishes,
+// leaving it in ContainerCreating.
+func TestChartOmitsTheCSIDriverWithWorkloadIdentityOff(t *testing.T) {
+	for _, chartPath := range workloadIdentityOffChartPaths {
+		rendered, err := os.ReadFile(chartPath)
+		if err != nil {
+			t.Fatalf("reading rendered chart %s: %v", chartPath, err)
+		}
 
-// TestChartOmitsTheCSIDriverInAnIsolatedRegion is the other half of the region gate. The
-// agent does not start the node service there (configuration.IsIsolatedRegion), so an
-// object advertising the driver would let the webhook enroll a pod whose volume nothing
-// ever publishes, leaving it in ContainerCreating.
-func TestChartOmitsTheCSIDriverInAnIsolatedRegion(t *testing.T) {
-	rendered, err := os.ReadFile(isolatedRegionChartPath)
-	if err != nil {
-		t.Fatalf("reading rendered chart %s: %v", isolatedRegionChartPath, err)
-	}
+		if strings.Contains(string(rendered), "kind: CSIDriver") {
+			t.Errorf("%s renders a CSIDriver object with workload identity off, advertising a driver "+
+				"nothing serves", chartPath)
+		}
 
-	if strings.Contains(string(rendered), "kind: CSIDriver") {
-		t.Errorf("%s renders a CSIDriver object: an isolated region runs no node service, so the object "+
-			"would advertise a driver nothing serves", isolatedRegionChartPath)
-	}
-
-	// The name would still be present through the agent's own constants if the object were
-	// dropped but its driver name left behind somewhere else in the chart.
-	if strings.Contains(string(rendered), configuration.WorkloadIdentityCSIDriver) {
-		t.Errorf("%s still names driver %q somewhere: nothing in an isolated region's manifest should",
-			isolatedRegionChartPath, configuration.WorkloadIdentityCSIDriver)
+		// The name would still be present through the agent's own constants if the object were
+		// dropped but its driver name left behind somewhere else in the chart.
+		if strings.Contains(string(rendered), configuration.WorkloadIdentityCSIDriver) {
+			t.Errorf("%s still names driver %q somewhere: nothing in a manifest with workload identity "+
+				"off should", chartPath, configuration.WorkloadIdentityCSIDriver)
+		}
 	}
 }
 
-// TestChartRegionGateMatchesTheAgent pins the chart's Helm-side predicate against
-// configuration.IsIsolatedRegion. Helm cannot call a Go function, so the rule exists twice
-// — `contains "-iso"` in daemonset.yaml and csidriver.yaml, IsIsolatedRegion in the agent —
-// and they have to agree on every region name. Mounts without the service is an unused
-// privilege; the service without mounts is a plugin that registers and is never called.
-func TestChartRegionGateMatchesTheAgent(t *testing.T) {
+// TestChartRegionGateMatchesIsIsolatedRegion pins the `contains "-iso"` literal in the
+// chart's enableWorkloadIdentity helper to configuration.IsIsolatedRegion. Helm can't call
+// Go, so this keeps the two definitions of an isolated region in step. The agent and the
+// CSI sidecar never read the region, so the chart helper is the only region gate.
+func TestChartRegionGateMatchesIsIsolatedRegion(t *testing.T) {
 	// The literal the templates use. Kept beside the assertion so a change to either side
 	// shows up here.
 	const chartInfix = "-iso"
@@ -163,10 +160,8 @@ func TestChartRegionGateMatchesTheAgent(t *testing.T) {
 		chartGated := strings.Contains(region, chartInfix)
 		agentGated := configuration.IsIsolatedRegion(region)
 		if chartGated != agentGated {
-			t.Errorf("region %q: chart gates=%v, configuration.IsIsolatedRegion=%v: the chart renders the "+
-				"mounts and the CSIDriver object, and the agent starts the node service, so a disagreement "+
-				"is either an unused privilege or a plugin the kubelet cannot reach",
-				region, chartGated, agentGated)
+			t.Errorf("region %q: chart gates=%v, configuration.IsIsolatedRegion=%v: the chart's and Go's "+
+				"definitions of an isolated region have drifted", region, chartGated, agentGated)
 		}
 	}
 }

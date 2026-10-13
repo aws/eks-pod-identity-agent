@@ -24,10 +24,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// DefaultKubeletKubeconfigPath is where the kubelet's kubeconfig sits on an EKS
-// node. It references the node client certificate, so a client built from it
-// authenticates as system:node:<nodeName>. The agent mounts this path from the
-// host.
+// DefaultKubeletKubeconfigPath is where nodeadm writes the kubelet's kubeconfig on
+// an AL2023 or hybrid node. On EKS it execs aws or aws-iam-authenticator, which the
+// agent image doesn't ship, and the chart doesn't mount it.
 const DefaultKubeletKubeconfigPath = "/var/lib/kubelet/kubeconfig"
 
 const (
