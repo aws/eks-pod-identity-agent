@@ -2,7 +2,6 @@ package fake
 
 import (
 	"context"
-	"net"
 	"slices"
 	"sync"
 
@@ -10,11 +9,11 @@ import (
 )
 
 // Attestor is a fake workloadidentity.Attestor. It returns a canned Workload or
-// a canned error, counts calls, records the connections it was handed, and parks
+// a canned error, counts calls, records the peers it was handed, and parks
 // its calls while its Gate is closed.
 //
-// Attest ignores conn beyond recording it, so a test of a tier above attestation
-// can pass nil and never build a socket. Only the real attestor's own tests need
+// Attest ignores peer beyond recording it, so a test of a tier above attestation
+// can pass nil and never build a socket. Only the transport's own tests need
 // a Unix socket.
 //
 // Set the fields before the fake is used. Use the setters to change behaviour
@@ -30,36 +29,36 @@ type Attestor struct {
 	Err error
 	// Func, when non-nil, wins over Result and Err: Attest returns whatever it
 	// returns.
-	Func func(ctx context.Context, conn net.Conn) (*workloadidentity.Workload, error)
+	Func func(ctx context.Context, peer workloadidentity.Peer) (*workloadidentity.Workload, error)
 
 	mu    sync.Mutex
 	calls int
-	conns []net.Conn
+	peers []workloadidentity.Peer
 }
 
-// Attest records conn and returns the canned Workload, the canned error, or
+// Attest records peer and returns the canned Workload, the canned error, or
 // whatever Func returns.
 //
 // It parks at the Gate first and returns the Gate's error unchanged. A call that
 // arrives with a done ctx, or that is woken by ctx rather than by Release, is
-// never counted and its conn is never recorded. A parked call is not counted
+// never counted and its peer is never recorded. A parked call is not counted
 // while it is parked; it counts and records itself once Release wakes it and it
 // is next scheduled, which can be after Release has returned. Use WaitForBlocked
 // to observe a parked call, and observe the call's own return before asserting on
-// Calls or Conns.
-func (a *Attestor) Attest(ctx context.Context, conn net.Conn) (*workloadidentity.Workload, error) {
+// Calls or Peers.
+func (a *Attestor) Attest(ctx context.Context, peer workloadidentity.Peer) (*workloadidentity.Workload, error) {
 	if err := a.enter(ctx); err != nil {
 		return nil, err
 	}
 
 	a.mu.Lock()
 	a.calls++
-	a.conns = append(a.conns, conn)
+	a.peers = append(a.peers, peer)
 	fn, result, err := a.Func, a.Result, a.Err
 	a.mu.Unlock()
 
 	if fn != nil {
-		return fn(ctx, conn)
+		return fn(ctx, peer)
 	}
 	if err != nil {
 		return nil, err
@@ -75,12 +74,12 @@ func (a *Attestor) Calls() int {
 	return a.calls
 }
 
-// Conns returns a copy of the connections Attest was called with, in call order,
+// Peers returns a copy of the peers Attest was called with, in call order,
 // so it is safe to read while another goroutine is calling the fake.
-func (a *Attestor) Conns() []net.Conn {
+func (a *Attestor) Peers() []workloadidentity.Peer {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return slices.Clone(a.conns)
+	return slices.Clone(a.peers)
 }
 
 // SetResult replaces the canned Workload and error while the fake is live.

@@ -77,6 +77,15 @@ clean:
 test: generate-mocks
 	go test -race -cover -covermode=atomic ./...
 
+# test-pidreuse reproduces PID reuse against a pinned connection. Steering PIDs
+# needs CAP_SYS_ADMIN over a fresh PID namespace: root unshares one directly,
+# others get it through a user namespace.
+PIDREUSE_UNSHARE = $(if $(filter 0,$(shell id -u)),-pf,-Urpf)
+.PHONY: test-pidreuse
+test-pidreuse:
+	go test -c -o $(OUTPUT)/grpcserver.test ./pkg/grpcserver/
+	PIDREUSE_REQUIRED=1 unshare $(PIDREUSE_UNSHARE) --mount-proc $(OUTPUT)/grpcserver.test -test.run 'TestPeer_PIDReuse' -test.count=1 -test.v
+
 # test-verbose also prints output for tests that didn't fail
 # and sets the verbosity to 5
 .PHONY: test-verbose

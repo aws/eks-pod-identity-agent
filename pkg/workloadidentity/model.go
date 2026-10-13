@@ -17,7 +17,6 @@ package workloadidentity
 
 import (
 	"context"
-	"net"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -44,23 +43,21 @@ type Workload struct {
 	NodeName string
 }
 
-// Attestor resolves the process on the other end of an accepted connection to a
-// Workload. It returns ErrUnattestable if the caller cannot be identified.
-//
-// Attest takes the conn rather than a PID because the PID alone is not safe to
-// act on. SO_PEERCRED reports who connected, and that process can exit before
-// the agent finishes resolving it, leaving the agent reading /proc for whatever
-// process inherited the number. Guarding against that needs a handle opened at
-// accept time and rechecked after resolution, and the conn is what scopes that
-// handle's lifetime. Passing a PID pushes the race onto every caller.
-//
-// The parameter is net.Conn rather than *net.UnixConn so a fake can ignore the
-// argument. The implementation does the type assertion and returns
-// ErrUnattestable for anything that is not a Unix socket, which also rejects a
-// caller reaching the handler over TCP.
+// Peer is the process on the other end of an RPC's connection, pinned by the
+// transport when the connection was accepted. PID is a hint: anything read about
+// it belongs to the caller only if Alive returns nil after the read. An
+// implementation may close the connection when Alive fails.
+type Peer interface {
+	// PID is the peer's process ID in the agent's PID namespace.
+	PID() int
+	// Alive reports whether the pinned process is still running.
+	Alive() error
+}
+
+// Attestor resolves a pinned Peer to a Workload, or returns ErrUnattestable.
 type Attestor interface {
-	// Attest identifies the workload behind conn.
-	Attest(ctx context.Context, conn net.Conn) (*Workload, error)
+	// Attest identifies the workload behind peer.
+	Attest(ctx context.Context, peer Peer) (*Workload, error)
 }
 
 // TokenMinter obtains a pod-bound ServiceAccount token for an attested

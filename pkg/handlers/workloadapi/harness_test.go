@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -118,7 +117,7 @@ func newHarness(t *testing.T, configure ...func(*harness)) *harness {
 	h.svidA = h.pki.issue(t, "spiffe://"+testTrustDomain+"/ns/ns/sa/sa-a")
 
 	pods := map[string]*workloadidentity.Workload{podA.PodUID: podA, podB.PodUID: podB, podUnenrolled.PodUID: podUnenrolled}
-	h.attestor = &fake.Attestor{Func: func(ctx context.Context, _ net.Conn) (*workloadidentity.Workload, error) {
+	h.attestor = &fake.Attestor{Func: func(ctx context.Context, _ workloadidentity.Peer) (*workloadidentity.Workload, error) {
 		return podFromMetadata(ctx, pods), nil
 	}}
 	h.providers = &fake.ProviderArnResolver{Arns: map[string]string{podA.PodUID: providerA, podB.PodUID: providerB}}

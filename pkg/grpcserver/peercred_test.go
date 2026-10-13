@@ -1,4 +1,4 @@
-package attestation
+package grpcserver
 
 import (
 	"net"
@@ -55,7 +55,7 @@ func TestPeerFromConn_NotUnixSocket(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	_, err := peerFromConn(c1)
+	_, err := peerFromConn(c1, pinProcHandle)
 
 	g.Expect(err).To(MatchError(errNotUnixSocket))
 }
@@ -67,13 +67,13 @@ func TestPeerFromConn_NotUnixSocket(t *testing.T) {
 func TestPeerFromConn_RealSocket_PinsSelf(t *testing.T) {
 	g := NewWithT(t)
 
-	conn, cleanup := selfConnectedUnixConn(t)
-	defer cleanup()
+	conn, client := unixPair(t)
+	defer client.Close()
 
-	peer, err := peerFromConn(conn)
+	peer, err := peerFromConn(conn, pinProcHandle)
 	g.Expect(err).NotTo(HaveOccurred())
-	defer peer.close()
+	defer peer.release()
 
-	g.Expect(peer.pid()).To(Equal(os.Getpid()))
-	g.Expect(peer.recheck()).To(Succeed(), "a live self-peer must pass the recheck")
+	g.Expect(peer.PID()).To(Equal(os.Getpid()))
+	g.Expect(peer.Alive()).To(Succeed(), "a live self-peer must pass the recheck")
 }

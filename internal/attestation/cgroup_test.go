@@ -117,10 +117,9 @@ func TestPodUIDForPID_ReadsProcCgroup(t *testing.T) {
 }
 
 // TestPodUIDForPID_MissingProcEntry_WrapsReadError proves a gone process (no
-// /proc/<pid>/cgroup) surfaces as a read error, not as ErrNoPodUID. The two are
-// distinct: a missing entry means the peer exited, which the attestor counts as
-// ReasonPeerGone, whereas ErrNoPodUID means the process exists but is not in a
-// pod.
+// /proc/<pid>/cgroup) surfaces as a read error, not as ErrNoPodUID. The attestor
+// counts it as liveness_recheck_failed when the pin is dead, never as
+// cgroup_no_pod_uid, which means the process exists but is not in a pod.
 func TestPodUIDForPID_MissingProcEntry_WrapsReadError(t *testing.T) {
 	g := NewWithT(t)
 

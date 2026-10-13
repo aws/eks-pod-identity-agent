@@ -3,7 +3,6 @@ package fake
 import (
 	"context"
 	"errors"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -63,16 +62,15 @@ func attestorOtherWorkload() *workloadidentity.Workload {
 	}
 }
 
-// attestorConn returns one end of an in-memory connection, so a test has a real
-// net.Conn without building a socket.
-func attestorConn(t *testing.T) net.Conn {
+// stubPeer is a distinct workloadidentity.Peer per call, compared by identity.
+type stubPeer struct{ pid int }
+
+func (p *stubPeer) PID() int     { return p.pid }
+func (p *stubPeer) Alive() error { return nil }
+
+func attestorPeer(t *testing.T) workloadidentity.Peer {
 	t.Helper()
-	local, remote := net.Pipe()
-	t.Cleanup(func() {
-		_ = local.Close()
-		_ = remote.Close()
-	})
-	return local
+	return &stubPeer{pid: 1}
 }
 
 // attestorExpectWorkload asserts every field of got against want, or that got is
@@ -90,9 +88,9 @@ func attestorExpectWorkload(g *WithT, got, want *workloadidentity.Workload) {
 	g.Expect(got.NodeName).To(Equal(want.NodeName))
 }
 
-// attestorExpectConns asserts the recorded connections are exactly want, by
+// attestorExpectPeers asserts the recorded peers are exactly want, by
 // identity and in order.
-func attestorExpectConns(g *WithT, got, want []net.Conn) {
+func attestorExpectPeers(g *WithT, got, want []workloadidentity.Peer) {
 	g.Expect(got).To(HaveLen(len(want)))
 	for i := range want {
 		if want[i] == nil {
@@ -118,7 +116,7 @@ func attestorAwait(t *testing.T, ctx context.Context, results <-chan attestorRes
 
 // attestorAttestAsync calls Attest on a new goroutine and returns the channel
 // its result arrives on.
-func attestorAttestAsync(ctx context.Context, a *Attestor, conn net.Conn) <-chan attestorResult {
+func attestorAttestAsync(ctx context.Context, a *Attestor, conn workloadidentity.Peer) <-chan attestorResult {
 	results := make(chan attestorResult, 1)
 	go func() {
 		workload, err := a.Attest(ctx, conn)
@@ -128,12 +126,12 @@ func attestorAttestAsync(ctx context.Context, a *Attestor, conn net.Conn) <-chan
 }
 
 func TestAttestorAttest_CannedBehaviour_ReturnsThatBehaviourAndRecordsTheCall(t *testing.T) {
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 
 	testCases := []struct {
 		name         string
 		attestor     *Attestor
-		conn         net.Conn
+		conn         workloadidentity.Peer
 		wantWorkload *workloadidentity.Workload
 		wantErr      error
 	}{
@@ -160,7 +158,7 @@ func TestAttestorAttest_CannedBehaviour_ReturnsThatBehaviourAndRecordsTheCall(t 
 			attestor: &Attestor{
 				Result: attestorOtherWorkload(),
 				Err:    errAttestorCanned,
-				Func: func(ctx context.Context, conn net.Conn) (*workloadidentity.Workload, error) {
+				Func: func(ctx context.Context, conn workloadidentity.Peer) (*workloadidentity.Workload, error) {
 					return attestorWorkload(), nil
 				},
 			},
@@ -171,7 +169,7 @@ func TestAttestorAttest_CannedBehaviour_ReturnsThatBehaviourAndRecordsTheCall(t 
 			name: "Func returning an error",
 			attestor: &Attestor{
 				Result: attestorWorkload(),
-				Func: func(ctx context.Context, conn net.Conn) (*workloadidentity.Workload, error) {
+				Func: func(ctx context.Context, conn workloadidentity.Peer) (*workloadidentity.Workload, error) {
 					return nil, errAttestorFromFunc
 				},
 			},
@@ -200,73 +198,73 @@ func TestAttestorAttest_CannedBehaviour_ReturnsThatBehaviourAndRecordsTheCall(t 
 				attestorExpectWorkload(g, got, tc.wantWorkload)
 			}
 			g.Expect(tc.attestor.Calls()).To(Equal(1))
-			attestorExpectConns(g, tc.attestor.Conns(), []net.Conn{tc.conn})
+			attestorExpectPeers(g, tc.attestor.Peers(), []workloadidentity.Peer{tc.conn})
 		})
 	}
 }
 
-func TestAttestorAttest_CalledRepeatedly_CountsCallsAndRecordsConnsInCallOrder(t *testing.T) {
+func TestAttestorAttest_CalledRepeatedly_CountsCallsAndRecordsPeersInCallOrder(t *testing.T) {
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	first := attestorConn(t)
-	second := attestorConn(t)
+	first := attestorPeer(t)
+	second := attestorPeer(t)
 
 	a := &Attestor{Result: attestorWorkload()}
 	g.Expect(a.Calls()).To(Equal(0))
-	g.Expect(a.Conns()).To(BeEmpty())
+	g.Expect(a.Peers()).To(BeEmpty())
 
 	// nil in the middle, because the fake documents that ignoring the conn makes
 	// nil a legal argument.
-	wantConns := []net.Conn{first, nil, second, first}
-	for _, conn := range wantConns {
+	wantPeers := []workloadidentity.Peer{first, nil, second, first}
+	for _, conn := range wantPeers {
 		got, err := a.Attest(ctx, conn)
 		g.Expect(err).ToNot(HaveOccurred())
 		attestorExpectWorkload(g, got, attestorWorkload())
 	}
 
-	g.Expect(a.Calls()).To(Equal(len(wantConns)))
-	attestorExpectConns(g, a.Conns(), wantConns)
+	g.Expect(a.Calls()).To(Equal(len(wantPeers)))
+	attestorExpectPeers(g, a.Peers(), wantPeers)
 }
 
-func TestAttestorConns_ReturnedSliceMutated_FakeIsUnaffected(t *testing.T) {
+func TestAttestorPeers_ReturnedSliceMutated_FakeIsUnaffected(t *testing.T) {
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 
 	_, err := a.Attest(ctx, conn)
 	g.Expect(err).ToNot(HaveOccurred())
 
-	recorded := a.Conns()
+	recorded := a.Peers()
 	g.Expect(recorded).To(HaveLen(1))
 	recorded[0] = nil
 
-	attestorExpectConns(g, a.Conns(), []net.Conn{conn})
+	attestorExpectPeers(g, a.Peers(), []workloadidentity.Peer{conn})
 }
 
 func TestAttestorAttest_Func_ReceivesCallerArgumentsAndMayCallBackIntoTheFake(t *testing.T) {
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 
 	type funcArgs struct {
 		ctx           context.Context
-		conn          net.Conn
+		conn          workloadidentity.Peer
 		callsSeen     int
 		connsSeenLen  int
-		firstConnSeen net.Conn
+		firstConnSeen workloadidentity.Peer
 	}
 	seen := make(chan funcArgs, 1)
 
 	a := &Attestor{}
-	a.Func = func(funcCtx context.Context, funcConn net.Conn) (*workloadidentity.Workload, error) {
+	a.Func = func(funcCtx context.Context, funcConn workloadidentity.Peer) (*workloadidentity.Workload, error) {
 		// Calls and Conns from inside Func would deadlock if the fake held its
 		// own lock across the callback.
-		conns := a.Conns()
-		var firstConn net.Conn
+		conns := a.Peers()
+		var firstConn workloadidentity.Peer
 		if len(conns) > 0 {
 			firstConn = conns[0]
 		}
@@ -303,14 +301,14 @@ func TestAttestorAttest_Func_ReceivesCallerArgumentsAndMayCallBackIntoTheFake(t 
 	g.Expect(args.firstConnSeen).To(BeIdenticalTo(conn))
 
 	g.Expect(a.Calls()).To(Equal(1))
-	attestorExpectConns(g, a.Conns(), []net.Conn{conn})
+	attestorExpectPeers(g, a.Peers(), []workloadidentity.Peer{conn})
 }
 
 func TestAttestorSetResult_CalledWhileLive_ReplacesCannedBehaviour(t *testing.T) {
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 
 	got, err := a.Attest(ctx, conn)
@@ -330,14 +328,14 @@ func TestAttestorSetResult_CalledWhileLive_ReplacesCannedBehaviour(t *testing.T)
 	attestorExpectWorkload(g, got, attestorOtherWorkload())
 
 	g.Expect(a.Calls()).To(Equal(3))
-	attestorExpectConns(g, a.Conns(), []net.Conn{conn, conn, conn})
+	attestorExpectPeers(g, a.Peers(), []workloadidentity.Peer{conn, conn, conn})
 }
 
 func TestAttestorAttest_GateBlocked_ParksUntilReleasedThenReturnsCannedWorkload(t *testing.T) {
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 	a.Block()
 
@@ -353,7 +351,7 @@ func TestAttestorAttest_GateBlocked_ParksUntilReleasedThenReturnsCannedWorkload(
 	default:
 	}
 	g.Expect(a.Calls()).To(Equal(0))
-	g.Expect(a.Conns()).To(BeEmpty())
+	g.Expect(a.Peers()).To(BeEmpty())
 
 	a.Release()
 
@@ -361,7 +359,7 @@ func TestAttestorAttest_GateBlocked_ParksUntilReleasedThenReturnsCannedWorkload(
 	g.Expect(result.err).ToNot(HaveOccurred())
 	attestorExpectWorkload(g, result.workload, attestorWorkload())
 	g.Expect(a.Calls()).To(Equal(1))
-	attestorExpectConns(g, a.Conns(), []net.Conn{conn})
+	attestorExpectPeers(g, a.Peers(), []workloadidentity.Peer{conn})
 	g.Expect(a.Blocked()).To(Equal(0))
 }
 
@@ -369,7 +367,7 @@ func TestAttestorAttest_SetResultWhileParked_ParkedCallReturnsTheNewResult(t *te
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 	a.Block()
 
@@ -383,14 +381,14 @@ func TestAttestorAttest_SetResultWhileParked_ParkedCallReturnsTheNewResult(t *te
 	g.Expect(result.err).ToNot(HaveOccurred())
 	attestorExpectWorkload(g, result.workload, attestorOtherWorkload())
 	g.Expect(a.Calls()).To(Equal(1))
-	attestorExpectConns(g, a.Conns(), []net.Conn{conn})
+	attestorExpectPeers(g, a.Peers(), []workloadidentity.Peer{conn})
 }
 
 func TestAttestorAttest_ParkedCallContextCancelled_ReturnsContextError(t *testing.T) {
 	g := NewWithT(t)
 	ctx := attestorTestContext(t)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 	a.Block()
 
@@ -406,7 +404,7 @@ func TestAttestorAttest_ParkedCallContextCancelled_ReturnsContextError(t *testin
 	g.Expect(result.err).To(MatchError(context.Canceled))
 	g.Expect(result.workload).To(BeNil())
 	g.Expect(a.Calls()).To(Equal(0))
-	g.Expect(a.Conns()).To(BeEmpty())
+	g.Expect(a.Peers()).To(BeEmpty())
 	g.Expect(a.Blocked()).To(Equal(0))
 
 	// The gate is still closed, so a fresh call parks rather than running.
@@ -452,7 +450,7 @@ func TestAttestorAttest_ContextAlreadyDone_ReturnsContextErrorAndCountsNothing(t
 			g := NewWithT(t)
 			ctx := attestorTestContext(t)
 
-			conn := attestorConn(t)
+			conn := attestorPeer(t)
 			a := &Attestor{Result: attestorWorkload()}
 			if tc.block {
 				a.Block()
@@ -464,7 +462,7 @@ func TestAttestorAttest_ContextAlreadyDone_ReturnsContextErrorAndCountsNothing(t
 			g.Expect(result.err).To(MatchError(tc.wantErr))
 			g.Expect(result.workload).To(BeNil())
 			g.Expect(a.Calls()).To(Equal(0))
-			g.Expect(a.Conns()).To(BeEmpty())
+			g.Expect(a.Peers()).To(BeEmpty())
 			g.Expect(a.Blocked()).To(Equal(0))
 		})
 	}
@@ -476,7 +474,7 @@ func TestAttestorAttest_ManyParkedCalls_AllReturnCannedWorkloadAfterOneRelease(t
 
 	const callers = 5
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 	a.Block()
 
@@ -500,7 +498,7 @@ func TestAttestorAttest_ManyParkedCalls_AllReturnCannedWorkloadAfterOneRelease(t
 	g.Expect(a.Calls()).To(Equal(callers))
 	g.Expect(a.Blocked()).To(Equal(0))
 
-	recorded := a.Conns()
+	recorded := a.Peers()
 	g.Expect(recorded).To(HaveLen(callers))
 	for i := range recorded {
 		g.Expect(recorded[i]).To(BeIdenticalTo(conn), "recorded conn %d", i)
@@ -516,7 +514,7 @@ func TestAttestorAttest_ConcurrentCallers_CountsEveryCallExactlyOnce(t *testing.
 		callsPerCaller = 25
 	)
 
-	conn := attestorConn(t)
+	conn := attestorPeer(t)
 	a := &Attestor{Result: attestorWorkload()}
 
 	failures := make(chan error, callers)
@@ -538,7 +536,7 @@ func TestAttestorAttest_ConcurrentCallers_CountsEveryCallExactlyOnce(t *testing.
 				// Reading the counters concurrently is what the race detector
 				// needs to see.
 				_ = a.Calls()
-				_ = a.Conns()
+				_ = a.Peers()
 			}
 		}()
 	}
@@ -552,7 +550,7 @@ func TestAttestorAttest_ConcurrentCallers_CountsEveryCallExactlyOnce(t *testing.
 	g.Expect(collected).To(BeEmpty())
 
 	g.Expect(a.Calls()).To(Equal(callers * callsPerCaller))
-	recorded := a.Conns()
+	recorded := a.Peers()
 	g.Expect(recorded).To(HaveLen(callers * callsPerCaller))
 	for i := range recorded {
 		g.Expect(recorded[i]).To(BeIdenticalTo(conn), "recorded conn %d", i)
