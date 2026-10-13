@@ -30,6 +30,7 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/kube"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
@@ -45,6 +46,7 @@ const wiTestNode = "node-1"
 var wiOpts = handlers.WorkloadIdentityServerOpts{
 	Enabled:             true,
 	ClusterName:         "test-cluster",
+	NodeKubeconfig:      "/etc/kubernetes/kubelet/kubeconfig",
 	MaxCacheSize:        100,
 	X509SVIDDuration:    12 * time.Hour,
 	JWTSVIDDuration:     time.Hour,
@@ -600,7 +602,7 @@ func TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSourc
 
 // TestWorkloadIdentityServers_Off_BuildsNothing proves the feature off builds no
 // node client, no token source for the credential cache, no tier and no socket,
-// so boot reaches neither the API server nor the kubelet's kubeconfig.
+// so boot reaches no API server.
 func TestWorkloadIdentityServers_Off_BuildsNothing(t *testing.T) {
 	g := NewWithT(t)
 	builds := countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))
@@ -619,17 +621,28 @@ func TestWorkloadIdentityServers_Off_BuildsNothing(t *testing.T) {
 }
 
 // TestNewWorkloadIdentityClients_On_BuildsOneNodeClient proves the feature on
-// builds the node client once, from the default kubeconfig, and the minter over
-// it.
+// builds the node client once, from the options' kubeconfig, AWS config and
+// cluster, and the minter over it.
 func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
 	g := NewWithT(t)
 	client := newWINodeClientset("system:node:" + wiTestNode)
 	builds := countNodeClientBuilds(t, client)
+	counting := newNodeClient
+	var built kube.NodeClientOpts
+	newNodeClient = func(opts kube.NodeClientOpts) (kubernetes.Interface, error) {
+		built = opts
+		return counting(opts)
+	}
+	opts := wiOpts
+	opts.Cfg = aws.Config{Region: "us-west-2"}
 
-	clients, err := newWorkloadIdentityClients(t.Context(), wiOpts)
+	clients, err := newWorkloadIdentityClients(t.Context(), opts)
 
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(builds.Load()).To(Equal(int32(1)))
+	g.Expect(built).To(Equal(kube.NodeClientOpts{
+		KubeconfigPath: opts.NodeKubeconfig, Cfg: opts.Cfg, ClusterName: opts.ClusterName,
+	}))
 	g.Expect(clients.clientset).To(BeIdenticalTo(client))
 	g.Expect(clients.minter).ToNot(BeNil())
 	g.Expect(clients.credentialTokens()).ToNot(BeNil())
@@ -650,11 +663,8 @@ func countNodeClientBuilds(t *testing.T, client kubernetes.Interface) *atomic.In
 	t.Helper()
 	var builds atomic.Int32
 	original := newNodeClient
-	newNodeClient = func(kubeconfigPath string) (kubernetes.Interface, error) {
+	newNodeClient = func(kube.NodeClientOpts) (kubernetes.Interface, error) {
 		builds.Add(1)
-		if kubeconfigPath != "" {
-			t.Errorf("the node client must come from the default kubeconfig, got %q", kubeconfigPath)
-		}
 		return client, nil
 	}
 	t.Cleanup(func() { newNodeClient = original })
@@ -683,7 +693,7 @@ func TestServerCmd_EnableWorkloadIdentity_IsOffByDefault(t *testing.T) {
 func TestBuildSharedCredentialManager_OnAndFailing_NamesTheOptOut(t *testing.T) {
 	g := NewWithT(t)
 	original := newNodeClient
-	newNodeClient = func(string) (kubernetes.Interface, error) {
+	newNodeClient = func(kube.NodeClientOpts) (kubernetes.Interface, error) {
 		return nil, errors.New("no kubeconfig")
 	}
 	t.Cleanup(func() { newNodeClient = original })

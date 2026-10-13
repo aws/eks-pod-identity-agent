@@ -47,6 +47,8 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		// Half life, which STS recommended on 2026-10-02.
 		{flag: handlers.FlagSVIDRenewalFraction, expectedDefault: "0.5"},
 		{flag: handlers.FlagSVIDRenewalJitter, expectedDefault: "0.1"},
+		// Empty is the in-cluster API server, which every chart install has.
+		{flag: handlers.FlagNodeKubeconfig, expectedDefault: ""},
 		{
 			flag:               handlers.FlagSVIDKeyType,
 			expectedDefault:    string(workloadidentity.DefaultKeyType),
@@ -106,6 +108,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 		// which the token tier reads rather than defining a second one, so this
 		// asserts the shared value arrives and not just that the field exists.
 		"--max-cache-size=512",
+		"--node-kubeconfig=/etc/kubernetes/kubelet/kubeconfig",
 	})
 	g.Expect(err).ToNot(HaveOccurred())
 
@@ -120,6 +123,7 @@ func TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions(t *testing.T)
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.75))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.25))
 	g.Expect(opts.MaxCacheSize).To(Equal(512))
+	g.Expect(opts.NodeKubeconfig).To(Equal("/etc/kubernetes/kubelet/kubeconfig"))
 }
 
 // TestNewWorkloadIdentityServerOpts_AnOutOfEnvelopeFlag_FailsValidation is the
@@ -154,8 +158,10 @@ func restoreWorkloadIdentityFlags(t *testing.T) {
 	// test that parses it would otherwise leave the AWS credentials cache resized
 	// for every test that runs after it.
 	originalMaxCacheSize := maxCacheSize
+	originalNodeKubeconfig := nodeKubeconfig
 
 	t.Cleanup(func() {
+		nodeKubeconfig = originalNodeKubeconfig
 		clusterName = originalCluster
 		x509SVIDDuration = originalX509
 		jwtSVIDDuration = originalJWT
@@ -195,8 +201,8 @@ func TestShareCredentialManager_HandsTheManagersPartsToBothServers(t *testing.T)
 }
 
 // TestCreateServers_WorkloadIdentityOff_BuildsNoNodeClient proves boot with
-// workload identity off builds no node client, so it needs neither the API
-// server nor the kubelet's kubeconfig. Nothing listens until the servers run.
+// workload identity off builds no node client, so it needs no API server.
+// Nothing listens until the servers run.
 func TestCreateServers_WorkloadIdentityOff_BuildsNoNodeClient(t *testing.T) {
 	g := NewWithT(t)
 	builds := countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))

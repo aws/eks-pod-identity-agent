@@ -9,6 +9,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
@@ -138,4 +139,23 @@ func TestResolveNodeNameWithRetry_ATransientFailure_IsRetried(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(name).To(Equal(testNode))
 	g.Expect(calls.Load()).To(BeEquivalentTo(3))
+}
+
+// TestResolveNodeNameWithRetry_ARefusedCredential_GivesUpNamingTheCause proves a
+// boot that gives up reports the last failure and what a 401 usually means,
+// rather than only that the retry timed out.
+func TestResolveNodeNameWithRetry_ARefusedCredential_GivesUpNamingTheCause(t *testing.T) {
+	g := NewWithT(t)
+	fastNodeNameBackoff(t)
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("create", "selfsubjectreviews",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewUnauthorized("Unauthorized")
+		})
+
+	_, err := ResolveNodeNameWithRetry(context.Background(), client)
+
+	g.Expect(err).To(MatchError(ContainSubstring("gave up retrying")))
+	g.Expect(apierrors.IsUnauthorized(err)).To(BeTrue(), "the cause has to stay inspectable")
+	g.Expect(err).To(MatchError(ContainSubstring("access entry")))
 }

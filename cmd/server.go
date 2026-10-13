@@ -41,6 +41,7 @@ var (
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
 	// package configuration and deliberately not flags.
 	enableWorkloadIdentity bool
+	nodeKubeconfig         string
 	x509SVIDDuration       time.Duration
 	jwtSVIDDuration        time.Duration
 	svidRenewalFraction    float64
@@ -227,6 +228,7 @@ func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServ
 	return handlers.WorkloadIdentityServerOpts{
 		Enabled:             enableWorkloadIdentity,
 		Cfg:                 cfg,
+		NodeKubeconfig:      nodeKubeconfig,
 		ClusterName:         clusterName,
 		MaxCacheSize:        maxCacheSize,
 		X509SVIDDuration:    x509SVIDDuration,
@@ -279,7 +281,9 @@ func init() {
 		"Enable consuming credentials from IMDS when available on the node")
 
 	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, false,
-		"Serve SPIFFE workload identity on its socket. Off by default, and then boot needs neither the API server nor the kubelet's kubeconfig. On, the agent exits at boot if it can't reach the API server as the node")
+		"Serve SPIFFE workload identity on its socket. When on, boot fails if the API server can't be reached as the node")
+	serverCmd.Flags().StringVar(&nodeKubeconfig, handlers.FlagNodeKubeconfig, "",
+		"Kubeconfig workload identity reaches the API server with. Empty uses the in-cluster API server and CA, and the agent authenticates as the node with an IAM token signed from its AWS credentials. A kubeconfig whose user runs an exec plugin gets the same IAM token in place of the plugin; any other user (client certificate, token) is used as is, so it must be the node")
 
 	// Workload identity. Each requested SVID lifetime is a ceiling and not a
 	// grant: STS issues the least of what is asked for and what it allows, and

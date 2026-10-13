@@ -151,9 +151,9 @@ imagePullSecrets: []
 
 # Workload identity: the agent's socket, the CSI driver sidecar that publishes it, the
 # CSIDriver object and the host PID namespace attestation needs. Off by default. Isolated
-# regions never get it, whatever this says. Not usable yet: the chart doesn't give the agent
-# a node credential, so turning it on crash-loops the agent. See "Workload identity" in the
-# chart README.
+# regions never get it, whatever this says. The agent authenticates as the node with an IAM
+# token from the node's role, so the agent's ServiceAccount must carry no IAM role. See
+# "Workload identity" in the chart README.
 workloadIdentity:
   enabled: false
 
@@ -201,6 +201,7 @@ serviceAccount:
   create: false
   # Annotations to add to the ServiceAccount when create is true (e.g. for
   # IRSA / EKS Pod Identity associations on the agent itself, if desired).
+  # Not with workloadIdentity.enabled, which needs the node's role.
   annotations: {}
   # The ServiceAccount name to use.
   #   create=true,  name=""       -> chart-managed name (fullname template)

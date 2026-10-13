@@ -49,7 +49,7 @@ The following table lists the configurable parameters for this chart and their d
 | `resources`               | Resources for the agent container                       | `{}`                     |
 | `tolerations`             | Optional deployment tolerations                         | `all`                    |
 | `updateStrategy`          | Optional update strategy                                | `type: RollingUpdate`    |
-| `workloadIdentity.enabled`| Serve workload identity (not usable yet; see below)     | `false`                  |
+| `workloadIdentity.enabled`| Serve workload identity; see below                      | `false`                  |
 
 Specify each parameter using the `--set key=value[,key=value]` argument to `helm install` or provide a YAML file
 containing the values for the above parameters.
@@ -63,15 +63,39 @@ Isolated regions never get any of it, whatever the value says. Turn it on only w
 built with workload identity, which ships `/eks-pod-identity-csi-driver`. Images without it
 (every release through v0.2.5) reject the flag and crash-loop.
 
-Not usable yet. With it on, the agent builds its node client from
-`/var/lib/kubelet/kubeconfig`, which this chart doesn't mount, so every agent pod exits at boot
-and crash-loops, taking the Pod Identity credential endpoint on that node down with it. The
-node credential comes in a later change. With it off, the rendered manifest has no workload
-identity piece at all.
+With it off, the rendered manifest has no workload identity piece at all.
 
-Pass the flag through this value, not `agent.additionalArgs`. That map renders a key and its
-value as two arguments, and the agent reads a bare `--enable-workload-identity` as true and
-ignores a separate `false`.
+Pass `--enable-workload-identity` through `workloadIdentity.enabled`, not `agent.additionalArgs`.
+That map renders a key and its value as two arguments, and the agent reads a bare
+`--enable-workload-identity` as true and ignores a separate `false`.
+
+### Node credential
+
+Workload identity reads pods and mints their ServiceAccount tokens as the node
+(`system:node:<name>`), which the Node authorizer scopes to pods on that node. The agent reaches
+the API server through the in-cluster `kubernetes` Service and its CA, and authenticates with an
+IAM token it signs from its own AWS credentials, the way the kubelet's exec plugin does. Those
+credentials are the node's role (IMDS on EC2, the mounted credentials file on hybrid nodes), and
+the cluster's access entry (or `aws-auth` entry) for that role maps the token to the node. The
+chart mounts no kubeconfig or kubelet credential from the host.
+
+Two consequences:
+
+- The agent's ServiceAccount must carry no IAM role. With IRSA (or a Pod Identity association)
+  on it, the agent signs as that role, can't resolve its node, and exits at boot.
+- Boot needs the `kubernetes` Service reachable, which on a new node waits for kube-proxy. The
+  agent retries for about 30 seconds (longer when connections hang, since each attempt can wait
+  up to 30 seconds to connect), then exits. Workload identity failures at boot are fatal: the
+  kubelet restarts the agent with backoff, and the Pod Identity credential endpoint on that node
+  stays down until a boot succeeds.
+
+Clusters without IAM authentication, such as kind, point the agent at a kubeconfig with a client
+certificate instead: set `agent.additionalArgs` to `{"--node-kubeconfig": <path>}` (a string flag,
+so the two-argument rendering is fine) and mount the file and its certificate with
+`daemonsets.<name>.volumes` and `volumeMounts`. Those lists replace the chart's defaults, so copy
+the `jwk-cache` volume and mount from `values.yaml` into yours (and `aws-credentials` on the
+hybrid DaemonSets). A kubeconfig whose user runs an exec plugin is read for its server and CA
+only; the agent still signs the IAM token.
 
 ### CSI driver
 

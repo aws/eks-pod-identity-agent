@@ -27,6 +27,7 @@ import (
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -40,6 +41,12 @@ import (
 // hold; that is a startup failure, not a value to strip blindly.
 const nodeUsernamePrefix = "system:node:"
 
+// credentialHint names what a refused or non-node credential most often means, on
+// both credential paths the node client has.
+const credentialHint = "the agent must present the node credential. With the IAM token, its AWS credentials " +
+	"must be the node's role, mapped to the node by an access entry, and its ServiceAccount must carry no IAM " +
+	"role; with a --node-kubeconfig user other than exec, that user must be the node"
+
 // errNotANode marks an authenticated identity that is not a node, which no retry
 // can change: a ServiceAccount, anonymous, or system:node: with an empty name.
 var errNotANode = errors.New("not a node identity")
@@ -51,14 +58,17 @@ var errNotANode = errors.New("not a node identity")
 func ResolveNodeName(ctx context.Context, clientset kubernetes.Interface) (string, error) {
 	res, err := clientset.AuthenticationV1().SelfSubjectReviews().Create(
 		ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if apierrors.IsUnauthorized(err) {
+		return "", fmt.Errorf("creating SelfSubjectReview: %w: %s", err, credentialHint)
+	}
 	if err != nil {
 		return "", fmt.Errorf("creating SelfSubjectReview: %w", err)
 	}
 
 	username := res.Status.UserInfo.Username
 	if !strings.HasPrefix(username, nodeUsernamePrefix) {
-		return "", fmt.Errorf("authenticated as %q, which is %w (%s...): the agent must present the node credential",
-			username, errNotANode, nodeUsernamePrefix)
+		return "", fmt.Errorf("authenticated as %q, which is %w (%s...): %s",
+			username, errNotANode, nodeUsernamePrefix, credentialHint)
 	}
 
 	nodeName := strings.TrimPrefix(username, nodeUsernamePrefix)
@@ -87,6 +97,8 @@ func ResolveNodeNameWithRetry(ctx context.Context, clientset kubernetes.Interfac
 	log := logger.FromContext(ctx)
 
 	var nodeName string
+	// lastErr is the cause a give-up reports: the backoff's own error says only that it timed out.
+	var lastErr error
 	err := wait.ExponentialBackoffWithContext(ctx, nodeNameBackoff, func(ctx context.Context) (bool, error) {
 		name, err := ResolveNodeName(ctx, clientset)
 		if err != nil {
@@ -94,12 +106,16 @@ func ResolveNodeNameWithRetry(ctx context.Context, clientset kubernetes.Interfac
 			if errors.Is(err, errNotANode) {
 				return false, err
 			}
+			lastErr = err
 			log.Warnf("resolving node name, will retry: %v", err)
 			return false, nil
 		}
 		nodeName = name
 		return true, nil
 	})
+	if wait.Interrupted(err) && lastErr != nil {
+		return "", fmt.Errorf("resolving node name: gave up retrying: %w", lastErr)
+	}
 	if err != nil {
 		return "", fmt.Errorf("resolving node name: %w", err)
 	}
