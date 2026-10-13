@@ -22,6 +22,7 @@ const (
 	FlagSVIDRenewalFraction    = "svid-renewal-fraction"
 	FlagSVIDRenewalJitter      = "svid-renewal-jitter"
 	FlagSVIDKeyType            = "svid-key-type"
+	FlagNodeKubeconfig         = "node-kubeconfig"
 )
 
 // WorkloadIdentityServerOpts carries configuration from the command line into
@@ -37,11 +38,15 @@ const (
 // server is given its addr today.
 type WorkloadIdentityServerOpts struct {
 	// Enabled is whether the agent serves the workload identity socket at all.
-	// Off, it builds no workload identity tier, so boot needs neither the API
-	// server nor the kubelet's kubeconfig. Validate does not read it.
+	// Off, it builds no workload identity tier, so boot needs no API server.
+	// Validate does not read it.
 	Enabled bool
-	// Cfg is the AWS configuration the STS and EKS Auth clients are built from.
+	// Cfg is the AWS configuration the STS and EKS Auth clients are built from,
+	// and that signs the node client's IAM token.
 	Cfg aws.Config
+	// NodeKubeconfig is the kubeconfig the node client reads. Empty means the
+	// in-cluster server and CA. See kube.NodeClientOpts.
+	NodeKubeconfig string
 	// ClusterName is the EKS cluster the agent runs in.
 	ClusterName string
 	// MaxCacheSize bounds each per-pod cache, in entries. It is --max-cache-size,

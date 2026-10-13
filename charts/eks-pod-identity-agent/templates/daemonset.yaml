@@ -1,9 +1,9 @@
 {{- $top := . -}}
 {{- /*
-Whether this install gets the workload identity CSI driver sidecar and socket mount; see
-the helper and "Workload identity CSI driver" in the chart README.
+Whether this install gets workload identity; see the helper and "Workload identity" in
+the chart README.
 */ -}}
-{{- $enableWorkloadIdentityCSI := eq (include "eks-pod-identity-agent.enableWorkloadIdentityCSI" $top) "true" -}}
+{{- $enableWorkloadIdentity := eq (include "eks-pod-identity-agent.enableWorkloadIdentity" $top) "true" -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -41,8 +41,10 @@ spec:
       serviceAccountName: {{ . }}
       {{- end }}
       hostNetwork: true
+      {{- if $enableWorkloadIdentity }}
       {{- /* Attestation needs the peer's PID: without it SO_PEERCRED reports 0. */}}
       hostPID: true
+      {{- end }}
       terminationGracePeriodSeconds: 30
       {{- with $top.Values.tolerations }}
       tolerations:
@@ -92,6 +94,10 @@ spec:
             - "--metrics-port"
             - {{ $top.Values.metrics.port | quote }}
             {{- end }}
+            {{- if $enableWorkloadIdentity }}
+            {{- /* One token: pflag reads a bare bool flag as true and ignores a separate value. */}}
+            - "--enable-workload-identity=true"
+            {{- end }}
             {{- range $key, $value := $top.Values.agent.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}
@@ -123,13 +129,15 @@ spec:
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
+          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $enableWorkloadIdentity $daemonset.volumeMounts }}
           volumeMounts:
+          {{- end }}
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: ca-bundle
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
           {{- end }}
-          {{- if $enableWorkloadIdentityCSI }}
+          {{- if $enableWorkloadIdentity }}
           {{- /* The agent binds its socket here; the CSI driver sidecar publishes it. */}}
           - name: workload-identity-socket-dir
             mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
@@ -168,12 +176,12 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
-        {{- if $enableWorkloadIdentityCSI }}
+        {{- if $enableWorkloadIdentity }}
         {{- /*
         The workload identity CSI node plugin, a separate binary in the agent's image. It is
         privileged, because Kubernetes allows Bidirectional propagation only there, so the
         agent above does not have to be. Each kubelet mountPath must equal its host path.
-        See "Workload identity CSI driver" in the chart README.
+        See "Workload identity" in the chart README.
         */}}
         - name: {{ $top.Chart.Name }}-csi-driver
           image: {{ include "eks-pod-identity-agent.image" $ }}
@@ -205,16 +213,19 @@ spec:
             privileged: true
             readOnlyRootFilesystem: true
           resources:
-            {{- toYaml $top.Values.csiDriver.resources | nindent 12 }}
+            {{- /* Nil-safe: helm upgrade --reuse-values keeps an older chart's values, which have no csiDriver. */}}
+            {{- toYaml (default (dict) (default (dict) $top.Values.csiDriver).resources) | nindent 12 }}
         {{- end }}
+      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $enableWorkloadIdentity $daemonset.volumes }}
       volumes:
+      {{- end }}
         {{- if contains "-iso" $top.Values.env.AWS_REGION }}
         - name: ca-bundle
           hostPath:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
         {{- end }}
-        {{- if $enableWorkloadIdentityCSI }}
+        {{- if $enableWorkloadIdentity }}
         {{- /*
         Workload identity CSI volumes. The hostPath types are deliberate; see the chart
         README.

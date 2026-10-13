@@ -1,14 +1,11 @@
 {{- /*
-The cluster-scoped CSIDriver object for the workload identity socket. The chart owns it
-and there is no values knob.
+The cluster-scoped CSIDriver object for the workload identity socket. The chart owns it,
+and renders it only when workload identity is on (never in an isolated region).
 
-Not rendered in isolated regions, where workload identity is not enabled.
-
-See "Workload identity CSI driver" in the chart README for why the chart owns this object,
-why it is inert on clusters not using workload identity, which fields are immutable, and
-what the tokenRequests declaration is for.
+See "Workload identity" in the chart README for why the chart owns this object, which
+fields are immutable, and what the tokenRequests declaration is for.
 */}}
-{{- if eq (include "eks-pod-identity-agent.enableWorkloadIdentityCSI" .) "true" }}
+{{- if eq (include "eks-pod-identity-agent.enableWorkloadIdentity" .) "true" }}
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:

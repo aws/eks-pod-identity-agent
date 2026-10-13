@@ -39,18 +39,21 @@ type workloadIdentityClients struct {
 	minter    workloadidentity.TokenMinter
 }
 
-// newNodeClient builds the node client from the kubelet's kubeconfig. Tests
-// replace it.
+// newNodeClient builds the node client. Tests replace it.
 var newNodeClient = kube.NewNodeClient
 
 // newWorkloadIdentityClients builds the clients when workload identity is on,
 // blocking until the node name resolves. Off, it builds nothing and returns nil,
-// so boot needs neither the API server nor the kubelet's kubeconfig.
+// so boot needs no API server.
 func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
 	if !opts.Enabled {
 		return nil, nil
 	}
-	clientset, err := newNodeClient("")
+	clientset, err := newNodeClient(kube.NodeClientOpts{
+		KubeconfigPath: opts.NodeKubeconfig,
+		Cfg:            opts.Cfg,
+		ClusterName:    opts.ClusterName,
+	})
 	if err != nil {
 		return nil, err
 	}
