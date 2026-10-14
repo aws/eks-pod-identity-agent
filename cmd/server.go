@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -91,6 +92,18 @@ func startServers(pCtx context.Context, cfg aws.Config) {
 }
 
 func createServers(ctx context.Context, cfg aws.Config) []*server.Server {
+	log := logger.FromContext(ctx)
+
+	// Refuse to start if the credential server is pointed at anything other
+	// than a node-local address. The agent vends AWS credentials in exchange
+	// for a service-account token, and its only locality control assumes the
+	// listener is reachable solely from the node. Binding a routable address
+	// (e.g. 0.0.0.0, which also covers the node's VPC IP) would expose the
+	// credential endpoint to the rest of the network.
+	if err := validateBindHosts(bindHosts); err != nil {
+		log.Fatal(err)
+	}
+
 	servers := make([]*server.Server, len(bindHosts))
 	// listen on all bindHosts
 	for i, ip := range bindHosts {
@@ -110,6 +123,41 @@ func createServers(ctx context.Context, cfg aws.Config) []*server.Server {
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 	return servers
+}
+
+// validateBindHosts returns an error if any requested credential-server bind
+// host is not node-local. Only loopback and the two link-local target hosts the
+// agent authorizes against are permitted; anything else (notably 0.0.0.0) would
+// move the credential listener onto a network-reachable address.
+func validateBindHosts(hosts []string) error {
+	for _, h := range hosts {
+		if !isNodeLocalBindHost(h) {
+			return fmt.Errorf(
+				"refusing to bind credential server to non-node-local host %q; "+
+					"only loopback and the link-local hosts %s / %s are permitted",
+				h, configuration.DefaultIpv4TargetHost, configuration.DefaultIpv6TargetHost)
+		}
+	}
+	return nil
+}
+
+// isNodeLocalBindHost reports whether host is safe to bind the credential
+// server to: loopback, localhost, or one of the agent's link-local target
+// hosts. IPv6 hosts may arrive bracketed (e.g. "[fd00:ec2::23]").
+func isNodeLocalBindHost(host string) bool {
+	if len(host) > 1 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() ||
+		ip.Equal(net.ParseIP(configuration.DefaultIpv4TargetHost)) ||
+		ip.Equal(net.ParseIP(configuration.DefaultIpv6TargetHost))
 }
 
 func overrideEndpointInCfg(log *logrus.Entry, cfg *aws.Config, endpoint string) {
