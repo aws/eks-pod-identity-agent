@@ -8,15 +8,15 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// Attest resolves the caller from the connection in ctx. Failures are
-// ErrUnattestable.
+// Attest resolves the caller from the Peer the transport pinned for this RPC's
+// connection. Failures are ErrUnattestable.
 func Attest(ctx context.Context, attestor workloadidentity.Attestor) (*workloadidentity.Workload, error) {
-	conn, ok := grpcserver.ConnFromContext(ctx)
+	peer, ok := grpcserver.PeerFromContext(ctx)
 	if !ok {
-		return nil, errors.ErrUnattestable.Wrapf(nil, "the caller's connection is not available, so it cannot be attested")
+		return nil, errors.ErrUnattestable.Wrapf(nil, "attestation refused")
 	}
 
-	caller, err := attestor.Attest(ctx, conn)
+	caller, err := attestor.Attest(ctx, peer)
 	if err != nil {
 		return nil, err
 	}

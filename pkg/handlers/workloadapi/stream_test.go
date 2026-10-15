@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -687,7 +686,7 @@ func TestStreams_NonRetryableErrorEndsTheStreamWithItsMappedCode(t *testing.T) {
 			name: "attest unattestable",
 			pod:  podA,
 			configure: func(h *harness, _ streamRPC) {
-				h.attestor.Func = func(context.Context, net.Conn) (*workloadidentity.Workload, error) {
+				h.attestor.Func = func(context.Context, workloadidentity.Peer) (*workloadidentity.Workload, error) {
 					return nil, wierrors.ErrUnattestable.Wrapf(nil, "no pod owns the caller")
 				}
 			},

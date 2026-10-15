@@ -1,21 +1,23 @@
-package attestation
+package grpcserver
 
 // This file covers the first link in the attestation chain: turning an accepted
 // Unix socket connection into the kernel-attested identity of the process on the
-// other end, and guarding that identity against PID reuse for the lifetime of
-// the resolution.
+// other end, and guarding that identity against PID reuse for the life of the
+// connection.
 //
 // The property the whole design rests on is that SO_PEERCRED reports the
 // credentials the kernel captured when the peer called connect(2). The caller
 // cannot set or forge them. Everything downstream trusts this, so the ordering
 // here is the substance of the defence, not incidental: the /proc handle is
-// opened before anything else touches the PID, and it is rechecked after the pod
-// has been resolved. See T3 for why.
+// opened at the handshake before anything else touches the PID, and every RPC
+// rechecks it around the pod resolution. This is the tier for every kernel;
+// peer.go has the Peer type and the SO_PEERPIDFD tier.
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -31,7 +33,7 @@ import (
 // its own peer.
 var procRoot = "/proc"
 
-// Sentinel errors classifying why a peer could not be established. The attestor
+// Sentinel errors classifying why a peer could not be established. pinReason
 // maps each onto a metric reason with errors.Is; they are not returned to the
 // caller directly (the attestor wraps ErrUnattestable), so they carry no metric
 // label of their own.
@@ -50,28 +52,23 @@ var (
 	// errPeerGone means the peer process could not be pinned under /proc because
 	// it had already exited.
 	errPeerGone = errors.New("peer process is gone")
-	// errLivenessRecheckFailed means the peer handle failed the recheck after
-	// pod resolution, so the resolved identity can no longer be trusted.
+	// errLivenessRecheckFailed means the peer handle failed the recheck, at the
+	// handshake or on an RPC, so the connection's identity can't be trusted.
 	errLivenessRecheckFailed = errors.New("peer liveness recheck failed")
 )
 
-// peerConn is the seam between the attestor and the kernel-attested peer. It is
-// an interface so the attestor can be unit-tested with a fake peer that records
-// the order of recheck relative to pod resolution, while production uses the
-// real peerHandle over a Unix socket.
+// peerConn is a tier's hold on the peer process: peerHandle here, pidfdPin on
+// kernels with SO_PEERPIDFD. A Peer keeps one for the life of its connection.
 type peerConn interface {
-	// pid is the peer's process ID in the agent's PID namespace, captured by
-	// the kernel at connect time.
-	pid() int
 	// recheck confirms the handle still refers to the same process it did when
-	// it was opened. It must be called after pod resolution.
+	// it was opened. Peer.Alive calls it before and after every resolution.
 	recheck() error
 	// close releases the /proc handle.
 	close() error
 }
 
 // peerHandle is a live handle to the peer process. procDir is kept open for the
-// whole resolution: it pins the original process's /proc directory, so a read
+// life of the connection: it pins the original process's /proc directory, so a read
 // through it fails once the process exits rather than silently resolving a
 // different process that inherited the PID.
 type peerHandle struct {
@@ -87,7 +84,7 @@ type peerHandle struct {
 // PID 0, then open the /proc handle before reading anything else about the PID,
 // and record the process start time through that handle. A caller that has
 // already exited is refused here rather than misattributed.
-func peerFromConn(conn net.Conn) (peerConn, error) {
+func peerFromConn(conn net.Conn, method pinMethod) (*Peer, error) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
 		return nil, errNotUnixSocket
@@ -118,11 +115,25 @@ func peerFromConn(conn net.Conn) (peerConn, error) {
 		return nil, errPeerPIDZero
 	}
 
+	if method == pinSocketPidfd {
+		return peerFromPidfd(conn, raw, int(ucred.Pid))
+	}
+	h, err := newPeerHandle(ucred)
+	if err != nil {
+		return nil, err
+	}
+	return &Peer{pid: h.procPID, conn: conn, pin: h}, nil
+}
+
+// newPeerHandle pins the process ucred names through /proc, and checks its owner
+// at once, which refuses a PID reused before the handshake by another uid or gid.
+// That is all this tier can catch of such a reuse, as in SPIRE.
+func newPeerHandle(ucred *unix.Ucred) (*peerHandle, error) {
 	// Pin the process before reading anything else about the PID. This is the
 	// narrowest possible reuse window.
 	procDir, err := os.Open(filepath.Join(procRoot, strconv.Itoa(int(ucred.Pid))))
 	if err != nil {
-		return nil, fmt.Errorf("%w: opening /proc handle: %v", errPeerGone, err)
+		return nil, procOpenErr("opening /proc handle", err)
 	}
 
 	h := &peerHandle{
@@ -135,21 +146,31 @@ func peerFromConn(conn net.Conn) (peerConn, error) {
 	startTime, err := h.readStartTime()
 	if err != nil {
 		_ = h.close()
-		return nil, fmt.Errorf("%w: reading start time: %v", errPeerGone, err)
+		return nil, procOpenErr("reading start time", err)
 	}
 	h.startTime = startTime
 
+	if err := h.recheck(); err != nil {
+		_ = h.close()
+		return nil, err
+	}
 	return h, nil
 }
 
-func (h *peerHandle) pid() int { return h.procPID }
+// procOpenErr classifies a failed /proc read at the handshake. Only a missing
+// process is peer_gone; an LSM or hidepid refusal is not evidence it exited.
+func procOpenErr(what string, err error) error {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("%w: %s: %v", errPeerGone, what, err)
+	}
+	return fmt.Errorf("%w: %s: %v", errPeerCredFailed, what, err)
+}
 
 // recheck confirms the pinned process is still the same one SO_PEERCRED
-// reported. It reads three things through the retained handle rather than by
-// path, so a PID that has been reused since the handle was opened is detected:
-// the /proc directory still fstats (the process still exists), its owning UID
-// and GID still match what the kernel reported, and its start time is unchanged.
-// Any mismatch is a refusal.
+// reported, reading through the retained handle rather than by path: the handle
+// still fstats, its owner still matches, and its start time is unchanged. The
+// start time is what catches a reaped process, since fstat then still succeeds
+// and reports 0:0. Any mismatch is a refusal.
 func (h *peerHandle) recheck() error {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(h.procDir.Fd()), &st); err != nil {

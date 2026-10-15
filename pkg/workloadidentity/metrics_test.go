@@ -290,6 +290,7 @@ func TestMetricNames_Declared_MatchesExpectedListExactly(t *testing.T) {
 	g := NewWithT(t)
 
 	expected := []string{
+		"workload_identity_peer_pin_total",
 		"workload_identity_attestation_total",
 		"workload_identity_attestation_duration_seconds",
 		"workload_identity_token_mint_total",
@@ -345,6 +346,7 @@ func TestMetricNames_ByInstrumentKind_HasExpectedSuffix(t *testing.T) {
 		metric     string
 		wantSuffix string
 	}{
+		{name: "peer pin counter", metric: MetricPeerPinTotal, wantSuffix: "_total"},
 		{name: "attestation counter", metric: MetricAttestationTotal, wantSuffix: "_total"},
 		{name: "attestation histogram", metric: MetricAttestationDuration, wantSuffix: "_duration_seconds"},
 		{name: "token mint counter", metric: MetricTokenMintTotal, wantSuffix: "_total"},

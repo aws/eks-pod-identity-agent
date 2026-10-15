@@ -28,6 +28,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
@@ -140,6 +141,8 @@ type Server struct {
 	// shutdownWait bounds the graceful stop. It is injected rather than read from
 	// a package constant so a test can use a budget it is willing to wait out.
 	shutdownWait time.Duration
+	// pinMethod is how this kernel lets callers be pinned, logged at start.
+	pinMethod pinMethod
 }
 
 // Opts configures the server. The socket path and the shutdown budget come from
@@ -178,12 +181,13 @@ type Opts struct {
 // bound is worth reporting where the process can still exit non-zero, and a caller
 // holding a Server knows the socket already exists, so nothing has to poll for it.
 func New(opts Opts) (*Server, error) {
+	method := probePinMethod()
 	lis, err := ListenUnix(opts.SocketPath, SocketMode)
 	if err != nil {
 		return nil, err
 	}
 
-	srv := grpc.NewServer(serverOptions(opts)...)
+	srv := grpc.NewServer(serverOptions(opts, peerCredentials{method: method})...)
 	if opts.Register != nil {
 		opts.Register(srv)
 	}
@@ -198,28 +202,16 @@ func New(opts Opts) (*Server, error) {
 		lis:          lis,
 		socketPath:   opts.SocketPath,
 		shutdownWait: shutdownWait,
+		pinMethod:    method,
 	}, nil
 }
 
-// serverOptions builds the gRPC options for the workload identity socket.
-//
-// The interceptor order mirrors the HTTP chain in pkg/server.configureHandler:
-// logger first so everything after it logs with the call's fields, then the gate,
-// then the rate limiter. grpc.ChainUnaryInterceptor and grpc.ChainStreamInterceptor
-// run the slice outermost first, so the order written here is the order that runs.
-// The two chain options must not be mixed with the singular grpc.UnaryInterceptor,
-// which gRPC silently promotes to the outermost position.
-//
-// The chain is written once, as pairs, and both options are derived from it. Two
-// hand-maintained slices would compile with a rule added to one and not the other,
-// or added to both in different positions, and the result would be a server that
-// gates streams and not unary calls, or the reverse. SPIRE assembles its chain the
-// same way for the same reason.
-//
-// One limiter is shared by both halves, because the budget being spent is the
-// agent's admission budget and it should not matter whether a caller spends it on
-// unary calls or on opening streams.
-func serverOptions(opts Opts) []grpc.ServerOption {
+// serverOptions builds the socket's gRPC options. The interceptors run in the
+// order written (logger, gate, limiter, as in pkg/server), from one chain both the
+// unary and stream options derive, so the two can't drift; don't mix in the
+// singular grpc.UnaryInterceptor, which gRPC puts outermost. One limiter serves
+// both, since unary calls and new streams spend the same admission budget.
+func serverOptions(opts Opts, creds credentials.TransportCredentials) []grpc.ServerOption {
 	limiter := opts.RequestLimiter
 	if limiter == nil {
 		limiter = ratelimiter.NewRateLimiter(configuration.WorkloadIdentityRequestRate)
@@ -232,10 +224,6 @@ func serverOptions(opts Opts) []grpc.ServerOption {
 	}
 
 	options := []grpc.ServerOption{
-		// The credentials carry the accepted conn to the handler, which is what
-		// attestation needs and the only supported route to it.
-		grpc.Creds(NewConnCredentials()),
-
 		grpc.ChainUnaryInterceptor(unaryChain(chain)...),
 		grpc.ChainStreamInterceptor(streamChain(chain)...),
 
@@ -254,7 +242,10 @@ func serverOptions(opts Opts) []grpc.ServerOption {
 		}),
 	}
 
-	return append(options, opts.ServerOptions...)
+	options = append(options, opts.ServerOptions...)
+	// Last, so no ServerOptions entry can replace the credentials that pin each
+	// caller. They are the only route from a connection to its Peer.
+	return append(options, grpc.Creds(creds))
 }
 
 // Addr is the socket path the server is bound to. It is the log field cmd tags
@@ -279,7 +270,7 @@ func (s *Server) ListenUntilContextCancelled(ctx context.Context) {
 	served := make(chan error, 1)
 	go func() {
 		log.Infof("Pod Identity Agent version %v", configuration.AgentVersion)
-		log.Info("Starting workload identity gRPC server...")
+		log.Infof("Starting workload identity gRPC server, pinning callers with the %s", s.pinMethod)
 		served <- s.grpc.Serve(s.lis)
 	}()
 

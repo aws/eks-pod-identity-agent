@@ -127,8 +127,8 @@ func newHarness(t *testing.T) *harness {
 }
 
 // serve starts the handler on a Unix socket and returns a client for it. Built
-// with grpcserver.NewConnCredentials and nothing else, since those credentials
-// put the caller's connection on the context, the only route to attestation. The
+// with grpcserver.NewPeerCredentials and nothing else, since those credentials
+// put the caller's pinned Peer on the context, the only route to attestation. The
 // rest of the interceptor chain is grpcserver's own to test.
 func serve(t *testing.T, handler *Handler) secretv3.SecretDiscoveryServiceClient {
 	t.Helper()
@@ -146,7 +146,7 @@ func serve(t *testing.T, handler *Handler) secretv3.SecretDiscoveryServiceClient
 		t.Fatalf("listening on %s: %v", socketPath, err)
 	}
 
-	server := grpc.NewServer(grpc.Creds(grpcserver.NewConnCredentials()))
+	server := grpc.NewServer(grpc.Creds(grpcserver.NewPeerCredentials()))
 	handler.Register(server)
 
 	served := make(chan struct{})
@@ -686,7 +686,7 @@ func TestStreamSecrets_BundleChangeWakesOnlyTheChangedProvider(t *testing.T) {
 	// the fake bundle source has one own-trust-domain for all callers.
 	var mu sync.Mutex
 	attested := 0
-	h.attestor.Func = func(context.Context, net.Conn) (*workloadidentity.Workload, error) {
+	h.attestor.Func = func(context.Context, workloadidentity.Peer) (*workloadidentity.Workload, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		attested++

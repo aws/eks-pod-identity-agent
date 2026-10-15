@@ -3,7 +3,6 @@ package workloadapi
 import (
 	"context"
 	stderrors "errors"
-	"net"
 	"testing"
 	"time"
 
@@ -81,7 +80,7 @@ var (
 	errsAttestPath = errsPath{
 		name: "attest",
 		inject: func(h *harness, err error) {
-			h.attestor.Func = func(context.Context, net.Conn) (*workloadidentity.Workload, error) { return nil, err }
+			h.attestor.Func = func(context.Context, workloadidentity.Peer) (*workloadidentity.Workload, error) { return nil, err }
 		},
 		calls: func(h *harness) int { return h.attestor.Calls() },
 	}
@@ -425,7 +424,7 @@ func errsExpectBlocked(t *testing.T, h *harness, stream errsStream, path errsPat
 // every RPC, rather than reaching a tier with a nil workload.
 func TestErrorMapping_AttestationNamingNoWorkloadIsUnattestable(t *testing.T) {
 	noWorkload := func(h *harness) {
-		h.attestor.Func = func(context.Context, net.Conn) (*workloadidentity.Workload, error) { return nil, nil }
+		h.attestor.Func = func(context.Context, workloadidentity.Peer) (*workloadidentity.Workload, error) { return nil, nil }
 	}
 	tc := errsCase{
 		err:   wierrors.ErrUnattestable,

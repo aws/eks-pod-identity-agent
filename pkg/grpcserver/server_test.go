@@ -18,6 +18,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -451,6 +452,29 @@ func TestRemoveSocket_LeavesASuccessorsSocketAlone(t *testing.T) {
 	srv.RemoveSocket()
 
 	g.Expect(path).To(BeAnExistingFile(), "the successor's socket has to survive")
+}
+
+// TestServerOptions_CannotReplaceThePinningCredentials pins the one exception to
+// ServerOptions winning: a grpc.Creds entry there can't replace the credentials
+// that pin each caller, or every RPC would arrive with no Peer.
+func TestServerOptions_CannotReplaceThePinningCredentials(t *testing.T) {
+	g := NewWithT(t)
+	stub := &stubService{unary: func(ctx context.Context) error {
+		if _, ok := PeerFromContext(ctx); !ok {
+			return status.Error(codes.Internal, "no peer")
+		}
+		return nil
+	}}
+	path := tempSocketPath(t)
+	serve(t, newStubServer(t, stub, Opts{
+		SocketPath:    path,
+		ServerOptions: []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())},
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn := dial(t, path)
+	g.Eventually(func() error { return callUnary(withHeader(ctx), conn) }).WithContext(ctx).Should(Succeed())
 }
 
 // TestServerOptions_TheCallerCanOverrideAnOption pins that Opts.ServerOptions wins,

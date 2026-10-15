@@ -17,6 +17,9 @@ package workloadidentity
 // Metric names. Each comment names the task that owns the collector and the
 // label set it registers with.
 const (
+	// MetricPeerPinTotal counts connections by whether the handshake pinned
+	// their peer. T2: {outcome, reason}.
+	MetricPeerPinTotal = "workload_identity_peer_pin_total"
 	// MetricAttestationTotal counts attestation attempts. T3: {outcome, reason}.
 	MetricAttestationTotal = "workload_identity_attestation_total"
 	// MetricAttestationDuration observes attestation latency. T3: {outcome}.
@@ -94,7 +97,8 @@ const (
 const (
 	// LabelOutcome carries OutcomeSuccess or OutcomeFailure.
 	LabelOutcome = "outcome"
-	// LabelReason carries an attestation failure reason.
+	// LabelReason carries a refusal reason, one of the Reason values, on
+	// MetricPeerPinTotal and MetricAttestationTotal, which use different subsets.
 	LabelReason = "reason"
 	// LabelError carries whatever errors.MetricLabel in pkg/errors returns for
 	// the operation's error, which is one of a taxonomy member's label,
@@ -231,32 +235,35 @@ const (
 	CredentialSourceIMDSFirst = "imds_first"
 )
 
-// Values for LabelReason, one per attestation failure mode.
+// Values for LabelReason. MetricPeerPinTotal (the handshake) carries
+// not_unix_socket, peercred_failed, peer_pid_zero, peer_gone and
+// liveness_recheck_failed; MetricAttestationTotal (each RPC) carries peer_gone,
+// liveness_recheck_failed, the cgroup and pod reasons, and peercred_failed for a
+// missing Peer.
 const (
-	// ReasonNotUnixSocket means the connection was not a Unix socket, so peer
-	// credentials cannot be read. A caller reaching the handler over TCP lands
-	// here.
+	// ReasonNotUnixSocket means the connection was not a Unix socket, so the
+	// handshake refused it before any handler ran.
 	ReasonNotUnixSocket = "not_unix_socket"
-	// ReasonPeerCredFailed means the SO_PEERCRED read on the connection failed.
+	// ReasonPeerCredFailed means reading the kernel's record of the peer
+	// (SO_PEERCRED, SO_PEERPIDFD or /proc/<pid>) failed for a reason other than
+	// the peer exiting, such as an LSM or hidepid denial.
 	ReasonPeerCredFailed = "peercred_failed"
-	// ReasonPeerPIDZero means SO_PEERCRED reported PID 0, which happens when the
-	// peer is in a different PID namespace than the agent. It means the agent is
-	// deployed without hostPID, so it is a deployment bug rather than a caller
-	// error, and T3 alarms on it separately from the other reasons.
+	// ReasonPeerPIDZero means SO_PEERCRED reported PID 0: the peer is in another
+	// PID namespace, so the agent lacks hostPID. A deployment bug, alarmed on
+	// MetricPeerPinTotal; it never reaches MetricAttestationTotal.
 	ReasonPeerPIDZero = "peer_pid_zero"
-	// ReasonPeerGone means the peer process exited before it could be resolved.
+	// ReasonPeerGone means the peer exited before the handshake pinned it, or
+	// before an RPC resolved it.
 	ReasonPeerGone = "peer_gone"
-	// ReasonLivenessRecheckFailed means the peer handle failed the recheck
-	// performed after resolution, so the resolved identity cannot be trusted.
+	// ReasonLivenessRecheckFailed means the pin failed its recheck: at the
+	// handshake (a PID reused by another owner), or after an RPC's resolution.
 	ReasonLivenessRecheckFailed = "liveness_recheck_failed"
 	// ReasonCgroupNoPodUID means no pod UID could be extracted from the peer's
 	// cgroup path.
 	ReasonCgroupNoPodUID = "cgroup_no_pod_uid"
-	// ReasonCgroupReadFailed means reading the peer's /proc/<pid>/cgroup failed
-	// for a reason other than the entry being gone (for example a permission or
-	// I/O error). It is kept distinct from peer_gone because such an error is not
-	// evidence the peer exited: it points at the node or the agent rather than a
-	// racing caller, so an operator alarms on it differently.
+	// ReasonCgroupReadFailed means reading the live peer's /proc/<pid>/cgroup
+	// failed (permission, I/O). A dead pin is counted as peer_gone or
+	// liveness_recheck_failed instead, so this points at the node or the agent.
 	ReasonCgroupReadFailed = "cgroup_read_failed"
 	// ReasonPodNotInStore means the resolved pod UID is absent from the agent's
 	// pod store.
@@ -272,6 +279,7 @@ const (
 // set without reflection.
 func MetricNames() []string {
 	return []string{
+		MetricPeerPinTotal,
 		MetricAttestationTotal,
 		MetricAttestationDuration,
 		MetricTokenMintTotal,
