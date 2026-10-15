@@ -180,6 +180,20 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+podLiveness:
+  # When enabled, the agent watches the pods on its own node and skips renewing
+  # credentials for pods that have terminated, so a burst of pod churn no longer
+  # spends AssumeRoleForPodIdentity calls and EKS Auth rate-limiter capacity on
+  # credentials nobody will read again. See issue #171.
+  #
+  # Enabling this adds a NODE_NAME env (from the downward API) to the agent
+  # container and a ClusterRole/ClusterRoleBinding granting the agent's
+  # ServiceAccount get, list and watch on pods. Default false keeps the chart's
+  # current rendered output unchanged; the agent then renews every cached pod as
+  # before. When serviceAccount.create is false the binding targets the "default"
+  # ServiceAccount the pod runs as.
+  enabled: false
+
 serviceAccount:
   # Whether a ServiceAccount manifest should be created and assigned to the pod.
   # Default false preserves the chart's current rendered output: no SA is created
