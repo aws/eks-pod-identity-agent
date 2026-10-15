@@ -73,6 +73,8 @@ const (
 	defaultRefreshInterval = 60 * time.Second
 	// iamEKSPrefix is the IMDS namespace prefix for EKS pod credentials.
 	iamEKSPrefix = "iam-eks-"
+	syncOpTimeout = 1 * time.Second
+	refreshOpTimeout = 5 * time.Second
 )
 
 type service struct {
@@ -172,14 +174,17 @@ func (s *service) GetIamCredentials(ctx context.Context, request *credentials.Ek
 		return nil, nil, ErrPodNotInMapping
 	}
 
-	cred, err := s.readCredential(ctx, ns, podUID)
+	// Bound the read so the agent still has time to call eksauth if necessary
+	readCtx, cancel := context.WithTimeout(ctx, syncOpTimeout)
+	defer cancel()
+	cred, err := s.readCredential(readCtx, ns, podUID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("IMDS delegate: %w", err)
 	}
 
 	log.WithFields(logrus.Fields{
 		"source":    credentials.SourceIMDS,
-		"namespace": ns,
+		"podUID":    podUID,
 	}).Info("Fetched credentials from IMDS")
 
 	return cred, credentials.CredentialMetadata{CredSource: credentials.SourceIMDS}, nil
@@ -210,16 +215,22 @@ func (s *service) startBackgroundRefresh(ctx context.Context, interval time.Dura
 func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	log := logger.FromContext(ctx)
 
+	// Bound the reads from IMDS - failures will preserve the old mapping
+	ctx, cancel := context.WithTimeout(ctx, refreshOpTimeout)
+	defer cancel()
+
 	namespaces, err := s.discoverNamespaces(ctx)
 	if err != nil {
 		return fmt.Errorf("building namespace mapping: %w", err)
 	}
 
 	newMap := make(map[string]string)
+	anyFailed := false
 	for _, ns := range namespaces {
 		info, err := s.readNamespaceInfo(ctx, ns)
 		if err != nil {
-			log.WithField("namespace", ns).Warnf("Failed to read namespace info, skipping: %v", err)
+			log.WithField("namespace", ns).Warnf("Failed to read namespace info, retaining known pods for it: %v", err)
+			anyFailed = true
 			continue
 		}
 		for podUID, code := range info.PodCredentials {
@@ -232,9 +243,30 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 		}
 	}
 
+	// If unable to read a namespace, keep pods that weren't found in IMDS. This
+	// prevents failed namespace reads from clearing the pod from namespaceMapping,
+	// which would evict the pod from the cache. Instead, the background refresh
+	// process will try again, and in the meantime failures to get creds from IMDS
+	// will fall back to eksauth. Note that this may preserve mappings for deleted pods.
+	if anyFailed {
+		currentMap := s.loadMapping()
+		carryForwardEntries(newMap, currentMap)
+	}
+
 	s.storeMapping(newMap)
-	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces", len(newMap), len(namespaces))
+	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces (completeScan=%v)",
+		len(newMap), len(namespaces), !anyFailed)
 	return nil
+}
+
+// carryForwardEntries carries forward previous-map entries into newMap
+func carryForwardEntries(newMap, previousMap map[string]string) {
+	for podUID, oldNS := range previousMap {
+		if _, seen := newMap[podUID]; seen {
+			continue
+		}
+		newMap[podUID] = oldNS
+	}
 }
 
 // maxMetadataBytes bounds a single IMDS response.
@@ -275,6 +307,7 @@ func (s *service) readNamespaceInfo(ctx context.Context, namespace string) (*cre
 // readCredential reads and parses a pod's credential file from IMDS.
 func (s *service) readCredential(ctx context.Context, namespace, podUID string) (*credentials.EksCredentialsResponse, error) {
 	path := iamEKSPrefix + namespace + "/security-credentials/" + podUID
+	// Get the credential from IMDS
 	data, err := s.getMetadata(ctx, path)
 	if err != nil {
 		if isNotFound(err) {
@@ -285,6 +318,10 @@ func (s *service) readCredential(ctx context.Context, namespace, podUID string) 
 	var cred credentials.EksCredentialsResponse
 	if err := json.Unmarshal(data, &cred); err != nil {
 		return nil, fmt.Errorf("parsing credential %s/%s: %w", namespace, podUID, err)
+	}
+	// Validate that the credential is well-formed
+	if cred.AccessKeyId == "" || cred.SecretAccessKey == "" || cred.Token == "" {
+		return nil, fmt.Errorf("credential %s/%s: %w", namespace, podUID, ErrInvalidCredential)
 	}
 	return &cred, nil
 }

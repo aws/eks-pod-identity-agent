@@ -139,6 +139,38 @@ func TestReadCredential(t *testing.T) {
 			body:    "",
 			wantErr: "credential not found in IMDS",
 		},
+		{
+			name:    "empty object is rejected",
+			status:  200,
+			body:    "{}",
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			name:    "expiration-only payload is rejected",
+			status:  200,
+			body:    `{"Expiration":"2099-01-01T00:00:00Z"}`,
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			name:    "missing secret key is rejected",
+			status:  200,
+			body:    `{"AccessKeyId":"AKIA","Token":"tok","Expiration":"2099-01-01T00:00:00Z"}`,
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			name:    "missing token is rejected",
+			status:  200,
+			body:    `{"AccessKeyId":"AKIA","SecretAccessKey":"secret","Expiration":"2099-01-01T00:00:00Z"}`,
+			wantErr: ErrInvalidCredential.Error(),
+		},
+		{
+			// Static-stability: a well-formed but expired credential must still pass
+			// validation (expiry is enforced by the cache, not readCredential).
+			name:      "valid but expired credential is accepted",
+			status:    200,
+			body:      expiredCredJSON(),
+			wantKeyId: "AKIA",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -312,6 +344,7 @@ func TestNamespaceMapping_Build(t *testing.T) {
 		name        string
 		rootListing string                                    // newline-delimited IMDS root listing response
 		infoByNS    map[string]func() (*http.Response, error) // namespace suffix → HTTP response for its /info file
+		prevMapping map[string]string                         // podUID → namespace map seeded before the build (for salvage cases)
 		wantPods    int                                       // expected total entries in podUID → namespace map
 		wantLookups map[string]string                         // podUID → namespace pairs that must exist
 		wantMissing []string                                  // podUIDs that must NOT be in the map
@@ -328,7 +361,9 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			wantMissing: []string{"pod-missing"},
 		},
 		{
-			name:        "partial failure skips failed namespace",
+			// No previous map, so there is nothing to salvage: a failed namespace
+			// simply contributes no pods this cycle.
+			name:        "partial failure with no previous map drops failed namespace",
 			rootListing: "iam-eks-1\niam-eks-2",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
@@ -336,6 +371,63 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			},
 			wantPods:    1,
 			wantLookups: map[string]string{"pod-a": "1"},
+		},
+		{
+			// pod-c lives in ns2, ns2 read fails. ns2's pods are salvaged from
+			// the previous map so a transient failure does not look like removal.
+			name:        "partial failure salvages pods from failed namespace",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a", "pod-b")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(500, "internal error"), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "1", "pod-b": "1", "pod-c": "2"},
+			wantPods:    3,
+			wantLookups: map[string]string{"pod-a": "1", "pod-b": "1", "pod-c": "2"},
+		},
+		{
+			// pod-a reshuffled ns2→ns1; ns2 (its OLD home) fails. ns1 reads OK
+			// and reports pod-a, so the current-cycle namespace (1) wins over the
+			// salvaged previous namespace (2).
+			name:        "reshuffle beats salvage when new namespace reads successfully",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "2"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-a": "1"},
+		},
+		{
+			// pod-a reshuffled ns2→ns1; ns1 (its NEW home) fails. ns2 reads OK
+			// and no longer lists pod-a. The agent cannot tell relocation from
+			// removal while ns1 is dark, so on a partial scan we retain pod-a with
+			// its stale previous namespace (2) rather than evict a possibly-live
+			// pod. The stale home self-heals on the next clean scan.
+			name:        "partial failure retains pod with stale namespace (reshuffle into failed ns)",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
+				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON()), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "2"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-a": "2"},
+		},
+		{
+			// Complete scan (no namespace failed): a pod absent from the previous
+			// map is a confirmed removal and is NOT salvaged, so it is evicted.
+			name:        "complete scan evicts removed pod",
+			rootListing: "iam-eks-1\niam-eks-2",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON()), nil },
+			},
+			prevMapping: map[string]string{"pod-a": "1", "pod-gone": "2"},
+			wantPods:    1,
+			wantLookups: map[string]string{"pod-a": "1"},
+			wantMissing: []string{"pod-gone"},
 		},
 		{
 			name:        "non-sequential namespaces",
@@ -397,6 +489,12 @@ func TestNamespaceMapping_Build(t *testing.T) {
 				}
 				return httpResponse(404, ""), nil
 			})
+
+			// Seed the previous map so salvage-on-partial-scan cases can exercise
+			// retention of pods from namespaces that fail to read this cycle.
+			if tt.prevMapping != nil {
+				svc.storeMapping(tt.prevMapping)
+			}
 
 			// Build the mapping: discover namespaces → read info files → populate podUID map.
 			require.NoError(t, svc.buildNamespaceMapping(testCtx()))
@@ -500,6 +598,14 @@ func TestGetIamCredentials(t *testing.T) {
 			credCode: 404,
 			podUID:   "pod-1",
 			wantErr:  ErrCredentialNotFound,
+		},
+		{
+			name:     "invalid credential payload is rejected",
+			mapping:  map[string]string{"pod-1": "1"},
+			credBody: "{}",
+			credCode: 200,
+			podUID:   "pod-1",
+			wantErr:  ErrInvalidCredential,
 		},
 		{
 			name:      "expired credential still returned",
@@ -701,4 +807,58 @@ func TestProbeIMDS_TransportError_ReturnsFalse(t *testing.T) {
 		o.ClientEnableState = imds.ClientEnabled
 	})
 	assert.False(t, result)
+}
+
+// --- Operation timeout tests ---
+
+// blockUntilCtxDone returns a handler that blocks until the request context is
+// cancelled, then returns its error. It lets a test drive an IMDS call that
+// "hangs" so an operation deadline — not the per-attempt HTTP timeout — is what
+// ends it.
+func blockUntilCtxDone() func(*http.Request) (*http.Response, error) {
+	return func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}
+}
+
+// TestGetIamCredentials_ForegroundTimeout verifies that a slow IMDS read is
+// bounded by syncOpTimeout rather than running up to the SDK's much larger
+// default, so the chained retriever retains budget for the EKS Auth fallback.
+func TestGetIamCredentials_ForegroundTimeout(t *testing.T) {
+	svc := newTestService(blockUntilCtxDone())
+	svc.storeMapping(map[string]string{"pod-1": "1"})
+
+	start := time.Now()
+	_, _, err := svc.GetIamCredentials(testCtx(), fakeRequest(t, "pod-1"))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	// Must be bounded by our 1s operation budget, well under the SDK default (5s).
+	assert.Less(t, elapsed, syncOpTimeout+2*time.Second,
+		"foreground read should be bounded by syncOpTimeout, took %v", elapsed)
+}
+
+// TestBuildNamespaceMapping_RefreshBudget verifies that a build whose namespace
+// read hangs is bounded by refreshOpTimeout rather than blocking indefinitely.
+func TestBuildNamespaceMapping_RefreshBudget(t *testing.T) {
+	// Root listing returns quickly; the per-namespace info read blocks on context.
+	svc := newTestService(func(req *http.Request) (*http.Response, error) {
+		path := req.URL.Path
+		if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
+			return httpResponse(200, "iam-eks-1"), nil
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+
+	start := time.Now()
+	err := svc.buildNamespaceMapping(testCtx())
+	elapsed := time.Since(start)
+
+	// The build still "succeeds" (a failed read is retained, not fatal), but it
+	// must return bounded by refreshOpTimeout rather than hanging on the stuck read.
+	require.NoError(t, err)
+	assert.Less(t, elapsed, refreshOpTimeout+2*time.Second,
+		"build should be bounded by refreshOpTimeout, took %v", elapsed)
 }

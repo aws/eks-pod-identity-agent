@@ -11,6 +11,8 @@ var (
 	ErrPodNotInMapping = errors.New("pod not found in IMDS namespace mapping")
 	// ErrCredentialNotFound is returned when IMDS returns 404 for a credential.
 	ErrCredentialNotFound = errors.New("credential not found in IMDS")
+	// ErrInvalidCredential is returned when a credential is missing critical fields.
+	ErrInvalidCredential = errors.New("IMDS credential missing required fields")
 )
 
 // isNotFound returns true if the error is an HTTP 404 from IMDS.

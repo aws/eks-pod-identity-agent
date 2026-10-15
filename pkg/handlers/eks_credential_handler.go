@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -89,9 +90,9 @@ type CredentialManager struct {
 	EKSAuth credentials.CredentialRetriever
 }
 
-// NewCredentialManager builds the EKS Auth client, the [imds, eksauth] chain when
-// opts.EnableIMDS is set and IMDS answers, and, unless CredentialRenewal or
-// MaxCacheSize is zero, the cache and its retriever with a token validator. It
+// NewCredentialManager builds the EKS Auth client and, unless CredentialRenewal or
+// MaxCacheSize is zero, the cache and its retriever with a token validator, over
+// the [imds, eksauth] chain when opts.EnableIMDS is set and IMDS answers. It
 // reads every field of opts but CredentialRetriever. cmd calls it once, so every
 // bind host and the workload identity tiers share one cache.
 func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) CredentialManager {
@@ -101,19 +102,6 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 
 	var authSvc credentials.CredentialRetriever = credentialsRetriever
 
-	// IMDS credential discovery is feature-flagged, default disabled
-	if opts.EnableIMDS {
-		// Check if IMDS is present on the node
-		if imdscloud.ProbeIMDS(ctx, opts.Cfg) {
-			// If so, configure the agent's credential delegates to be a chain of [imds, eksAuth]
-			log.Info("IMDS available: using [imds, eksauth] chained retriever")
-			imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
-			credentialsRetriever = credsretriever.NewChainedRetriever(imdsSvc, credentialsRetriever)
-		} else {
-			log.Info("IMDS not available on node: using eksauth-only retriever")
-		}
-	}
-
 	tv, err := validation.NewTokenValidator(ctx)
 	if err != nil {
 		log.Infof("failed to initialize token validator: %v", err)
@@ -122,19 +110,24 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 		tv.EndpointOverridden = opts.EndpointOverridden
 	}
 
-	return newCredentialManager(opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+	return newCredentialManager(ctx, opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
 }
 
 // newCredentialManager is NewCredentialManager over delegates it's given: general
 // serves the handler without a cache and refreshes the cache, and authSvc serves
 // misses. With opts.WorkloadIdentityTokens set, authSvc also refreshes decorated
 // entries. cacheOpts carries the cache options only tests set.
-func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
+//
+// The [imds, eksauth] chain is constructed only when caching is enabled. The IMDS
+// delegate cannot validate tokens, and without caching, the agent doesn't know
+// which tokens are valid. So, without caching, only eksauth must be used.
+func newCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts, cacheOpts credcache.Opts,
 	general, authSvc credentials.CredentialRetriever, tv *validation.TokenValidator) CredentialManager {
 	manager := CredentialManager{Retriever: general, EKSAuth: authSvc}
 	if opts.CredentialRenewal == 0 || opts.MaxCacheSize == 0 {
 		return manager
 	}
+	general = buildCredentialRetriever(ctx, opts, general)
 	cacheOpts.Delegate = general
 	// Off, the agent issues nothing from a decorated session, so even a
 	// decorated entry refreshes through general and IMDS keeps static stability.
@@ -158,6 +151,23 @@ func newCredentialManager(opts EksCredentialHandlerOpts, cacheOpts credcache.Opt
 	return manager
 }
 
+// buildCredentialRetriever returns a [imds, eksauth] chained retriever when
+// IMDS credential discovery is enabled and IMDS is present on the node.
+// Otherwise it returns the given delegate unchanged.
+func buildCredentialRetriever(ctx context.Context, opts EksCredentialHandlerOpts, delegate credentials.CredentialRetriever) credentials.CredentialRetriever {
+	log := logger.FromContext(ctx)
+	if !opts.EnableIMDS {
+		return delegate
+	}
+	if !imdscloud.ProbeIMDS(ctx, opts.Cfg) {
+		log.Info("IMDS not available on node: using eksauth-only retriever")
+		return delegate
+	}
+	log.Info("IMDS available: using [imds, eksauth] chained retriever")
+	imdsSvc := imdscloud.NewService(ctx, opts.Cfg)
+	return credsretriever.NewChainedRetriever(imdsSvc, delegate)
+}
+
 func (h *EksCredentialHandler) ConfigureHandler(register func(pattern string, handlerFunc http.HandlerFunc)) {
 	register("/v1/credentials", h.HandleRequest)
 }
@@ -171,7 +181,7 @@ func (h *EksCredentialHandler) HandleRequest(resp http.ResponseWriter, req *http
 	eksCredentialsRequest := &credentials.EksCredentialsRequest{
 		ClusterName:         h.ClusterName,
 		ServiceAccountToken: req.Header.Get("Authorization"),
-		RequestTargetHost:   req.Host,
+		RequestTargetHost:   requestTargetHost(req),
 	}
 
 	creds, err := h.GetEksCredentials(ctx, eksCredentialsRequest)
@@ -207,4 +217,18 @@ func (h *EksCredentialHandler) GetEksCredentials(ctx context.Context, request *c
 	// call EKS Auth
 	iamCredentials, _, err := h.CredentialRetriever.GetIamCredentials(ctx, request)
 	return iamCredentials, err
+}
+
+// requestTargetHost returns the address the connection was accepted on, as
+// recorded by net/http under LocalAddrContextKey. The locality check must run
+// against this server-observed address rather than the client-supplied Host
+// header: a remote caller can set any Host header, so authorizing on req.Host
+// would let a non-node-local caller satisfy the link-local check. It falls back
+// to req.Host only when the local address is absent, which happens in unit
+// tests that invoke the handler without a running net/http server.
+func requestTargetHost(req *http.Request) string {
+	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && localAddr != nil {
+		return localAddr.String()
+	}
+	return req.Host
 }

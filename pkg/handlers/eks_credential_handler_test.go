@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -159,7 +160,7 @@ func TestNewCredentialManager_CacheRefreshesThroughTheGeneralDelegate(t *testing
 	general := &recordingRetriever{name: "chained-retriever", accessKeyId: "AKIA-REFRESHED"}
 	authSvc := &recordingRetriever{name: "eks-auth", accessKeyId: "AKIA-MISS"}
 	const renewal = 50 * time.Millisecond
-	manager := newCredentialManager(EksCredentialHandlerOpts{
+	manager := newCredentialManager(context.Background(), EksCredentialHandlerOpts{
 		CredentialRenewal: renewal,
 		// One pod, and a size the cache's QPS check passes at this renewal TTL.
 		MaxCacheSize: 1,
@@ -328,7 +329,7 @@ func refreshingManager(workloadIdentity bool, tokens credcache.TokenSource,
 	if workloadIdentity {
 		opts.WorkloadIdentityTokens = tokens
 	}
-	return newCredentialManager(opts, credcache.Opts{CleanupInterval: renewal / 5}, general, authSvc, nil)
+	return newCredentialManager(context.Background(), opts, credcache.Opts{CleanupInterval: renewal / 5}, general, authSvc, nil)
 }
 
 func (r *recordingRetriever) String() string                     { return r.name }
@@ -507,4 +508,78 @@ func (f *fakeHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	rec := httptest.NewRecorder()
 	f.handler.ServeHTTP(rec, req)
 	return rec.Result(), nil
+}
+
+// withLocalAddr attaches a server-observed local address to the request's
+// context the same way net/http does when it accepts a connection.
+func withLocalAddr(req *http.Request, addr string) *http.Request {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	local := &net.TCPAddr{IP: net.ParseIP(host), Port: 80}
+	return req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, net.Addr(local)))
+}
+
+// TestEksCredentialHandler_AuthorizesOnAcceptedAddress verifies that the
+// locality check runs against the address the connection was accepted on, not
+// the caller-supplied Host header. A spoofed link-local Host header must not
+// grant access when the connection was accepted on a routable address, and a
+// genuine link-local connection must be served regardless of the Host header.
+func TestEksCredentialHandler_AuthorizesOnAcceptedAddress(t *testing.T) {
+	someFutureTime := time.Now().Add(1 * time.Hour)
+	validToken := test.CreateToken(t, test.TokenConfig{Expiry: someFutureTime, Iat: time.Now(), Nbf: time.Now()})
+	validResponse := &credentials.EksCredentialsResponse{
+		AccessKeyId:     "access-key-id",
+		SecretAccessKey: "secret-access-key",
+		Token:           "token",
+		AccountId:       "account-id",
+		Expiration:      credentials.SdkCompliantExpirationTime{Time: someFutureTime},
+	}
+	marshalledCreds, _ := json.Marshal(validResponse)
+
+	testCases := []struct {
+		name        string
+		hostHeader  string
+		localAddr   string
+		expectBytes []byte
+		expectCreds bool
+	}{
+		{
+			name:        "spoofed link-local Host header on a wildcard-accepted connection is denied",
+			hostHeader:  configuration.DefaultIpv4TargetHost,
+			localAddr:   "0.0.0.0:80",
+			expectBytes: []byte("Access Denied. Called agent through invalid address"),
+			expectCreds: false,
+		},
+		{
+			name:        "connection accepted on link-local address is served despite a foreign Host header",
+			hostHeader:  "attacker.example.com",
+			localAddr:   configuration.DefaultIpv4TargetHost + ":80",
+			expectBytes: marshalledCreds,
+			expectCreds: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			controller := gomock.NewController(t)
+			defer controller.Finish()
+
+			eksAuthService := eksauth.NewMockIface(controller)
+			handler := EksCredentialHandler{
+				CredentialRetriever: eksAuthService,
+				RequestValidator:    validation.DefaultCredentialValidator{},
+				ClusterName:         "cluster-a",
+			}
+			if tc.expectCreds {
+				eksAuthService.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+					Return(validResponse, nil, nil)
+			}
+
+			request := withLocalAddr(buildRequest(validToken, tc.hostHeader), tc.localAddr)
+			handler.HandleRequest(&mockResponseWriter{g: g, expectBytes: tc.expectBytes}, request)
+		})
+	}
 }
