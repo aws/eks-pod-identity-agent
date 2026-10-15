@@ -20,6 +20,12 @@ const (
 	maxWebIdentityTokenDuration       = time.Hour
 	MaxWebIdentityTokenAudiences      = 10
 	MaxWebIdentityTokenAudienceLength = 1000
+	// signingAlgorithm is the algorithm STS signs the JWT-SVID with. The member
+	// is required, and STS accepts RS256 (RSA with SHA-256) or ES384 (ECDSA on
+	// P-384 with SHA-384). RS256 has the broadest verifier support, and a
+	// consumer takes the key from the trust bundle either way, so the choice is
+	// not visible to a workload.
+	signingAlgorithm = "RS256"
 )
 
 type WebIdentityTokenType string
@@ -57,6 +63,7 @@ func (s *service) GetWebIdentityToken(ctx context.Context, creds aws.Credentials
 			audiences.Value().String(audience)
 		}
 		input.Key("TokenType").String(string(req.TokenType))
+		input.Key("SigningAlgorithm").String(signingAlgorithm)
 		if req.Duration > 0 {
 			input.Key("DurationSeconds").Integer(int32(req.Duration.Seconds()))
 		}

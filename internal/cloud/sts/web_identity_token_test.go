@@ -32,7 +32,7 @@ func TestGetWebIdentityTokenUsesSharedTransportAndWorkloadCredentials(t *testing
 	require.Equal(t, time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC), got.Expiration)
 	expectSignedQuery(NewWithT(t), f.only(t), operationGetWebIdentityToken, url.Values{
 		"Audience.member.1": {"payments.example"}, "Audience.member.2": {"ledger.example"},
-		"DurationSeconds": {"3600"}, "TokenType": {"JWT_SVID"},
+		"DurationSeconds": {"3600"}, "TokenType": {"JWT_SVID"}, "SigningAlgorithm": {"RS256"},
 	})
 }
 
@@ -43,7 +43,7 @@ func TestGetWebIdentityTokenOmitsUnconfiguredDuration(t *testing.T) {
 	})
 	require.NoError(t, err)
 	expectSignedQuery(NewWithT(t), f.only(t), operationGetWebIdentityToken, url.Values{
-		"Audience.member.1": {"payments.example"}, "TokenType": {"JWT_SVID"},
+		"Audience.member.1": {"payments.example"}, "TokenType": {"JWT_SVID"}, "SigningAlgorithm": {"RS256"},
 	})
 }
 
@@ -120,7 +120,7 @@ func TestGetWebIdentityTokenPreservesAPIErrorsWithoutRetrying(t *testing.T) {
 
 func TestGetWebIdentityTokenAcceptsAudienceLimits(t *testing.T) {
 	audiences := make([]string, MaxWebIdentityTokenAudiences)
-	expected := url.Values{"TokenType": {"JWT_SVID"}}
+	expected := url.Values{"TokenType": {"JWT_SVID"}, "SigningAlgorithm": {"RS256"}}
 	for i := range audiences {
 		audiences[i] = strings.Repeat("界", MaxWebIdentityTokenAudienceLength)
 		expected.Set("Audience.member."+strconv.Itoa(i+1), audiences[i])
