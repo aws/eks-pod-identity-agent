@@ -934,3 +934,103 @@ func TestNew_RefreshQPSTooLowForTheCache_Panics(t *testing.T) {
 		New(Opts{Delegate: &fakeSource{}, RenewalTtl: time.Second, MaxSize: 100, RefreshQPS: 1})
 	}).To(PanicWith(ContainSubstring("Refresh QPS is too small")))
 }
+
+// fakePodChecker is a test double for podPresenceChecker.
+type fakePodChecker struct {
+	present bool
+	known   bool
+	calls   int
+}
+
+func (f *fakePodChecker) IsPresent(_ string) (bool, bool) {
+	f.calls++
+	return f.present, f.known
+}
+
+// TestCache_Refresh_SkipsRenewalForDeletedPod verifies that when the pod checker
+// reports a pod is known to be gone, the refresh evicts the entry and never calls
+// the delegate (no AssumeRoleForPodIdentity call for a terminated pod).
+func TestCache_Refresh_SkipsRenewalForDeletedPod(t *testing.T) {
+	g := NewWithT(t)
+	delegate := serving(creds(5*time.Hour), authMetadata)
+	checker := &fakePodChecker{present: false, known: true}
+	c := newTestCacheWith(Opts{Delegate: delegate, PodChecker: checker})
+	e := entryExpiringIn(2*time.Hour, authMetadata)
+	c.items.Set("pod", e)
+	before := testutil.ToFloat64(promCacheState.WithLabelValues("pod_not_found"))
+
+	c.onRefresh("pod", e)
+
+	_, found := c.Get("pod")
+	g.Expect(found).To(BeFalse()) // entry evicted instead of renewed
+	g.Expect(delegate.requests()).To(BeEmpty())
+	g.Expect(checker.calls).To(Equal(1))
+	g.Expect(testutil.ToFloat64(promCacheState.WithLabelValues("pod_not_found"))).To(Equal(before + 1))
+}
+
+// TestCache_Refresh_RenewsWhenPodPresentOrUnknown verifies that renewal proceeds
+// when the pod is present, and also when the checker cannot tell yet (known ==
+// false, e.g. an informer that has not synced), so live pods are never evicted.
+func TestCache_Refresh_RenewsWhenPodPresentOrUnknown(t *testing.T) {
+	tests := []struct {
+		name    string
+		checker *fakePodChecker
+	}{
+		{"pod present", &fakePodChecker{present: true, known: true}},
+		{"presence unknown", &fakePodChecker{present: false, known: false}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fresh := creds(5 * time.Hour)
+			delegate := serving(fresh, authMetadata)
+			c := newTestCacheWith(Opts{Delegate: delegate, PodChecker: tc.checker})
+			e := entryExpiringIn(2*time.Hour, authMetadata)
+			c.items.Set("pod", e)
+
+			c.onRefresh("pod", e)
+
+			got, found := c.Get("pod")
+			g.Expect(found).To(BeTrue()) // renewed and kept
+			g.Expect(got.Credentials).To(Equal(fresh))
+			g.Expect(delegate.requests()).To(HaveLen(1))
+			g.Expect(tc.checker.calls).To(Equal(1))
+		})
+	}
+}
+
+// fakeCheckerNotifier implements both podPresenceChecker and podDeletionNotifier
+// so the cache registers its eviction callback.
+type fakeCheckerNotifier struct {
+	present   bool
+	known     bool
+	onDeleted func(string)
+}
+
+func (f *fakeCheckerNotifier) IsPresent(_ string) (bool, bool) { return f.present, f.known }
+func (f *fakeCheckerNotifier) SetOnPodDeleted(fn func(string)) { f.onDeleted = fn }
+
+// TestCache_RegistersPodDeletionCallback verifies that when the pod checker
+// supports deletion notifications, the cache registers a callback that evicts
+// the pod's cached credentials immediately, counting only real evictions.
+func TestCache_RegistersPodDeletionCallback(t *testing.T) {
+	g := NewWithT(t)
+	checker := &fakeCheckerNotifier{present: true, known: true}
+	c := newTestCacheWith(Opts{PodChecker: checker})
+
+	g.Expect(checker.onDeleted).ToNot(BeNil())
+
+	g.Expect(c.Store(context.Background(), "pod", entryExpiringIn(2*time.Hour, authMetadata))).To(Succeed())
+	before := testutil.ToFloat64(promCacheState.WithLabelValues("pod_deleted"))
+
+	checker.onDeleted("pod")
+
+	_, found := c.Get("pod")
+	g.Expect(found).To(BeFalse())
+	g.Expect(testutil.ToFloat64(promCacheState.WithLabelValues("pod_deleted"))).To(Equal(before + 1))
+
+	// A deletion for a pod with nothing cached must NOT count: the metric
+	// reflects ghost credentials cleaned up, not every pod deletion.
+	checker.onDeleted("no-such-pod-uid")
+	g.Expect(testutil.ToFloat64(promCacheState.WithLabelValues("pod_deleted"))).To(Equal(before + 1))
+}
