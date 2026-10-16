@@ -922,6 +922,77 @@ func TestSessionProvider_InvalidateDropsWhatThePodHolds(t *testing.T) {
 	g.Expect(next.Credentials.AccessKeyID).To(Equal(exchangeKey(3)))
 }
 
+// TestSessionProvider_APodDeletionDropsItsSession proves a pod's deletion drops
+// its session, logging under the session's pod and association, and that the
+// next exchange for the pod is ErrUnattestable and caches nothing. Another pod's
+// session stays cached.
+func TestSessionProvider_APodDeletionDropsItsSession(t *testing.T) {
+	g := NewWithT(t)
+	capture := captureLogs(t)
+	h := newSessionFixture(t)
+	for _, podUID := range []string{testSessionPodUID, otherSessionPodUID} {
+		_, err := h.session(podUID)
+		g.Expect(err).NotTo(HaveOccurred())
+	}
+
+	h.pods.Delete(testSessionPodUID)
+
+	g.Expect(h.cachedKey(testSessionPodUID)).To(BeEmpty())
+	g.Expect(h.cachedKey(otherSessionPodUID)).To(Equal(exchangeKey(2)))
+	g.Expect(capture.fieldsAbout(testSessionPodUID, "Pod deleted, dropping its cached credentials")).To(HaveExactElements(
+		HaveKeyWithValue("association-id", eksauthtest.EnrolledSession(time.Time{}).AssociationID)))
+	got, err := h.session(testSessionPodUID)
+	g.Expect(got).To(BeNil())
+	g.Expect(err).To(MatchError(wierrors.ErrUnattestable))
+	g.Expect(err).To(MatchError(credcache.ErrForgotten))
+	g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
+	g.Expect(h.cachedKey(testSessionPodUID)).To(BeEmpty())
+	g.Expect(h.cachedKey(otherSessionPodUID)).To(Equal(exchangeKey(2)))
+}
+
+// TestSessionProvider_APodDeletedDuringAnExchangeIsUnattestable proves an
+// exchange in flight when its pod is deleted caches nothing, unlike one in
+// flight at an Invalidate, and its caller gets ErrUnattestable naming the pod.
+func TestSessionProvider_APodDeletedDuringAnExchangeIsUnattestable(t *testing.T) {
+	g := NewWithT(t)
+	h := newSessionFixture(t)
+	h.server.Block()
+	pending := h.sessionAsync(t.Context(), testSessionPodUID)
+	h.waitForBlocked(t, 1)
+
+	h.pods.Delete(testSessionPodUID)
+	h.server.Release()
+
+	r := awaitResult(t, pending)
+	g.Expect(r.session).To(BeNil())
+	g.Expect(r.err).To(MatchError(wierrors.ErrUnattestable))
+	g.Expect(r.err.Error()).To(ContainSubstring("pod " + testSessionPodUID + " was deleted"))
+	g.Expect(wierrors.IsRetryable(r.err)).To(BeFalse())
+	g.Expect(h.cachedKey(testSessionPodUID)).To(BeEmpty(), "an exchange in flight at a deletion must not be cached")
+	g.Expect(h.server.Calls()).To(Equal(1))
+}
+
+// TestSessionProvider_APodDeletedDuringARefreshStaysDropped proves a refresh in
+// flight when its pod is deleted caches nothing, though the cache stores a
+// renewal in flight at an Invalidate.
+func TestSessionProvider_APodDeletedDuringARefreshStaysDropped(t *testing.T) {
+	g := NewWithT(t)
+	capture := captureLogs(t)
+	h := newSessionFixture(t, sweeping, dueEverySecond)
+	exchanges := map[int64]*heldExchange{2: {}}
+	h.holdExchanges(t, exchanges, h.sessionFor)
+	_, err := h.session(testSessionPodUID)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	h.waitForCalls(t, 2)
+	h.pods.Delete(testSessionPodUID)
+	exchanges[2].release()
+
+	capture.waitFor(t, testSessionPodUID, "Pod "+testSessionPodUID+" was deleted while its credentials refreshed", 1)
+	g.Expect(h.cachedKey(testSessionPodUID)).To(BeEmpty(), "a renewal must not bring back a deleted pod's session")
+	g.Expect(h.server.Calls()).To(Equal(2))
+}
+
 // TestSessionProvider_ARenewalRacingAnHTTPTokenCheckStillStores proves a
 // refresh in flight while an HTTP caller's token passes local validation still
 // stores. The HTTP retriever records the token on the entry while the refresh
@@ -1288,7 +1359,8 @@ func TestNew_RejectsAnInvalidConfiguration(t *testing.T) {
 	client := mockcreds.NewMockCredentialRetriever(ctrl)
 	cache := credcache.New(credcache.Opts{Delegate: client, RenewalTtl: time.Hour, MaxSize: 10, CleanupInterval: time.Hour})
 	valid := func() Opts {
-		return Opts{ClusterName: testClusterName, Minter: &fake.TokenMinter{}, Cache: cache, EKSAuth: client}
+		return Opts{ClusterName: testClusterName, Minter: &fake.TokenMinter{}, Cache: cache, EKSAuth: client,
+			PodStore: &fake.PodStore{}}
 	}
 
 	testCases := []struct {
@@ -1308,6 +1380,12 @@ func TestNew_RejectsAnInvalidConfiguration(t *testing.T) {
 			},
 		},
 		{name: "no EKS Auth", change: func(o *Opts) { o.EKSAuth = nil }, wantErr: []string{"EKS Auth"}},
+		{name: "no pod store", change: func(o *Opts) { o.PodStore = nil }, wantErr: []string{"pod store"}},
+		{
+			name:    "a pod store that refuses the callback",
+			change:  func(o *Opts) { o.PodStore = &fake.PodStore{RegisterErr: errors.New("no informer")} },
+			wantErr: []string{"registering the pod deletion callback", "no informer"},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1327,10 +1405,12 @@ func TestNew_RejectsAnInvalidConfiguration(t *testing.T) {
 
 	t.Run("every field set", func(t *testing.T) {
 		g := NewWithT(t)
-		p, err := New(valid())
+		opts := valid()
+		p, err := New(opts)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(p.cache).To(BeIdenticalTo(cache))
 		g.Expect(p.eksAuth).To(BeIdenticalTo(client))
+		g.Expect(opts.PodStore.(*fake.PodStore).Registered()).To(Equal(1), "New registers for pod deletions")
 	})
 }
 
@@ -1344,6 +1424,7 @@ func newMockedProvider(t *testing.T, client credentials.CredentialRetriever) *Pr
 		Minter:      &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "projected-token"}},
 		Cache:       cache,
 		EKSAuth:     client,
+		PodStore:    &fake.PodStore{},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

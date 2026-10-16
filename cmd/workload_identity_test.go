@@ -22,8 +22,11 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -79,14 +82,24 @@ func (wiNoExchange) IsIrrecoverable(error) (string, bool) { return "Unknown", fa
 type wiNodeClientset struct {
 	*fake.Clientset
 
+	// podWatch is closed once the pod store's watch is open. The fake sends a
+	// deletion only to a watch already open.
+	podWatch chan struct{}
+
 	mu            sync.Mutex
 	podSelectors  []string
 	podListsTotal int
 	tokens        []string
 }
 
-func newWINodeClientset(username string) *wiNodeClientset {
-	c := &wiNodeClientset{Clientset: fake.NewSimpleClientset()}
+// newWINodeClientset is the clientset for username, whose API server holds a pod
+// on the test node for each of workloads.
+func newWINodeClientset(username string, workloads ...*workloadidentity.Workload) *wiNodeClientset {
+	pods := make([]runtime.Object, 0, len(workloads))
+	for _, w := range workloads {
+		pods = append(pods, wiPod(w))
+	}
+	c := &wiNodeClientset{Clientset: fake.NewSimpleClientset(pods...), podWatch: make(chan struct{})}
 	c.PrependReactor("create", "selfsubjectreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, &authenticationv1.SelfSubjectReview{
 			Status: authenticationv1.SelfSubjectReviewStatus{UserInfo: authenticationv1.UserInfo{Username: username}},
@@ -116,7 +129,28 @@ func newWINodeClientset(username string) *wiNodeClientset {
 		}
 		return false, nil, nil
 	})
+	var watching sync.Once
+	c.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		var opts metav1.ListOptions
+		if watchAction, ok := action.(k8stesting.WatchActionImpl); ok {
+			opts = watchAction.ListOptions
+		}
+		w, err := c.Tracker().Watch(action.GetResource(), action.GetNamespace(), opts)
+		if err != nil {
+			return false, nil, err
+		}
+		watching.Do(func() { close(c.podWatch) })
+		return true, w, nil
+	})
 	return c
+}
+
+// wiPod is w's pod, bound to the test node.
+func wiPod(w *workloadidentity.Workload) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: w.PodName, Namespace: w.Namespace, UID: types.UID(w.PodUID)},
+		Spec:       corev1.PodSpec{NodeName: wiTestNode, ServiceAccountName: w.ServiceAccount},
+	}
 }
 
 func (c *wiNodeClientset) podLists() (int, []string) {
@@ -190,21 +224,33 @@ func wiBuildTiers(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCo
 }
 
 // wiBuildTiersAndClients is wiBuildTiers that also returns the clients the tiers
-// were built over.
-func wiBuildTiersAndClients(t *testing.T) (*workloadIdentityTiers, *wiNodeClientset, *wiCountingFetcher, *workloadIdentityClients) {
+// were built over, with a pod on the node for each of workloads.
+func wiBuildTiersAndClients(t *testing.T, workloads ...*workloadidentity.Workload) (
+	*workloadIdentityTiers, *wiNodeClientset, *wiCountingFetcher, *workloadIdentityClients) {
+	t.Helper()
+	client := newWINodeClientset("system:node:"+wiTestNode, workloads...)
+	fetcher := &wiCountingFetcher{}
+	tiers, clients := wiBuildTiersWith(t, wiOpts, client, fetcher)
+	return tiers, client, fetcher, clients
+}
+
+// wiBuildTiersWith builds the clients and the tiers as createServers does, from
+// opts over client and stsClient. The pod store's informer runs under a context
+// cancelled at cleanup.
+func wiBuildTiersWith(t *testing.T, opts handlers.WorkloadIdentityServerOpts, client kubernetes.Interface,
+	stsClient sts.Iface) (*workloadIdentityTiers, *workloadIdentityClients) {
 	t.Helper()
 	g := NewWithT(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client := newWINodeClientset("system:node:" + wiTestNode)
-	fetcher := &wiCountingFetcher{}
-	clients := wiClients(t, ctx, client)
-	tiers, err := buildWorkloadIdentityTiers(ctx, wiOpts, clients, fetcher)
+	clients, err := buildWorkloadIdentityClients(ctx, opts, client)
+	g.Expect(err).ToNot(HaveOccurred())
+	tiers, err := buildWorkloadIdentityTiers(opts, clients, stsClient)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(tiers).ToNot(BeNil())
-	return tiers, client, fetcher, clients
+	return tiers, clients
 }
 
 // TestBuildWorkloadIdentityTiers_ANodeIdentity_BuildsEveryTier covers the boot
@@ -574,7 +620,7 @@ func TestBuildWorkloadIdentityTiers_NoCredentialCache_FailsBuildingTheSessionTie
 	opts := wiOpts
 	opts.CredentialCache = nil
 
-	tiers, err := buildWorkloadIdentityTiers(ctx, opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
+	tiers, err := buildWorkloadIdentityTiers(opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
 		&wiCountingFetcher{})
 
 	g.Expect(err).To(MatchError(ContainSubstring("building the session tier")))
@@ -584,7 +630,7 @@ func TestBuildWorkloadIdentityTiers_NoCredentialCache_FailsBuildingTheSessionTie
 }
 
 // TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSource
-// proves the JWT-SVID source is built with the tiers over the attestor's pod
+// proves the JWT-SVID source is built with the tiers over the clients' pod
 // store: a zero lifetime, which Validate would have refused, fails the build.
 func TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSource(t *testing.T) {
 	g := NewWithT(t)
@@ -593,7 +639,7 @@ func TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSourc
 	opts := wiOpts
 	opts.JWTSVIDDuration = 0
 
-	tiers, err := buildWorkloadIdentityTiers(ctx, opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
+	tiers, err := buildWorkloadIdentityTiers(opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
 		&wiCountingFetcher{})
 
 	g.Expect(err).To(MatchError(ContainSubstring("building the JWT-SVID tier")))
@@ -643,7 +689,8 @@ func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
 	g.Expect(built).To(Equal(kube.NodeClientOpts{
 		KubeconfigPath: opts.NodeKubeconfig, Cfg: opts.Cfg, ClusterName: opts.ClusterName,
 	}))
-	g.Expect(clients.clientset).To(BeIdenticalTo(client))
+	g.Expect(clients.nodeName).To(Equal(wiTestNode), "the node name resolves over the built client")
+	g.Expect(clients.pods).ToNot(BeNil(), "the pod store syncs with the clients")
 	g.Expect(clients.minter).ToNot(BeNil())
 	g.Expect(clients.credentialTokens()).ToNot(BeNil())
 }
@@ -712,8 +759,8 @@ func TestBuildSharedCredentialManager_OnAndFailing_NamesTheOptOut(t *testing.T) 
 // source is handed for the same pod, with no second TokenRequest.
 func TestWorkloadIdentityClients_TheSessionTierAndTheCredentialCacheShareOneMinter(t *testing.T) {
 	g := NewWithT(t)
-	tiers, client, _, clients := wiBuildTiersAndClients(t)
 	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
+	tiers, client, _, clients := wiBuildTiersAndClients(t, w)
 
 	_, err := tiers.sessions.Session(t.Context(), w)
 	g.Expect(err).To(MatchError(wierrors.ErrSessionUnavailable), "wiNoExchange refuses the exchange after the mint")

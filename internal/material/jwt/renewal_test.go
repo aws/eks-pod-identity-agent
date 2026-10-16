@@ -14,6 +14,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 )
 
 func TestRenewalPointUsesHalfOfIssuedLifetime(t *testing.T) {
@@ -51,7 +52,7 @@ func TestJWTSVIDUsesIssuedLifetimeAndConfiguredRenewal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second).Add(-values.renewAfter - time.Minute)
 			issuer := successfulIssuer(t, &now, values.lifetime)
-			source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+			source := newTestSource(t, issuer, &fake.PodStore{}, &now, 10)
 			source.renewalJitter = values.jitter
 			source.draw = func() float64 { return values.draw }
 
@@ -91,7 +92,7 @@ func TestFailedRenewalKeepsTokenUntilResponseExpiration(t *testing.T) {
 		}
 		return baseRespond(attempt, req)
 	}
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source := newTestSource(t, issuer, &fake.PodStore{}, &now, 10)
 	original, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"payments.example"})
 	require.NoError(t, err)
 
@@ -119,7 +120,7 @@ func TestFailedRenewalFallsBackToCurrentCacheEntry(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second).Add(-6 * time.Minute)
 			issuer := successfulIssuer(t, &now, 10*time.Minute)
-			source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+			source := newTestSource(t, issuer, &fake.PodStore{}, &now, 10)
 			w := workload(testPodUID)
 			audiences := []string{"ledger.example", "payments.example"}
 			key := makeCacheKey(testPodUID, audiences)
@@ -165,7 +166,7 @@ func TestFailedRenewalFallsBackToCurrentCacheEntry(t *testing.T) {
 func TestRenewalLogNeverContainsBearerToken(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source := newTestSource(t, issuer, &fake.PodStore{}, &now, 10)
 	audiences := []string{"payments.example"}
 	key := makeCacheKey(testPodUID, audiences)
 
@@ -191,7 +192,7 @@ func TestRenewalLogNeverContainsBearerToken(t *testing.T) {
 
 func TestBackgroundRenewalContinuesOnlyWhilePodExists(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	watcher := &fakePodStore{}
+	watcher := &fake.PodStore{}
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
 	source := newTestSource(t, issuer, watcher, &now, 10)
 	audiences := []string{"ledger.example", "payments.example"}
@@ -211,7 +212,7 @@ func TestBackgroundRenewalContinuesOnlyWhilePodExists(t *testing.T) {
 	require.Equal(t, audiences, replacement.svid.Audience)
 	require.NotEqual(t, original.svid.Marshal(), replacement.svid.Marshal())
 
-	watcher.delete(testPodUID)
+	watcher.Delete(testPodUID)
 	source.onRefresh(key, replacement)
 	require.Equal(t, 2, issuer.calls(), "a deleted pod must not renew")
 	require.Empty(t, source.cache.Items())
@@ -219,7 +220,7 @@ func TestBackgroundRenewalContinuesOnlyWhilePodExists(t *testing.T) {
 
 func TestBackgroundRenewalChecksPresenceBeforeDeletionCallback(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pods := &fakePodStore{}
+	pods := &fake.PodStore{}
 	issuer := successfulIssuer(t, &now, time.Hour)
 	source := newTestSource(t, issuer, pods, &now, 10)
 	audiences := []string{"payments.example"}
@@ -229,7 +230,7 @@ func TestBackgroundRenewalChecksPresenceBeforeDeletionCallback(t *testing.T) {
 	cached, ok := source.cache.Get(key)
 	require.True(t, ok)
 
-	pods.remove(testPodUID)
+	pods.Remove(testPodUID)
 	source.onRefresh(key, cached)
 	require.Equal(t, 1, issuer.calls())
 	require.Empty(t, source.cache.Items())
@@ -269,7 +270,7 @@ func TestBackgroundRenewalRechecksPodAfterWaitingForPermit(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return source.limiter.Tokens() < 0
 	}, 500*time.Millisecond, time.Millisecond)
-	pods.delete(key.podUID)
+	pods.Delete(key.podUID)
 
 	select {
 	case <-done:
@@ -302,11 +303,11 @@ func TestBackgroundRenewalPermitDeadlineKeepsCachedToken(t *testing.T) {
 	require.Empty(t, source.states)
 }
 
-func newDueRenewalSource(t *testing.T, podCount int) (*Source, *fakeIssuer, *fakePodStore) {
+func newDueRenewalSource(t *testing.T, podCount int) (*Source, *fakeIssuer, *fake.PodStore) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second).Add(-31 * time.Minute)
 	issuer := successfulIssuer(t, &now, time.Hour)
-	pods := &fakePodStore{}
+	pods := &fake.PodStore{}
 	source := newTestSource(t, issuer, pods, &now, 10)
 	for i := range podCount {
 		_, err := source.JWTSVIDs(context.Background(), workload(fmt.Sprintf("pod-%d", i)), []string{"payments.example"})

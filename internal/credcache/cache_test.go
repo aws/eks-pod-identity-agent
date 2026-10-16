@@ -817,6 +817,106 @@ func TestCache_Writes_GoByPodUID(t *testing.T) {
 	g.Expect(c.Modify("pod", func(e *Entry) { e.Request = request })).To(BeFalse())
 }
 
+// TestCache_Forget_DropsTheEntryAndRefusesLaterStores proves Forget removes the
+// pod's entry and refuses every later Store for it, one for a pod with nothing
+// cached included, and leaves other pods alone.
+func TestCache_Forget_DropsTheEntryAndRefusesLaterStores(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	hook := captureLogs(t)
+	const podUID = "forgotten-pod"
+	c := newTestCache(nil)
+	other := entryExpiringIn(time.Hour, authMetadata)
+	g.Expect(c.Store(ctx, podUID, entryExpiringIn(time.Hour, authMetadata))).To(Succeed())
+	g.Expect(c.Store(ctx, "other-pod", other)).To(Succeed())
+
+	c.Forget(podUID)
+	c.Forget("never-cached-pod")
+
+	_, _, found := c.items.GetStale(podUID)
+	g.Expect(found).To(BeFalse())
+	for _, forgotten := range []string{podUID, "never-cached-pod"} {
+		g.Expect(c.Store(ctx, forgotten, entryExpiringIn(2*time.Hour, authMetadata))).To(MatchError(ErrForgotten))
+		_, _, found = c.items.GetStale(forgotten)
+		g.Expect(found).To(BeFalse(), "pod %s", forgotten)
+	}
+	g.Expect(storeLogs(hook, podUID)).To(HaveLen(1), "a refused Store stores nothing")
+	g.Expect(c.Modify(podUID, func(*Entry) {})).To(BeFalse())
+	got, found := c.Get("other-pod")
+	g.Expect(found).To(BeTrue())
+	g.Expect(got).To(BeIdenticalTo(other))
+	g.Expect(c.Store(ctx, "other-pod", entryExpiringIn(2*time.Hour, authMetadata))).To(Succeed())
+}
+
+// TestCache_Forget_DuringARefreshStoresNothing proves a refresh whose pod is
+// forgotten while it renews leaves the pod uncached, and counts neither a hit
+// nor an error: no source is asked to classify the refused store.
+func TestCache_Forget_DuringARefreshStoresNothing(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	renewing, release := make(chan struct{}), make(chan struct{})
+	delegate := &fakeSource{
+		get: func(context.Context, *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
+			close(renewing)
+			<-release
+			return creds(5 * time.Hour), authMetadata, nil
+		},
+		code: "Forgotten",
+	}
+	c := newTestCache(delegate)
+	old := entryExpiringIn(2*time.Hour, authMetadata)
+	g.Expect(c.Store(ctx, "pod", old)).To(Succeed())
+	hitsBefore := testutil.ToFloat64(promCacheState.WithLabelValues("hit"))
+	errorsBefore := testutil.ToFloat64(promCacheError.WithLabelValues("Recoverable", "Forgotten")) +
+		testutil.ToFloat64(promCacheError.WithLabelValues("NonRecoverable", "Forgotten"))
+	refreshed := make(chan struct{})
+	go func() {
+		defer close(refreshed)
+		c.onRefresh("pod", old)
+	}()
+	waitFor(t, renewing, "the refresh to reach its source")
+
+	c.Forget("pod")
+	close(release)
+	waitFor(t, refreshed, "the refresh to finish")
+
+	_, _, found := c.items.GetStale("pod")
+	g.Expect(found).To(BeFalse(), "a renewal must not bring back a forgotten pod")
+	g.Expect(delegate.requests()).To(HaveLen(1))
+	g.Expect(delegate.classified).To(BeEmpty())
+	g.Expect(testutil.ToFloat64(promCacheState.WithLabelValues("hit"))).To(Equal(hitsBefore))
+	g.Expect(testutil.ToFloat64(promCacheError.WithLabelValues("Recoverable", "Forgotten")) +
+		testutil.ToFloat64(promCacheError.WithLabelValues("NonRecoverable", "Forgotten"))).To(Equal(errorsBefore))
+}
+
+// TestCache_Forget_RemembersAtMostMaxSizePods proves MaxSize bounds the
+// forgotten pods: past it, the one forgotten longest ago can be stored again.
+func TestCache_Forget_RemembersAtMostMaxSizePods(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	c := newTestCacheWith(Opts{MaxSize: 2})
+
+	for _, podUID := range []string{"pod-1", "pod-2", "pod-3"} {
+		c.Forget(podUID)
+	}
+
+	g.Expect(c.forgotten.ItemCount()).To(Equal(2))
+	g.Expect(c.Store(ctx, "pod-1", entryExpiringIn(time.Hour, authMetadata))).To(Succeed())
+	for _, podUID := range []string{"pod-2", "pod-3"} {
+		g.Expect(c.Store(ctx, podUID, entryExpiringIn(time.Hour, authMetadata))).To(MatchError(ErrForgotten), "pod %s", podUID)
+	}
+}
+
+// waitFor fails the test unless done closes within 5 seconds.
+func waitFor(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
 // captureLogs records what the shared logger logs for the rest of the test.
 func captureLogs(t *testing.T) *logtest.Hook {
 	log := logger.FromContext(context.Background()).Logger

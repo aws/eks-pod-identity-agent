@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // podResyncInterval is how often the informer relists. Attestation reads the
@@ -67,6 +68,8 @@ type PodStore struct {
 	indexer  cache.Indexer
 	informer cache.SharedIndexInformer
 }
+
+var _ workloadidentity.PodStore = (*PodStore)(nil)
 
 // podUIDIndexFunc keys a pod object by its UID for the byPodUID index.
 func podUIDIndexFunc(obj interface{}) ([]string, error) {
@@ -187,7 +190,10 @@ func NewPodStore(ctx context.Context, clientset kubernetes.Interface, nodeName s
 	return &PodStore{indexer: indexer, informer: podInformer}, nil
 }
 
-// OnPodDeleted reuses this node's watch. Callbacks must return promptly.
+// OnPodDeleted calls fn with the UID of each pod that leaves this node's store:
+// deleted, or replaced by a same-named pod with a new UID, which a relist
+// delivers as an update with no delete. It reuses this node's watch. Callbacks
+// must return promptly.
 func (s *PodStore) OnPodDeleted(fn func(podUID string)) error {
 	if fn == nil {
 		return fmt.Errorf("pod deletion callback is required")
@@ -196,6 +202,9 @@ func (s *PodStore) OnPodDeleted(fn func(podUID string)) error {
 		return fmt.Errorf("pod store has no informer to report pod deletions from")
 	}
 	_, err := s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// Not for UID changes, which can't happen: for two pods sharing a name,
+		// whose delete and create a relist folds into one update.
+		UpdateFunc: podReplacedHandler(fn),
 		DeleteFunc: podDeletedHandler(fn),
 	})
 	if err != nil {
@@ -212,6 +221,21 @@ func podDeletedHandler(fn func(string)) func(interface{}) {
 		pod, ok := obj.(*corev1.Pod)
 		if ok && pod != nil && pod.UID != "" {
 			fn(string(pod.UID))
+		}
+	}
+}
+
+// podReplacedHandler reports the old UID when an update carries a different pod.
+// A pod's UID never changes, but the informer keys pods by namespace/name: a pod
+// deleted and recreated under the same name while the watch is down, such as a
+// StatefulSet pod, reaches the relist as one update from old pod to new and no
+// delete (client-go's SharedInformer doc). A resync keeps the UID and reports nothing.
+func podReplacedHandler(fn func(string)) func(interface{}, interface{}) {
+	return func(oldObj, newObj interface{}) {
+		oldPod, oldOK := oldObj.(*corev1.Pod)
+		newPod, newOK := newObj.(*corev1.Pod)
+		if oldOK && newOK && oldPod != nil && newPod != nil && oldPod.UID != "" && oldPod.UID != newPod.UID {
+			fn(string(oldPod.UID))
 		}
 	}
 }

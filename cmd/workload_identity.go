@@ -29,22 +29,24 @@ import (
 )
 
 // workloadIdentityClients is what workload identity reaches the API server with,
-// built once by createServers before the credential manager: the node client, the
-// node name it authenticates as, and T4's cached token minter. The minter is the
-// one token cache, shared by the session tier's exchanges and the credential
-// cache's refreshes.
+// built once by createServers before the credential manager: the node name the
+// agent authenticates as, the synced node-scoped pod store and T4's cached token
+// minter. The minter is the one token cache, shared by the session tier's
+// exchanges and the credential cache's refreshes. The attestor resolves callers
+// from the pod store, and the minter and every per-pod tier drop a pod it reports
+// deleted.
 type workloadIdentityClients struct {
-	clientset kubernetes.Interface
-	nodeName  string
-	minter    workloadidentity.TokenMinter
+	nodeName string
+	pods     *attestation.PodStore
+	minter   workloadidentity.TokenMinter
 }
 
 // newNodeClient builds the node client. Tests replace it.
 var newNodeClient = kube.NewNodeClient
 
 // newWorkloadIdentityClients builds the clients when workload identity is on,
-// blocking until the node name resolves. Off, it builds nothing and returns nil,
-// so boot needs no API server.
+// blocking until the node name resolves and the pod store syncs. Off, it builds
+// nothing and returns nil, so boot needs no API server.
 func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
 	if !opts.Enabled {
 		return nil, nil
@@ -62,20 +64,29 @@ func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdent
 
 // buildWorkloadIdentityClients is newWorkloadIdentityClients past the node
 // client, so a test can drive it with a fake clientset. The node name's retry
-// comes first, so the minter's pre-flight reaches an API server that has answered.
+// comes first, so the pod store's list and the minter's pre-flight reach an API
+// server that has answered. The store syncs before the minter is built, so the
+// minter drops deleted pods' tokens from its first mint.
 func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clientset kubernetes.Interface) (*workloadIdentityClients, error) {
 	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
 	if err != nil {
 		return nil, err
 	}
+	pods, err := attestation.NewPodStore(ctx, clientset, nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("starting the node-scoped pod store: %w", err)
+	}
 	// It refuses a --max-cache-size of zero, which the credential endpoint's cache
 	// reads as no caching.
-	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{MaxCacheSize: opts.MaxCacheSize})
+	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{
+		MaxCacheSize: opts.MaxCacheSize,
+		PodStore:     pods,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("building the token minter: %w", err)
 	}
-	return &workloadIdentityClients{clientset: clientset, nodeName: nodeName, minter: minter}, nil
+	return &workloadIdentityClients{nodeName: nodeName, pods: pods, minter: minter}, nil
 }
 
 // credentialTokens is the token source the credential cache refreshes with: the
@@ -89,8 +100,7 @@ func (c *workloadIdentityClients) credentialTokens() credcache.TokenSource {
 
 // workloadIdentityServers is what the workload identity feature runs: the gRPC
 // server on its socket and the trust bundle refresh loop, over the clients
-// createServers built. Off, it builds nothing. On, it blocks until the pod store
-// syncs, so a node the agent cannot attest on fails the boot.
+// createServers built, whose pod store has already synced. Off, it builds nothing.
 func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients) ([]runnable, error) {
 	if !opts.Enabled {
@@ -102,7 +112,7 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 		return nil, errors.New("workload identity is on, but its clients weren't built")
 	}
 
-	tiers, err := newWorkloadIdentityTiers(ctx, opts, clients)
+	tiers, err := newWorkloadIdentityTiers(opts, clients)
 	if err != nil {
 		return nil, fmt.Errorf("building the workload identity tiers: %w", err)
 	}
@@ -137,37 +147,38 @@ type workloadIdentityTiers struct {
 	handler      *workloadapi.Handler
 	sdsHandler   *sds.Handler
 	bundleSource *bundle.Registry
-	// sessions is read only by tests, which mint through it.
+	// sessions, certs and tokens are read only by tests, which call the tiers
+	// directly.
 	sessions *session.Provider
+	certs    *x509tier.Source
+	tokens   *jwttier.Source
 }
 
-// newWorkloadIdentityTiers builds the tiers over clients and a new STS client. It
-// blocks until the pod store syncs, since nothing can be attested before then.
-func newWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
+// newWorkloadIdentityTiers builds the tiers over clients and a new STS client.
+func newWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients) (*workloadIdentityTiers, error) {
-	return buildWorkloadIdentityTiers(ctx, opts, clients, sts.NewService(opts.Cfg))
+	return buildWorkloadIdentityTiers(opts, clients, sts.NewService(opts.Cfg))
 }
 
 // buildWorkloadIdentityTiers is newWorkloadIdentityTiers past the STS client, so
 // a test can drive the wiring with fake clients and STS. One hub serves the node:
 // the bundle and X.509-SVID tiers publish to it, and each stream subscribes
-// through its own hub.ForRPC under that RPC's constant.
-func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
+// through its own hub.ForRPC under that RPC's constant. The attestor and every
+// per-pod tier share the clients' pod store, so a deleted pod leaves each tier.
+func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients, stsClient sts.Iface) (*workloadIdentityTiers, error) {
-	attestor, pods, err := attestation.NewAttestor(ctx, clients.clientset, clients.nodeName)
-	if err != nil {
-		return nil, err
-	}
+	attestor := attestation.New(clients.nodeName, clients.pods, attestation.NewCgroupResolver())
 
 	// Cache is the credential cache every bind host serves from, so one session
 	// per pod serves both the HTTP endpoint and this socket. The tier refuses a
 	// nil cache, which either caching flag at zero yields. Minter is the one the
-	// cache refreshes with.
+	// cache refreshes with. A pod's deletion has the cache forget it.
 	sessionProvider, err := session.New(session.Opts{
 		ClusterName: opts.ClusterName,
 		Minter:      clients.minter,
 		Cache:       opts.CredentialCache,
 		EKSAuth:     opts.EKSAuth,
+		PodStore:    clients.pods,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the session tier: %w", err)
@@ -189,6 +200,7 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		Issuer:          stsClient,
 		SessionProvider: sessionProvider,
 		Notifier:        hub,
+		PodStore:        clients.pods,
 		MaxCacheSize:    opts.MaxCacheSize,
 		Duration:        opts.X509SVIDDuration,
 		RenewFraction:   opts.SVIDRenewalFraction,
@@ -199,11 +211,10 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		return nil, fmt.Errorf("building the X.509-SVID tier: %w", err)
 	}
 
-	// Watches the attestor's pod store, so a deleted pod's tokens go with it.
 	tokens, err := jwttier.New(jwttier.Opts{
 		Issuer:          stsClient,
 		SessionProvider: sessionProvider,
-		PodStore:        pods,
+		PodStore:        clients.pods,
 		MaxCacheSize:    opts.MaxCacheSize,
 		Duration:        opts.JWTSVIDDuration,
 		RenewalFraction: opts.SVIDRenewalFraction,
@@ -236,6 +247,8 @@ func buildWorkloadIdentityTiers(ctx context.Context, opts handlers.WorkloadIdent
 		sdsHandler:   sdsHandler,
 		bundleSource: bundleSource,
 		sessions:     sessionProvider,
+		certs:        certs,
+		tokens:       tokens,
 	}, nil
 }
 
