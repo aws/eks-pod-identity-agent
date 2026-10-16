@@ -46,6 +46,10 @@ func (receiver responseMetadataTest) Source() credentials.CredentialSource {
 	return credentials.SourceAuthService
 }
 
+func (receiver responseMetadataTest) ProviderArn() string {
+	return ""
+}
+
 func TestCachedCredentialRetriever_GetIamCredentials_Fetching(t *testing.T) {
 	sampleResponse := credentials.EksCredentialsResponse{
 		Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
@@ -996,6 +1000,7 @@ type imdsMetadataTest struct{}
 
 func (imdsMetadataTest) AssociationId() string                { return "" }
 func (imdsMetadataTest) Source() credentials.CredentialSource { return credentials.SourceIMDS }
+func (imdsMetadataTest) ProviderArn() string                  { return "" }
 
 // TestCachedCredentialRetriever_CredsHandledBySource verifies that the cache
 // accepts/serves credentials differently based on source and expiration:

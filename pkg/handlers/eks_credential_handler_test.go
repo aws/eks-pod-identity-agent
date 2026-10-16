@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -182,30 +183,153 @@ func TestNewCredentialManager_CacheRefreshesThroughTheGeneralDelegate(t *testing
 	g.Expect(manager.EKSAuth).To(BeIdenticalTo(authSvc))
 }
 
-// recordingRetriever serves new hour-long credentials with accessKeyId and counts
-// its calls. Unlike a gomock mock it's safe to call after the test ends, as the
-// cache's sweep may.
+// recordingRetriever serves new hour-long credentials with accessKeyId,
+// decorated with provider when it's set, and records the token of every call.
+// Unlike a gomock mock it's safe to call after the test ends, as the cache's
+// sweep may.
 type recordingRetriever struct {
-	name, accessKeyId string
+	name, accessKeyId, provider string
 
-	mu sync.Mutex
-	n  int
+	mu     sync.Mutex
+	tokens []string
 }
 
-func (r *recordingRetriever) GetIamCredentials(context.Context, *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
+func (r *recordingRetriever) GetIamCredentials(_ context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.n++
+	r.tokens = append(r.tokens, request.ServiceAccountToken)
 	return &credentials.EksCredentialsResponse{
-		AccessKeyId: r.accessKeyId,
-		Expiration:  credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
-	}, credentials.CredentialMetadata{Association: "a-1", CredSource: credentials.SourceAuthService}, nil
+			AccessKeyId: r.accessKeyId,
+			Expiration:  credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+		}, credentials.CredentialMetadata{
+			Association: "a-1", CredSource: credentials.SourceAuthService, Provider: r.provider,
+		}, nil
 }
 
 func (r *recordingRetriever) calls() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.n
+	return len(r.tokens)
+}
+
+// presented returns the token of every call, in order.
+func (r *recordingRetriever) presented() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.tokens...)
+}
+
+const testProviderArn = "arn:aws:iam::111122223333:workload-identity-provider/example"
+
+// scriptedTokens is a credcache.TokenSource handing out token and counting its
+// calls. It's safe to call after the test ends.
+type scriptedTokens struct {
+	token string
+	n     atomic.Int32
+}
+
+func (s *scriptedTokens) Token(context.Context, *credentials.EksCredentialsRequest) (string, error) {
+	s.n.Add(1)
+	return s.token, nil
+}
+
+func (*scriptedTokens) IsIrrecoverable(error) (string, bool) { return "Unknown", false }
+
+// TestNewCredentialManager_RefreshWithFollowsWorkloadIdentity verifies the fork
+// rule: with workload identity on, an entry the HTTP retriever stored that EKS
+// Auth decorated refreshes through EKS Auth, and every other entry, decorated
+// ones included with workload identity off, through the general delegate with
+// its stored token, even one close to expiry.
+func TestNewCredentialManager_RefreshWithFollowsWorkloadIdentity(t *testing.T) {
+	testCases := []struct {
+		name             string
+		workloadIdentity bool
+		decorated        bool
+		// tokenLife is how long the stored token has left, an hour when zero.
+		tokenLife   time.Duration
+		wantEKSAuth bool
+	}{
+		{name: "on, decorated", workloadIdentity: true, decorated: true, wantEKSAuth: true},
+		{name: "on, undecorated", workloadIdentity: true},
+		{name: "on, undecorated, token close to expiry", workloadIdentity: true, tokenLife: 2 * time.Minute},
+		{name: "off, decorated", decorated: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			general := &recordingRetriever{name: "chained-retriever", accessKeyId: "AKIA-REFRESHED"}
+			authSvc := &recordingRetriever{name: "eks-auth", accessKeyId: "AKIA-MISS"}
+			if tc.decorated {
+				authSvc.provider = testProviderArn
+			}
+			tokens := &scriptedTokens{token: "unused"}
+			manager := refreshingManager(tc.workloadIdentity, tokens, general, authSvc)
+			request := chainTestRequest(t, "pod-1")
+			if tc.tokenLife != 0 {
+				request.ServiceAccountToken = test.CreateToken(t, test.TokenConfig{
+					Expiry: time.Now().Add(tc.tokenLife), Iat: time.Now(), Nbf: time.Now(), PodUID: "pod-1",
+				})
+			}
+
+			_, _, err := manager.Retriever.GetIamCredentials(context.Background(), request)
+
+			g.Expect(err).ToNot(HaveOccurred())
+			if tc.wantEKSAuth {
+				g.Eventually(authSvc.calls).WithTimeout(5*time.Second).Should(BeNumerically(">=", 2),
+					"the miss and a refresh go to EKS Auth")
+				g.Expect(authSvc.presented()[1]).To(Equal(request.ServiceAccountToken),
+					"a token with an hour left is presented as it is")
+				g.Expect(general.calls()).To(BeZero(), "a decorated entry never refreshes through the chain")
+			} else {
+				g.Eventually(general.calls).WithTimeout(5 * time.Second).Should(BeNumerically(">=", 1))
+				g.Expect(general.presented()[0]).To(Equal(request.ServiceAccountToken), "the stored token is presented")
+				g.Expect(authSvc.calls()).To(Equal(1), "only the miss goes to EKS Auth")
+			}
+			g.Expect(tokens.n.Load()).To(BeZero(), "only a decorated entry's token close to expiry is swapped")
+		})
+	}
+}
+
+// TestNewCredentialManager_WorkloadIdentityRenewsAnExpiringTokenFromItsSource
+// verifies the cache refreshes with the token source cmd hands it: a decorated
+// entry whose token expires within the floor is refreshed with a token from it.
+func TestNewCredentialManager_WorkloadIdentityRenewsAnExpiringTokenFromItsSource(t *testing.T) {
+	g := NewWithT(t)
+	general := &recordingRetriever{name: "chained-retriever", accessKeyId: "AKIA-REFRESHED"}
+	authSvc := &recordingRetriever{name: "eks-auth", accessKeyId: "AKIA-MISS", provider: testProviderArn}
+	tokens := &scriptedTokens{token: test.CreateToken(t, test.TokenConfig{
+		Expiry: time.Now().Add(time.Hour), Iat: time.Now(), Nbf: time.Now(), PodUID: "pod-1",
+	})}
+	manager := refreshingManager(true, tokens, general, authSvc)
+	request := chainTestRequest(t, "pod-1")
+	request.ServiceAccountToken = test.CreateToken(t, test.TokenConfig{
+		Expiry: time.Now().Add(2 * time.Minute), Iat: time.Now(), Nbf: time.Now(), PodUID: "pod-1",
+	})
+
+	_, _, err := manager.Retriever.GetIamCredentials(context.Background(), request)
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Eventually(authSvc.calls).WithTimeout(5 * time.Second).Should(BeNumerically(">=", 2))
+	g.Expect(authSvc.presented()[1]).To(Equal(tokens.token), "the refresh presents the source's token")
+	g.Expect(tokens.n.Load()).To(BeNumerically(">=", 1))
+	g.Expect(general.calls()).To(BeZero())
+}
+
+// refreshingManager is newCredentialManager refreshing every 50ms, with
+// workloadIdentity deciding whether the cache gets tokens.
+func refreshingManager(workloadIdentity bool, tokens credcache.TokenSource,
+	general, authSvc credentials.CredentialRetriever) CredentialManager {
+	const renewal = 50 * time.Millisecond
+	opts := EksCredentialHandlerOpts{
+		CredentialRenewal: renewal,
+		// One pod, and a size the cache's QPS check passes at this renewal TTL.
+		MaxCacheSize: 1,
+		RefreshQPS:   5,
+	}
+	if workloadIdentity {
+		opts.WorkloadIdentityTokens = tokens
+	}
+	return newCredentialManager(context.Background(), opts, credcache.Opts{CleanupInterval: renewal / 5}, general, authSvc, nil)
 }
 
 func (r *recordingRetriever) String() string                     { return r.name }
