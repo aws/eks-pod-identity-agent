@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/attestation"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
@@ -26,16 +27,16 @@ func (deadPin) close() error   { return nil }
 // togglePods is a pod store a test can empty and refill.
 type togglePods struct {
 	mu  sync.Mutex
-	pod *attestation.PodInfo
+	pod *podstore.PodInfo
 }
 
-func (s *togglePods) PodByUID(string) (*attestation.PodInfo, bool) {
+func (s *togglePods) PodByUID(string) (*podstore.PodInfo, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pod, s.pod != nil
 }
 
-func (s *togglePods) set(p *attestation.PodInfo) {
+func (s *togglePods) set(p *podstore.PodInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pod = p
@@ -46,7 +47,7 @@ type oneCgroup struct{}
 
 func (oneCgroup) PodUIDForPID(int) (string, error) { return "uid-1", nil }
 
-var e2ePod = &attestation.PodInfo{UID: "uid-1", Name: "web", Namespace: "a", ServiceAccount: "sa", NodeName: "node-a"}
+var e2ePod = &podstore.PodInfo{UID: "uid-1", Name: "web", Namespace: "a", ServiceAccount: "sa", NodeName: "node-a"}
 
 // e2eServer runs grpcserver.New with the real attestor: a stream that attests at
 // open and then stays open, and a unary that attests. Each reports its Peer.

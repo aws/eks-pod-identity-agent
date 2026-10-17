@@ -1,4 +1,4 @@
-package attestation
+package podstore
 
 import (
 	"sync"
@@ -15,6 +15,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
+)
+
+const (
+	testNode   = "ip-10-0-1-23.us-west-2.compute.internal"
+	testPodUID = "4e8f8d3a-9c3d-4b7e-8f2a-1c2d3e4f5a6b"
 )
 
 // indexerWithPods builds a real UID-indexed cache holding pods, so the store's
@@ -49,7 +54,7 @@ func pod(uid, name, ns, sa, node string) *corev1.Pod {
 func TestPodByUID_FoundAndProjected(t *testing.T) {
 	g := NewWithT(t)
 
-	store := newPodStoreFromIndexer(indexerWithPods(t,
+	store := newStoreFromIndexer(indexerWithPods(t,
 		pod(testPodUID, "web-0", "team-a", "web", testNode)))
 
 	got, ok := store.PodByUID(testPodUID)
@@ -69,7 +74,7 @@ func TestPodByUID_FoundAndProjected(t *testing.T) {
 func TestPodByUID_Missing(t *testing.T) {
 	g := NewWithT(t)
 
-	store := newPodStoreFromIndexer(indexerWithPods(t))
+	store := newStoreFromIndexer(indexerWithPods(t))
 
 	got, ok := store.PodByUID(testPodUID)
 
@@ -77,12 +82,12 @@ func TestPodByUID_Missing(t *testing.T) {
 	g.Expect(got).To(BeNil())
 }
 
-// TestNewPodStore_RequiresNodeName proves the store refuses to build without a
+// TestNew_RequiresNodeName proves the store refuses to build without a
 // node name, since an empty selector would scope the watch to the whole cluster.
-func TestNewPodStore_RequiresNodeName(t *testing.T) {
+func TestNew_RequiresNodeName(t *testing.T) {
 	g := NewWithT(t)
 
-	_, err := NewPodStore(t.Context(), nil, "")
+	_, err := New(t.Context(), nil, "")
 
 	g.Expect(err).To(HaveOccurred())
 }
@@ -137,7 +142,7 @@ func TestStripDownPod_KeepsNeededFieldsDropsRest(t *testing.T) {
 
 	// A trimmed pod still indexes by UID and projects to the same PodInfo, so
 	// the rest of the store is unaffected by the transform.
-	store := newPodStoreFromIndexer(indexerWithPods(t, trimmed))
+	store := newStoreFromIndexer(indexerWithPods(t, trimmed))
 	got, found := store.PodByUID(testPodUID)
 	g.Expect(found).To(BeTrue())
 	g.Expect(got).To(Equal(&PodInfo{
@@ -185,7 +190,7 @@ func TestStripDownPod_PassesThroughUnknownType(t *testing.T) {
 // the informer's pod watch is registered with the tracker. The fake doesn't
 // replay events to a watch that starts late, and the informer reports synced
 // after its list, before its watch necessarily exists, so a test that deletes a
-// pod straight after NewPodStore could otherwise lose the event.
+// pod straight after New could otherwise lose the event.
 func watchPodsWithSignal(clientset *fake.Clientset) <-chan struct{} {
 	started := make(chan struct{})
 	var once sync.Once
@@ -225,7 +230,7 @@ func TestOnPodDeleted_DeliversDeletedPodUID(t *testing.T) {
 
 	clientset := fake.NewSimpleClientset()
 	watching := watchPodsWithSignal(clientset)
-	store, err := NewPodStore(ctx, clientset, testNode)
+	store, err := New(ctx, clientset, testNode)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Eventually(watching).WithTimeout(5 * time.Second).Should(BeClosed())
 
@@ -282,7 +287,7 @@ func TestOnPodDeleted_TombstoneDeliversUID(t *testing.T) {
 func TestOnPodDeleted_NoInformerErrors(t *testing.T) {
 	g := NewWithT(t)
 
-	store := newPodStoreFromIndexer(indexerWithPods(t))
+	store := newStoreFromIndexer(indexerWithPods(t))
 
 	g.Expect(store.OnPodDeleted(func(string) {})).To(MatchError(ContainSubstring("no informer")))
 }
@@ -294,7 +299,7 @@ func TestOnPodDeleted_NoInformerErrors(t *testing.T) {
 func TestOnPodDeleted_RefusesANilCallback(t *testing.T) {
 	g := NewWithT(t)
 
-	store, err := NewPodStore(t.Context(), fake.NewSimpleClientset(), testNode)
+	store, err := New(t.Context(), fake.NewSimpleClientset(), testNode)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	g.Expect(store.OnPodDeleted(nil)).To(MatchError(ContainSubstring("callback is required")))

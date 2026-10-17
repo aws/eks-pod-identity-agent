@@ -13,8 +13,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
-	wifake "go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 )
@@ -29,7 +29,7 @@ func TestNewMinter_ChecksDriverAndMints(t *testing.T) {
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &wifake.PodStore{}})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &podstoretest.Store{}})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	got, err := m.Mint(context.Background(), testWorkload())
@@ -48,7 +48,7 @@ func TestNewMinter_MissingDriver_StillStarts(t *testing.T) {
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &wifake.PodStore{}})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &podstoretest.Store{}})
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(m).NotTo(BeNil())
@@ -66,7 +66,7 @@ func TestNewMinter_HardCheckError_Fails(t *testing.T) {
 			return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
 		})
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &wifake.PodStore{}})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &podstoretest.Store{}})
 
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(m).To(BeNil())
@@ -92,7 +92,7 @@ func TestNewMinter_RegistrationError_Fails(t *testing.T) {
 	g := NewWithT(t)
 
 	client := fake.NewSimpleClientset(chartCSIDriver())
-	pods := &wifake.PodStore{RegisterErr: errors.New("no informer")}
+	pods := &podstoretest.Store{RegisterErr: errors.New("no informer")}
 
 	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: pods})
 
@@ -110,7 +110,7 @@ func TestNewMinter_PodDeleted_DropsToken(t *testing.T) {
 	noWrites(client)
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
-	pods := &wifake.PodStore{}
+	pods := &podstoretest.Store{}
 
 	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: pods})
 	g.Expect(err).NotTo(HaveOccurred())

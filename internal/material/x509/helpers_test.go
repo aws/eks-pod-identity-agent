@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 )
@@ -211,7 +212,7 @@ func testSessions(expiresAt time.Time) *fake.SessionProvider {
 // reached through s.notifier and s.pods.
 func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.SessionProvider, now func() time.Time, draw func() float64) *Source {
 	t.Helper()
-	pods := &fake.PodStore{}
+	pods := &podstoretest.Store{}
 	s, err := New(Opts{
 		Issuer:          issuer,
 		SessionProvider: sessions,

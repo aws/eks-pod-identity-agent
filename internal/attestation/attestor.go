@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -45,6 +46,15 @@ const (
 	podLookupAttempts      = 5
 	podLookupRetryInterval = 50 * time.Millisecond
 )
+
+// PodGetter resolves a pod UID to the pod it belongs to, from the node-scoped
+// store. It is a small interface so the attestor is testable with a fake store
+// and no cluster.
+type PodGetter interface {
+	// PodByUID returns the pod with the given UID and true, or false when no pod
+	// on this node has that UID.
+	PodByUID(uid string) (*podstore.PodInfo, bool)
+}
 
 type attestor struct {
 	nodeName string
@@ -80,7 +90,7 @@ func newAttestor(nodeName string, pods PodGetter, cgroup CgroupResolver) *attest
 // spaced podRetryInterval apart, returning on the first hit. A miss after every
 // attempt is a real "no such pod on this node". The wait between attempts is cut
 // short if the request's context is cancelled.
-func (a *attestor) resolvePod(ctx context.Context, uid string) (*PodInfo, bool) {
+func (a *attestor) resolvePod(ctx context.Context, uid string) (*podstore.PodInfo, bool) {
 	attempts := a.podRetryAttempts
 	if attempts < 1 {
 		attempts = 1

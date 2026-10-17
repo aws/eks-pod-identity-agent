@@ -2,7 +2,7 @@ package tokenminter
 
 // Startup wiring for PSAT minting. The node-credentialed clientset and the
 // node-scoped pod store are injected, built once at startup and shared with the
-// attestor (T3).
+// attestor.
 
 import (
 	"context"

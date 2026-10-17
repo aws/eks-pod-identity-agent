@@ -1,4 +1,4 @@
-package fake
+package podstoretest
 
 import (
 	"errors"
@@ -7,9 +7,9 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestPodStore_RemoveHidesThePodWithoutCallbacks(t *testing.T) {
+func TestStore_RemoveHidesThePodWithoutCallbacks(t *testing.T) {
 	g := NewWithT(t)
-	var store PodStore
+	var store Store
 	var called []string
 	g.Expect(store.OnPodDeleted(func(uid string) { called = append(called, uid) })).To(Succeed())
 
@@ -20,9 +20,9 @@ func TestPodStore_RemoveHidesThePodWithoutCallbacks(t *testing.T) {
 	g.Expect(called).To(BeEmpty())
 }
 
-func TestPodStore_DeleteRemovesThenRunsEveryCallback(t *testing.T) {
+func TestStore_DeleteRemovesThenRunsEveryCallback(t *testing.T) {
 	g := NewWithT(t)
-	var store PodStore
+	var store Store
 	var seen []bool
 	for range 2 {
 		g.Expect(store.OnPodDeleted(func(uid string) { seen = append(seen, store.HasPod(uid)) })).To(Succeed())
@@ -33,10 +33,10 @@ func TestPodStore_DeleteRemovesThenRunsEveryCallback(t *testing.T) {
 	g.Expect(seen).To(Equal([]bool{false, false}), "each callback runs after the pod left the store")
 }
 
-func TestPodStore_RegisterErrRefusesRegistration(t *testing.T) {
+func TestStore_RegisterErrRefusesRegistration(t *testing.T) {
 	g := NewWithT(t)
 	refused := errors.New("no informer")
-	store := PodStore{RegisterErr: refused}
+	store := Store{RegisterErr: refused}
 
 	g.Expect(store.OnPodDeleted(func(string) {})).To(MatchError(refused))
 	g.Expect(store.Registered()).To(BeZero())

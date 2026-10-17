@@ -19,6 +19,7 @@ import (
 	x509tier "go.amzn.com/eks/eks-pod-identity-agent/internal/material/x509"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/notify"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/session"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/tokenminter"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
@@ -30,14 +31,14 @@ import (
 
 // workloadIdentityClients is what workload identity reaches the API server with,
 // built once by createServers before the credential manager: the node name the
-// agent authenticates as, the synced node-scoped pod store and T4's cached token
+// agent authenticates as, the synced node-scoped pod store and the cached token
 // minter. The minter is the one token cache, shared by the session tier's
 // exchanges and the credential cache's refreshes. The attestor resolves callers
 // from the pod store, and the minter and every per-pod tier drop a pod it reports
 // deleted.
 type workloadIdentityClients struct {
 	nodeName string
-	pods     *attestation.PodStore
+	podStore *podstore.Store
 	minter   workloadidentity.TokenMinter
 }
 
@@ -73,7 +74,7 @@ func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIde
 	if err != nil {
 		return nil, err
 	}
-	pods, err := attestation.NewPodStore(ctx, clientset, nodeName)
+	podStore, err := podstore.New(ctx, clientset, nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("starting the node-scoped pod store: %w", err)
 	}
@@ -81,12 +82,12 @@ func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIde
 	// reads as no caching.
 	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{
 		MaxCacheSize: opts.MaxCacheSize,
-		PodStore:     pods,
+		PodStore:     podStore,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the token minter: %w", err)
 	}
-	return &workloadIdentityClients{nodeName: nodeName, pods: pods, minter: minter}, nil
+	return &workloadIdentityClients{nodeName: nodeName, podStore: podStore, minter: minter}, nil
 }
 
 // credentialTokens is the token source the credential cache refreshes with: the
@@ -147,11 +148,11 @@ type workloadIdentityTiers struct {
 	handler      *workloadapi.Handler
 	sdsHandler   *sds.Handler
 	bundleSource *bundle.Registry
-	// sessions, certs and tokens are read only by tests, which call the tiers
-	// directly.
-	sessions *session.Provider
-	certs    *x509tier.Source
-	tokens   *jwttier.Source
+	// sessions, certSource and tokenSource are read only by tests, which call
+	// the tiers directly.
+	sessions    *session.Provider
+	certSource  *x509tier.Source
+	tokenSource *jwttier.Source
 }
 
 // newWorkloadIdentityTiers builds the tiers over clients and a new STS client.
@@ -167,7 +168,7 @@ func newWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 // per-pod tier share the clients' pod store, so a deleted pod leaves each tier.
 func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients, stsClient sts.Iface) (*workloadIdentityTiers, error) {
-	attestor := attestation.New(clients.nodeName, clients.pods, attestation.NewCgroupResolver())
+	attestor := attestation.New(clients.nodeName, clients.podStore, attestation.NewCgroupResolver())
 
 	// Cache is the credential cache every bind host serves from, so one session
 	// per pod serves both the HTTP endpoint and this socket. The tier refuses a
@@ -178,7 +179,7 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		Minter:      clients.minter,
 		Cache:       opts.CredentialCache,
 		EKSAuth:     opts.EKSAuth,
-		PodStore:    clients.pods,
+		PodStore:    clients.podStore,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the session tier: %w", err)
@@ -196,11 +197,11 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		return nil, fmt.Errorf("building the trust bundle tier: %w", err)
 	}
 
-	certs, err := x509tier.New(x509tier.Opts{
+	certSource, err := x509tier.New(x509tier.Opts{
 		Issuer:          stsClient,
 		SessionProvider: sessionProvider,
 		Notifier:        hub,
-		PodStore:        clients.pods,
+		PodStore:        clients.podStore,
 		MaxCacheSize:    opts.MaxCacheSize,
 		Duration:        opts.X509SVIDDuration,
 		RenewFraction:   opts.SVIDRenewalFraction,
@@ -211,10 +212,10 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		return nil, fmt.Errorf("building the X.509-SVID tier: %w", err)
 	}
 
-	tokens, err := jwttier.New(jwttier.Opts{
+	tokenSource, err := jwttier.New(jwttier.Opts{
 		Issuer:          stsClient,
 		SessionProvider: sessionProvider,
-		PodStore:        clients.pods,
+		PodStore:        clients.podStore,
 		MaxCacheSize:    opts.MaxCacheSize,
 		Duration:        opts.JWTSVIDDuration,
 		RenewalFraction: opts.SVIDRenewalFraction,
@@ -226,8 +227,8 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 
 	handler := workloadapi.New(workloadapi.Opts{
 		Attestor:              attestor,
-		Certs:                 certs,
-		Tokens:                tokens,
+		Certs:                 certSource,
+		Tokens:                tokenSource,
 		Bundles:               bundleSource,
 		X509SVIDSubscriber:    hub.ForRPC(workloadidentity.RPCFetchX509SVID),
 		X509BundlesSubscriber: hub.ForRPC(workloadidentity.RPCFetchX509Bundles),
@@ -235,7 +236,7 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 	})
 	sdsHandler := sds.New(sds.Opts{
 		Attestor: attestor,
-		Certs:    certs,
+		Certs:    certSource,
 		Bundles:  bundleSource,
 		// Its own hub.ForRPC, so an Envoy stream and a FetchX509SVID stream never
 		// share a subscription series. FetchSecrets has none: it answers once.
@@ -247,8 +248,8 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		sdsHandler:   sdsHandler,
 		bundleSource: bundleSource,
 		sessions:     sessionProvider,
-		certs:        certs,
-		tokens:       tokens,
+		certSource:   certSource,
+		tokenSource:  tokenSource,
 	}, nil
 }
 

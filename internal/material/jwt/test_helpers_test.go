@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
@@ -140,7 +141,7 @@ func successfulIssuer(t *testing.T, now *time.Time, lifetime time.Duration) *fak
 func newTestSource(
 	t *testing.T,
 	issuer Issuer,
-	watcher *fake.PodStore,
+	watcher *podstoretest.Store,
 	now *time.Time,
 	maxAudienceSets int,
 ) *Source {

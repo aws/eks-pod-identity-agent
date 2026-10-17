@@ -22,6 +22,7 @@ import (
 
 	// Initializes the agent's logger, which the tier logs a failed renewal
 	// through. Without it FromContext returns an entry over a nil logger.
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -59,7 +60,7 @@ func TestNewRejectsAnIncompleteConfiguration(t *testing.T) {
 		// keys is not something to arrive at by accident.
 		_, err := New(Opts{
 			Issuer: issuer, SessionProvider: testSessions(time.Now()), Notifier: &fake.Subscriber{},
-			PodStore: &fake.PodStore{}, MaxCacheSize: 0,
+			PodStore: &podstoretest.Store{}, MaxCacheSize: 0,
 		})
 		assert.ErrorContains(t, err, "positive cache bound")
 	})
@@ -363,7 +364,7 @@ func TestStoreNotifiesTheOpenStreams(t *testing.T) {
 		Issuer:          issuer,
 		SessionProvider: testSessions(now.Add(time.Hour)),
 		Notifier:        notifier,
-		PodStore:        &fake.PodStore{},
+		PodStore:        &podstoretest.Store{},
 		MaxCacheSize:    10,
 		Duration:        6 * time.Hour,
 		RenewFraction:   0.5,
@@ -627,7 +628,7 @@ func TestPodDeletionDropsTheCertificateAndWakesItsStreams(t *testing.T) {
 	}}
 	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
 	notifier := source.notifier.(*fake.Subscriber)
-	pods := source.pods.(*fake.PodStore)
+	pods := source.pods.(*podstoretest.Store)
 
 	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
 	require.NoError(t, err)
@@ -658,7 +659,7 @@ func TestX509SVIDsRefusesADeletedPod(t *testing.T) {
 	}}
 	sessions := testSessions(now.Add(time.Hour))
 	source := newTestSource(t, issuer, sessions, clockAt(&now), func() float64 { return 0.5 })
-	pods := source.pods.(*fake.PodStore)
+	pods := source.pods.(*podstoretest.Store)
 	w := testWorkload(testPodUID)
 
 	_, err := source.X509SVIDs(context.Background(), w)
@@ -694,7 +695,7 @@ func TestIssuanceInFlightWhenThePodIsDeletedStoresNothing(t *testing.T) {
 	}
 	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
 	notifier := source.notifier.(*fake.Subscriber)
-	pods := source.pods.(*fake.PodStore)
+	pods := source.pods.(*podstoretest.Store)
 
 	result := make(chan error, 1)
 	go func() {
@@ -726,7 +727,7 @@ func TestRenewalInFlightWhenThePodIsDeletedStoresNothing(t *testing.T) {
 	}}
 	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
 	notifier := source.notifier.(*fake.Subscriber)
-	pods := source.pods.(*fake.PodStore)
+	pods := source.pods.(*podstoretest.Store)
 
 	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
 	require.NoError(t, err)
@@ -760,7 +761,7 @@ func TestRenewalForADeletedPodDropsWithoutIssuing(t *testing.T) {
 	}}
 	sessions := testSessions(now.Add(time.Hour))
 	source := newTestSource(t, issuer, sessions, clockAt(&now), func() float64 { return 0.5 })
-	pods := source.pods.(*fake.PodStore)
+	pods := source.pods.(*podstoretest.Store)
 
 	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
 	require.NoError(t, err)

@@ -21,6 +21,7 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -43,7 +44,7 @@ type Opts struct {
 	// EKSAuth is the EKS Auth client every exchange goes to.
 	EKSAuth credentials.CredentialRetriever
 	// PodStore reports the pod deletions the tier drops entries for.
-	PodStore workloadidentity.PodStore
+	PodStore podstore.Interface
 }
 
 // Provider is the workloadidentity.SessionProvider the agent uses. It serves a
@@ -155,9 +156,9 @@ func (p *Provider) Invalidate(podUID string) {
 	p.cache.Delete(podUID)
 }
 
-// forget is the pod deletion callback. It drops the pod's entry, whichever caller
-// stored it, and has the cache refuse every later store for the pod, one for an
-// exchange or refresh in flight included.
+// forget is the pod deletion callback New registers with the pod store. It drops
+// the pod's entry, whichever caller stored it, and has the cache refuse every
+// later store for the pod, one for an exchange or refresh in flight included.
 func (p *Provider) forget(podUID string) {
 	if podUID == "" {
 		return

@@ -60,19 +60,6 @@ type Attestor interface {
 	Attest(ctx context.Context, peer Peer) (*Workload, error)
 }
 
-// PodStore is the node-scoped view of pods the attestor resolves callers from,
-// which every per-pod tier watches so a deleted pod's material goes with it. A
-// pod is gone from HasPod before OnPodDeleted's callbacks run for it, so a tier
-// that checks HasPod under the lock its callback takes never caches for a
-// deleted pod. internal/attestation's PodStore implements it.
-type PodStore interface {
-	// HasPod reports whether the pod is on this node.
-	HasPod(podUID string) bool
-	// OnPodDeleted has fn called with the UID of each pod that leaves this node.
-	// Callbacks must return promptly.
-	OnPodDeleted(fn func(podUID string)) error
-}
-
 // TokenMinter obtains a pod-bound ServiceAccount token for an attested
 // workload.
 type TokenMinter interface {

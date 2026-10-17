@@ -1,4 +1,4 @@
-package attestation
+package podstore
 
 import (
 	"net/http"
@@ -71,7 +71,7 @@ func TestPodReplacementSeenOnlyByARelistIsReported(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	store, err := NewPodStore(t.Context(), client, testNode)
+	store, err := New(t.Context(), client, testNode)
 	require.NoError(t, err)
 	replaced := make(chan string, 1)
 	require.NoError(t, store.OnPodDeleted(func(uid string) { replaced <- uid }))
@@ -92,15 +92,15 @@ func TestPodReplacementSeenOnlyByARelistIsReported(t *testing.T) {
 }
 
 func TestPodDeletionRegistrationRequiresInformerAndCallback(t *testing.T) {
-	var absent *PodStore
+	var absent *Store
 	require.Error(t, absent.OnPodDeleted(func(string) {}))
-	require.Error(t, (&PodStore{}).OnPodDeleted(func(string) {}))
-	require.Error(t, (&PodStore{}).OnPodDeleted(nil))
+	require.Error(t, (&Store{}).OnPodDeleted(func(string) {}))
+	require.Error(t, (&Store{}).OnPodDeleted(nil))
 }
 
 func TestPodDeletionCallbackUsesExistingInformer(t *testing.T) {
 	client := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
-	store, err := NewPodStore(t.Context(), client, testNode)
+	store, err := New(t.Context(), client, testNode)
 	require.NoError(t, err)
 	require.True(t, store.HasPod(testPodUID))
 	deleted := make(chan string, 1)
@@ -116,12 +116,12 @@ func TestPodDeletionCallbackUsesExistingInformer(t *testing.T) {
 }
 
 func TestHasPodUsesNodeCacheAndPodUID(t *testing.T) {
-	var absent *PodStore
+	var absent *Store
 	require.False(t, absent.HasPod(testPodUID))
-	require.False(t, (&PodStore{}).HasPod(testPodUID))
+	require.False(t, (&Store{}).HasPod(testPodUID))
 	p := pod(testPodUID, "web-0", "team-a", "web", testNode)
 	indexer := indexerWithPods(t, p)
-	store := newPodStoreFromIndexer(indexer)
+	store := newStoreFromIndexer(indexer)
 	require.True(t, store.HasPod(testPodUID))
 	require.False(t, store.HasPod(""))
 	require.False(t, store.HasPod("missing"))

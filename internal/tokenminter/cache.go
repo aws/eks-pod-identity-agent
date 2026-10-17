@@ -16,6 +16,7 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -63,7 +64,7 @@ type CachedMinter struct {
 	group   singleflight.Group
 	limiter *rate.Limiter
 	// pods is the node-scoped pod store, nil only in tests that skip presence checks.
-	pods workloadidentity.PodStore
+	pods podstore.Interface
 	// mu orders storeIfPresent against Invalidate, so a mint that finishes after
 	// the pod's deletion callback cannot store its token again.
 	mu sync.Mutex
@@ -96,7 +97,7 @@ type CachedMinterOpts struct {
 	// Invalidate for its deletions, and the minter refuses to mint or store a
 	// token for a pod it no longer holds. Nil, left only by tests that call
 	// newCachedMinter directly, turns the presence checks off.
-	PodStore workloadidentity.PodStore
+	PodStore podstore.Interface
 	// now is the clock; defaults to time.Now. Set only in tests.
 	now func() time.Time
 }

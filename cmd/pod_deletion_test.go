@@ -104,8 +104,8 @@ func wiCallEveryTier(ctx context.Context, tiers *workloadIdentityTiers, clients 
 	w *workloadidentity.Workload) map[string]error {
 	_, psat := clients.minter.Mint(ctx, w)
 	_, session := tiers.sessions.Session(ctx, w)
-	_, x509SVID := tiers.certs.X509SVIDs(ctx, w)
-	_, jwtSVID := tiers.tokens.JWTSVIDs(ctx, w, []string{wiAudience})
+	_, x509SVID := tiers.certSource.X509SVIDs(ctx, w)
+	_, jwtSVID := tiers.tokenSource.JWTSVIDs(ctx, w, []string{wiAudience})
 	return map[string]error{"PSAT": psat, "session": session, "X.509-SVID": x509SVID, "JWT-SVID": jwtSVID}
 }
 

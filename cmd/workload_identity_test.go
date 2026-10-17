@@ -690,7 +690,7 @@ func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
 		KubeconfigPath: opts.NodeKubeconfig, Cfg: opts.Cfg, ClusterName: opts.ClusterName,
 	}))
 	g.Expect(clients.nodeName).To(Equal(wiTestNode), "the node name resolves over the built client")
-	g.Expect(clients.pods).ToNot(BeNil(), "the pod store syncs with the clients")
+	g.Expect(clients.podStore).ToNot(BeNil(), "the pod store syncs with the clients")
 	g.Expect(clients.minter).ToNot(BeNil())
 	g.Expect(clients.credentialTokens()).ToNot(BeNil())
 }

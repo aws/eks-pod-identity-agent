@@ -8,6 +8,8 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
@@ -30,7 +32,7 @@ func newTestMinter(raw workloadidentity.TokenMinter, now func() time.Time) *Cach
 
 // newTestMinterWithPods is newTestMinter with presence checks against pods.
 // Nothing registers Invalidate, so a test plays the deletion callback itself.
-func newTestMinterWithPods(raw workloadidentity.TokenMinter, now func() time.Time, pods workloadidentity.PodStore) *CachedMinter {
+func newTestMinterWithPods(raw workloadidentity.TokenMinter, now func() time.Time, pods podstore.Interface) *CachedMinter {
 	return newCachedMinter(raw, CachedMinterOpts{
 		MaxCacheSize:    10,
 		CleanupInterval: -1,
@@ -275,7 +277,7 @@ func TestMint_PodGone_RefusedWithoutMinting(t *testing.T) {
 
 	clock := time.Now()
 	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "t1", ExpiresAt: clock.Add(time.Hour)}}
-	pods := &fake.PodStore{}
+	pods := &podstoretest.Store{}
 	m := newTestMinterWithPods(raw, clockAt(&clock), pods)
 	w := testWorkload()
 
@@ -303,7 +305,7 @@ func TestMint_PodDeletedMidMint_StoresNothing(t *testing.T) {
 	clock := time.Now()
 	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "late", ExpiresAt: clock.Add(time.Hour)}}
 	raw.Block()
-	pods := &fake.PodStore{}
+	pods := &podstoretest.Store{}
 	m := newTestMinterWithPods(raw, clockAt(&clock), pods)
 	w := testWorkload()
 
@@ -338,7 +340,7 @@ func TestOnRefresh_PodGone_DropsWithoutMinting(t *testing.T) {
 
 	clock := time.Now()
 	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "t1", ExpiresAt: clock.Add(time.Hour)}}
-	pods := &fake.PodStore{}
+	pods := &podstoretest.Store{}
 	m := newTestMinterWithPods(raw, clockAt(&clock), pods)
 	w := testWorkload()
 

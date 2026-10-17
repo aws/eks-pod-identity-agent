@@ -34,6 +34,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -99,7 +100,7 @@ type Opts struct {
 	// PodStore is the attestor's node-scoped pod store. Its deletion events drop a
 	// pod's certificate and key, and every store checks the pod is still in it. Required:
 	// without it a deleted pod's key stays in memory until the certificate expires.
-	PodStore workloadidentity.PodStore
+	PodStore podstore.Interface
 
 	// MaxCacheSize is the most certificates we hold, one per pod, from --max-cache-size.
 	// Zero or negative is rejected rather than defaulted: the cache underneath reads zero
@@ -156,7 +157,7 @@ type Source struct {
 	issuer          Issuer
 	sessionProvider workloadidentity.SessionProvider
 	notifier        workloadidentity.WorkloadNotifier
-	pods            workloadidentity.PodStore
+	pods            podstore.Interface
 	cache           *expiring.Cache[string, entry]
 
 	// storeMu makes store's presence check and cache write one step, and Invalidate

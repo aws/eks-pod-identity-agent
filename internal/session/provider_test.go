@@ -20,6 +20,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/eksauth/eksauthtest"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials/mockcreds"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
@@ -1360,7 +1361,7 @@ func TestNew_RejectsAnInvalidConfiguration(t *testing.T) {
 	cache := credcache.New(credcache.Opts{Delegate: client, RenewalTtl: time.Hour, MaxSize: 10, CleanupInterval: time.Hour})
 	valid := func() Opts {
 		return Opts{ClusterName: testClusterName, Minter: &fake.TokenMinter{}, Cache: cache, EKSAuth: client,
-			PodStore: &fake.PodStore{}}
+			PodStore: &podstoretest.Store{}}
 	}
 
 	testCases := []struct {
@@ -1383,7 +1384,7 @@ func TestNew_RejectsAnInvalidConfiguration(t *testing.T) {
 		{name: "no pod store", change: func(o *Opts) { o.PodStore = nil }, wantErr: []string{"pod store"}},
 		{
 			name:    "a pod store that refuses the callback",
-			change:  func(o *Opts) { o.PodStore = &fake.PodStore{RegisterErr: errors.New("no informer")} },
+			change:  func(o *Opts) { o.PodStore = &podstoretest.Store{RegisterErr: errors.New("no informer")} },
 			wantErr: []string{"registering the pod deletion callback", "no informer"},
 		},
 	}
@@ -1410,7 +1411,7 @@ func TestNew_RejectsAnInvalidConfiguration(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(p.cache).To(BeIdenticalTo(cache))
 		g.Expect(p.eksAuth).To(BeIdenticalTo(client))
-		g.Expect(opts.PodStore.(*fake.PodStore).Registered()).To(Equal(1), "New registers for pod deletions")
+		g.Expect(opts.PodStore.(*podstoretest.Store).Registered()).To(Equal(1), "New registers for pod deletions")
 	})
 }
 
@@ -1424,7 +1425,7 @@ func newMockedProvider(t *testing.T, client credentials.CredentialRetriever) *Pr
 		Minter:      &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "projected-token"}},
 		Cache:       cache,
 		EKSAuth:     client,
-		PodStore:    &fake.PodStore{},
+		PodStore:    &podstoretest.Store{},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -43,7 +43,8 @@ const (
 	imdsRefreshInterval = 30 * time.Minute
 )
 
-// ErrForgotten is what Store returns for a pod Forget dropped.
+// ErrForgotten is what Store returns, caching nothing, for a pod UID passed to
+// Forget: a pod deleted from the node.
 var ErrForgotten = errors.New("the pod was deleted")
 
 var (
@@ -154,9 +155,11 @@ type Cache struct {
 	// entry and its write are one step, and so are Store's check that the pod
 	// isn't forgotten and its write.
 	mu sync.Mutex
-	// forgotten holds the pod UIDs Forget dropped. A UID is never reused and only
-	// has to outlive the writes in flight at Forget, so MaxSize bounds it and
-	// nothing sweeps it.
+	// forgotten holds the UIDs of deleted pods passed to Forget, and Store refuses
+	// them. Pod UIDs are never reused, so a UID only has to stay until the writes
+	// already running when Forget was called finish. The cache is an LRU of
+	// MaxSize; if it evicts a UID while one of those writes is still running, that
+	// write caches the deleted pod.
 	forgotten *expiring.Cache[string, struct{}]
 
 	delegate    credentials.CredentialRetriever

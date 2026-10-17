@@ -15,6 +15,7 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -38,7 +39,7 @@ type Issuer interface {
 type Opts struct {
 	Issuer                Issuer
 	SessionProvider       workloadidentity.SessionProvider
-	PodStore              workloadidentity.PodStore
+	PodStore              podstore.Interface
 	MaxCacheSize          int
 	MaxAudienceSetsPerPod int
 	Duration              time.Duration
@@ -56,7 +57,7 @@ type Opts struct {
 type Source struct {
 	issuer          Issuer
 	sessionProvider workloadidentity.SessionProvider
-	pods            workloadidentity.PodStore
+	pods            podstore.Interface
 	cache           *expiring.Cache[cacheKey, *entry]
 	group           singleflight.Group
 	limiter         *rate.Limiter
