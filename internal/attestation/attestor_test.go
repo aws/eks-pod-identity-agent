@@ -10,6 +10,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -40,11 +41,11 @@ func (f *fakePeer) Alive() error {
 // fakePods is an injected PodGetter. It records each lookup against the shared
 // event sink.
 type fakePods struct {
-	byUID  map[string]*PodInfo
+	byUID  map[string]*podstore.PodInfo
 	events *[]string
 }
 
-func (f *fakePods) PodByUID(uid string) (*PodInfo, bool) {
+func (f *fakePods) PodByUID(uid string) (*podstore.PodInfo, bool) {
 	if f.events != nil {
 		*f.events = append(*f.events, "resolve")
 	}
@@ -66,8 +67,8 @@ const (
 	testPodUID = "4e8f8d3a-9c3d-4b7e-8f2a-1c2d3e4f5a6b"
 )
 
-func knownPod(node string) *PodInfo {
-	return &PodInfo{
+func knownPod(node string) *podstore.PodInfo {
+	return &podstore.PodInfo{
 		UID:            testPodUID,
 		Name:           "web-0",
 		Namespace:      "team-a",
@@ -83,7 +84,7 @@ func TestAttest_KnownPod_ReturnsPopulatedWorkload(t *testing.T) {
 
 	peer := &fakePeer{fakePID: 4242}
 	att := newAttestor(testNode,
-		&fakePods{byUID: map[string]*PodInfo{testPodUID: knownPod(testNode)}},
+		&fakePods{byUID: map[string]*podstore.PodInfo{testPodUID: knownPod(testNode)}},
 		&fakeCgroup{uid: testPodUID})
 
 	w, err := att.Attest(context.Background(), peer)
@@ -105,7 +106,7 @@ func TestAttest_RechecksAfterResolution(t *testing.T) {
 	var events []string
 	peer := &fakePeer{fakePID: 4242, events: &events}
 	att := newAttestor(testNode,
-		&fakePods{byUID: map[string]*PodInfo{testPodUID: knownPod(testNode)}, events: &events},
+		&fakePods{byUID: map[string]*podstore.PodInfo{testPodUID: knownPod(testNode)}, events: &events},
 		&fakeCgroup{uid: testPodUID})
 
 	_, err := att.Attest(context.Background(), peer)
@@ -153,28 +154,28 @@ func TestAttest_RefusalPaths(t *testing.T) {
 			name:   "pod not in node store",
 			peer:   &fakePeer{fakePID: 1},
 			cgroup: &fakeCgroup{uid: testPodUID},
-			pods:   &fakePods{byUID: map[string]*PodInfo{}},
+			pods:   &fakePods{byUID: map[string]*podstore.PodInfo{}},
 			reason: workloadidentity.ReasonPodNotInStore,
 		},
 		{
 			name:   "pod not in store, but the PID was reused: the recheck wins",
 			peer:   &fakePeer{fakePID: 1, aliveErrs: []error{nil, errDead}},
 			cgroup: &fakeCgroup{uid: testPodUID},
-			pods:   &fakePods{byUID: map[string]*PodInfo{}},
+			pods:   &fakePods{byUID: map[string]*podstore.PodInfo{}},
 			reason: workloadidentity.ReasonLivenessRecheckFailed,
 		},
 		{
 			name:   "pod bound to another node",
 			peer:   &fakePeer{fakePID: 1},
 			cgroup: &fakeCgroup{uid: testPodUID},
-			pods:   &fakePods{byUID: map[string]*PodInfo{testPodUID: knownPod("some-other-node")}},
+			pods:   &fakePods{byUID: map[string]*podstore.PodInfo{testPodUID: knownPod("some-other-node")}},
 			reason: workloadidentity.ReasonPodNodeMismatch,
 		},
 		{
 			name:   "liveness recheck fails after resolution",
 			peer:   &fakePeer{fakePID: 1, aliveErrs: []error{nil, errDead}},
 			cgroup: &fakeCgroup{uid: testPodUID},
-			pods:   &fakePods{byUID: map[string]*PodInfo{testPodUID: knownPod(testNode)}},
+			pods:   &fakePods{byUID: map[string]*podstore.PodInfo{testPodUID: knownPod(testNode)}},
 			reason: workloadidentity.ReasonLivenessRecheckFailed,
 		},
 	}
@@ -185,7 +186,7 @@ func TestAttest_RefusalPaths(t *testing.T) {
 
 			pods := tc.pods
 			if pods == nil {
-				pods = &fakePods{byUID: map[string]*PodInfo{}}
+				pods = &fakePods{byUID: map[string]*podstore.PodInfo{}}
 			}
 			cgroup := tc.cgroup
 			if cgroup == nil {
@@ -210,12 +211,12 @@ func TestAttest_RefusalPaths(t *testing.T) {
 // simulates informer cache lag: the pod's ADD watch event lands only after the
 // caller has already asked for it.
 type flakyPods struct {
-	pod      *PodInfo
+	pod      *podstore.PodInfo
 	hitAfter int
 	calls    int
 }
 
-func (f *flakyPods) PodByUID(string) (*PodInfo, bool) {
+func (f *flakyPods) PodByUID(string) (*podstore.PodInfo, bool) {
 	f.calls++
 	if f.calls >= f.hitAfter {
 		return f.pod, true
@@ -230,7 +231,7 @@ func TestAttest_PodAppearsAfterCacheLag_Retries(t *testing.T) {
 	g := NewWithT(t)
 
 	pods := &flakyPods{
-		pod:      &PodInfo{UID: testPodUID, Name: "web-0", Namespace: "team-a", ServiceAccount: "web", NodeName: testNode},
+		pod:      &podstore.PodInfo{UID: testPodUID, Name: "web-0", Namespace: "team-a", ServiceAccount: "web", NodeName: testNode},
 		hitAfter: 3, // miss, miss, then hit
 	}
 	att := newAttestor(testNode, pods, &fakeCgroup{uid: testPodUID})
@@ -271,7 +272,7 @@ func TestAttest_NodeMismatch_CountsOwnMetric(t *testing.T) {
 		promAttestationTotal.WithLabelValues(workloadidentity.OutcomeFailure, workloadidentity.ReasonPodNodeMismatch))
 
 	att := newAttestor(testNode,
-		&fakePods{byUID: map[string]*PodInfo{testPodUID: knownPod("some-other-node")}},
+		&fakePods{byUID: map[string]*podstore.PodInfo{testPodUID: knownPod("some-other-node")}},
 		&fakeCgroup{uid: testPodUID})
 
 	_, err := att.Attest(context.Background(), &fakePeer{fakePID: 1})

@@ -267,7 +267,8 @@ func TestBuildSharedCredentialManager_Off_GivesTheCacheNoTokenSource(t *testing.
 // serves for the pod, from one TokenRequest on the one node client.
 func TestBuildSharedCredentialManager_On_RefreshesWithTheTiersMinter(t *testing.T) {
 	g := NewWithT(t)
-	client := newWINodeClientset("system:node:" + wiTestNode)
+	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
+	client := newWINodeClientset("system:node:"+wiTestNode, w)
 	builds := countNodeClientBuilds(t, client)
 	built := captureCredentialManagerOpts(t)
 	credentialOpts := handlers.EksCredentialHandlerOpts{
@@ -279,13 +280,11 @@ func TestBuildSharedCredentialManager_On_RefreshesWithTheTiersMinter(t *testing.
 
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(builds.Load()).To(Equal(int32(1)))
-	g.Expect(clients.clientset).To(BeIdenticalTo(client))
 	g.Expect(*built).To(HaveLen(1))
 	g.Expect(workloadIdentityOpts.CredentialCache).ToNot(BeNil(), "the session tier gets the manager's cache")
 	tokens := (*built)[0].WorkloadIdentityTokens
 	g.Expect(tokens).ToNot(BeNil())
 
-	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
 	stored := wiPodToken(w.Namespace, w.ServiceAccount, &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{BoundObjectRef: &authenticationv1.BoundObjectReference{
 			Name: w.PodName, UID: types.UID(w.PodUID),

@@ -12,13 +12,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
 func TestIssuanceCleansUpAfterRecoveredStorePanic(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	issuer := successfulIssuer(t, &now, time.Hour)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 10)
 	source.draw = func() float64 {
 		panic("renewal point failed")
 	}
@@ -44,7 +45,7 @@ func TestIssuanceCleansUpAfterRecoveredStorePanic(t *testing.T) {
 func TestMultipleAudiencesUseOneTokenAndRenewTogether(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second).Add(-6 * time.Minute)
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 10)
 	audiences := []string{"one.example", "two.example", "three.example"}
 
 	svids, err := source.JWTSVIDs(context.Background(), workload(testPodUID), audiences)
@@ -81,7 +82,7 @@ func TestIssuanceRejectsMissingOrExtraAudiencesWithoutCaching(t *testing.T) {
 			issuer := &fakeIssuer{respond: func(int, sts.WebIdentityTokenRequest) (*sts.IssuedWebIdentityToken, error) {
 				return &sts.IssuedWebIdentityToken{Token: token, Expiration: expiresAt}, nil
 			}}
-			source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+			source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 10)
 
 			svids, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"ledger.example", "payments.example"})
 			require.ErrorIs(t, err, wierrors.ErrIssuanceFailed)
@@ -134,7 +135,7 @@ func TestIssuanceClassifiesSTSFailuresAndInvalidatesOnlyStaleSessions(t *testing
 				return nil, upstream
 			}}
 			provider := sessions(now.Add(time.Hour))
-			source := newTestSource(t, issuer, &fakePodStore{}, &now, 1)
+			source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 			source.sessionProvider = provider
 
 			svids, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"payments.example"})
@@ -179,7 +180,7 @@ func TestSessionFailureSkipsSTSAndReleasesAudienceSetReservation(t *testing.T) {
 	validSession := provider.Result
 	upstream := errors.New("session unavailable")
 	provider.SetResult(nil, upstream)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 1)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 	source.sessionProvider = provider
 
 	_, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"one.example"})
@@ -343,7 +344,7 @@ func TestIssuanceRejectsInvalidSTSResponses(t *testing.T) {
 				return tc.response, nil
 			}}
 			provider := sessions(now.Add(time.Hour))
-			source := newTestSource(t, issuer, &fakePodStore{}, &now, 1)
+			source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 			source.sessionProvider = provider
 
 			svids, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"payments.example"})
@@ -370,7 +371,7 @@ func TestIssuanceUsesCallStartWhenTokenHasNoIssuedAt(t *testing.T) {
 		now = now.Add(10 * time.Second)
 		return &sts.IssuedWebIdentityToken{Token: token, Expiration: expiresAt}, nil
 	}}
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 1)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 
 	svids, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"payments.example"})
 	require.NoError(t, err)

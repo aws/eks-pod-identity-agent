@@ -1249,6 +1249,37 @@ func TestCachedCredentialRetriever_RefreshUsesGeneralDelegate(t *testing.T) {
 	g.Expect(e.Request).To(Equal(request))
 }
 
+// TestCachedCredentialRetriever_ForgottenPod_ServesUncached verifies a pod the
+// cache forgot, as it does a deleted one, is served what the authoritative
+// delegate vended without caching it, so its next request reaches the delegate
+// again.
+func TestCachedCredentialRetriever_ForgottenPod_ServesUncached(t *testing.T) {
+	g := NewWithT(t)
+
+	podUID := "deleted-pod"
+	request := &credentials.EksCredentialsRequest{ServiceAccountToken: sourceTestToken(t, podUID)}
+	delegate := &countingRetriever{accessKeyId: "AKIA-uncached"}
+	retriever := newTestRetriever(credcache.Opts{
+		RenewalTtl: time.Hour,
+		MaxSize:    100,
+		RefreshQPS: 3,
+	}, CachedCredentialRetrieverOpts{
+		Delegate:              delegate,
+		AuthoritativeDelegate: delegate,
+	})
+	retriever.cache.Forget(podUID)
+
+	for range 2 {
+		creds, metadata, err := retriever.GetIamCredentials(context.Background(), request)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(creds.AccessKeyId).To(Equal("AKIA-uncached"))
+		g.Expect(metadata).To(Equal(responseMetadataTest("assoc")))
+		_, ok := retriever.cache.Get(podUID)
+		g.Expect(ok).To(BeFalse(), "a forgotten pod's credentials are not cached")
+	}
+	g.Expect(delegate.requests()).To(HaveExactElements(Equal(request), Equal(request)))
+}
+
 // countingRetriever serves new hour-long credentials with accessKeyId on every
 // call and records the requests it's given. Unlike a gomock mock it's safe to call
 // after the test ends, as the cache's sweep may.

@@ -13,6 +13,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
+	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
+
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 )
 
@@ -26,7 +29,7 @@ func TestNewMinter_ChecksDriverAndMints(t *testing.T) {
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &podstoretest.Store{}})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	got, err := m.Mint(context.Background(), testWorkload())
@@ -45,7 +48,7 @@ func TestNewMinter_MissingDriver_StillStarts(t *testing.T) {
 	var sent *authenticationv1.TokenRequest
 	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &podstoretest.Store{}})
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(m).NotTo(BeNil())
@@ -63,8 +66,62 @@ func TestNewMinter_HardCheckError_Fails(t *testing.T) {
 			return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
 		})
 
-	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: &podstoretest.Store{}})
 
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(m).To(BeNil())
+}
+
+// TestNewMinter_NilPodStore_Fails proves startup refuses a minter with no pod
+// store, which could never drop a deleted pod's token, before reaching the API.
+func TestNewMinter_NilPodStore_Fails(t *testing.T) {
+	g := NewWithT(t)
+
+	client := fake.NewSimpleClientset(chartCSIDriver())
+
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1})
+
+	g.Expect(err).To(MatchError(ContainSubstring("pod store")))
+	g.Expect(m).To(BeNil())
+	g.Expect(client.Actions()).To(BeEmpty())
+}
+
+// TestNewMinter_RegistrationError_Fails proves a pod store that cannot report
+// deletions stops startup.
+func TestNewMinter_RegistrationError_Fails(t *testing.T) {
+	g := NewWithT(t)
+
+	client := fake.NewSimpleClientset(chartCSIDriver())
+	pods := &podstoretest.Store{RegisterErr: errors.New("no informer")}
+
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: pods})
+
+	g.Expect(err).To(MatchError(ContainSubstring("no informer")))
+	g.Expect(m).To(BeNil())
+}
+
+// TestNewMinter_PodDeleted_DropsToken proves NewMinter registers for the pod
+// store's deletions, so a deleted pod's cached token is dropped and the pod is
+// refused afterwards.
+func TestNewMinter_PodDeleted_DropsToken(t *testing.T) {
+	g := NewWithT(t)
+
+	client := fake.NewSimpleClientset(chartCSIDriver())
+	noWrites(client)
+	var sent *authenticationv1.TokenRequest
+	tokenReactor(client, &sent, "psat", time.Now().Add(time.Hour))
+	pods := &podstoretest.Store{}
+
+	m, err := NewMinter(context.Background(), client, CachedMinterOpts{MaxCacheSize: 10, CleanupInterval: -1, PodStore: pods})
+	g.Expect(err).NotTo(HaveOccurred())
+	w := testWorkload()
+	_, err = m.Mint(context.Background(), w)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	pods.Delete(w.PodUID)
+
+	_, ok := m.(*CachedMinter).cache.Get(w.PodUID)
+	g.Expect(ok).To(BeFalse(), "the deletion callback must drop the pod's token")
+	_, err = m.Mint(context.Background(), w)
+	g.Expect(err).To(MatchError(wierrors.ErrUnattestable))
 }

@@ -189,8 +189,9 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, server.NewProbeServer(fmt.Sprintf("localhost:%d", probePort), bindHosts, serverPort))
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 
-	// Last, so a node the agent cannot attest on, or a socket that cannot be
-	// bound, fails the boot before anything is serving.
+	// Last, so a tier that cannot be built, or a socket that cannot be bound,
+	// fails the boot before anything is serving. A node the agent cannot attest
+	// on already failed it, in buildSharedCredentialManager.
 	workloadIdentity, err := workloadIdentityServers(ctx, workloadIdentityOpts, wiClients)
 	if err != nil {
 		return nil, fmt.Errorf("building the workload identity servers (--%s=false turns workload identity off): %w",

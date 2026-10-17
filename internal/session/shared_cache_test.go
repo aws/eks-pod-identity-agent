@@ -265,6 +265,34 @@ func TestSharedCache_InvalidateForcesTheNextHTTPRequestToExchange(t *testing.T) 
 	g.Expect(h.server.Calls()).To(Equal(2))
 }
 
+// TestSharedCache_APodDeletionDropsAnUndecoratedHTTPEntry proves a pod's
+// deletion drops an entry the HTTP retriever stored, undecorated as it is, and
+// the cache refuses the HTTP retriever's next store for the pod, which then
+// serves what EKS Auth vended without caching it.
+func TestSharedCache_APodDeletionDropsAnUndecoratedHTTPEntry(t *testing.T) {
+	g := NewWithT(t)
+	h := newSessionFixture(t)
+	h.server.SetFunc(func(eksauthtest.Request) (*eksauthtest.Session, *eksauthtest.APIError) {
+		session := eksauthtest.NotEnrolledSession(h.clock.Now().Add(time.Hour))
+		return &session, nil
+	})
+	token := podToken(t, testSessionPodUID, 0)
+	_, err := h.httpCredentials(t.Context(), token)
+	g.Expect(err).NotTo(HaveOccurred())
+	httpEntry, ok := h.cache.Get(testSessionPodUID)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(decorated(httpEntry)).To(BeFalse())
+
+	h.pods.Delete(testSessionPodUID)
+
+	g.Expect(h.cachedKey(testSessionPodUID)).To(BeEmpty())
+	creds, err := h.httpCredentials(t.Context(), token)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(creds.AccessKeyId).To(Equal(httpEntry.Credentials.AccessKeyId))
+	g.Expect(h.cachedKey(testSessionPodUID)).To(BeEmpty())
+	g.Expect(h.server.Calls()).To(Equal(2))
+}
+
 // TestSharedCache_ANotEnrolledHTTPEntryMakesSessionExchangeAndStaysCached proves
 // Session treats an entry with no provider ARN as a miss: it exchanges, gets
 // ErrNotEnrolled, stores nothing, and the HTTP entry goes on serving its caller.

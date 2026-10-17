@@ -15,6 +15,7 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -35,16 +36,10 @@ type Issuer interface {
 	GetWebIdentityToken(context.Context, aws.Credentials, sts.WebIdentityTokenRequest) (*sts.IssuedWebIdentityToken, error)
 }
 
-// PodStore supplies presence and deletion events from the same node-scoped cache.
-type PodStore interface {
-	HasPod(podUID string) bool
-	OnPodDeleted(func(podUID string)) error
-}
-
 type Opts struct {
 	Issuer                Issuer
 	SessionProvider       workloadidentity.SessionProvider
-	PodStore              PodStore
+	PodStore              podstore.Interface
 	MaxCacheSize          int
 	MaxAudienceSetsPerPod int
 	Duration              time.Duration
@@ -62,7 +57,7 @@ type Opts struct {
 type Source struct {
 	issuer          Issuer
 	sessionProvider workloadidentity.SessionProvider
-	pods            PodStore
+	pods            podstore.Interface
 	cache           *expiring.Cache[cacheKey, *entry]
 	group           singleflight.Group
 	limiter         *rate.Limiter

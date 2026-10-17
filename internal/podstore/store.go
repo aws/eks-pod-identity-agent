@@ -1,7 +1,6 @@
-package attestation
-
-// This file covers the pod-resolution link in the attestation chain: turning a
-// pod UID into the pod object it belongs to, from a store scoped to this node.
+// Package podstore is the agent's node-scoped view of pods. Attestation resolves
+// a caller's pod UID through it, and the per-pod tiers drop a pod's material when
+// it reports the pod gone.
 //
 // The store is backed by an informer whose list and watch carry a
 // spec.nodeName field selector equal to the agent's node. The selector is not an
@@ -10,11 +9,11 @@ package attestation
 // explicit, and it is what keeps a local caller from ever resolving to a pod on
 // another node. The redundant node recheck in the attestor turns a selector
 // regression from a security hole into a refused request.
+package podstore
 
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -26,11 +25,6 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 )
-
-// podResyncInterval is how often the informer relists. Attestation reads the
-// cache, never the API server, so a resync only reconciles against missed
-// watch events; a slow, cheap period is right.
-const podResyncInterval = 10 * time.Minute
 
 // podByUIDIndex is the informer index that keys pods by their UID, which is the
 // identifier the cgroup path yields. The default informer index is by
@@ -53,20 +47,25 @@ type PodInfo struct {
 	NodeName string
 }
 
-// PodGetter resolves a pod UID to the pod it belongs to, from the node-scoped
-// store. It is a small interface so the attestor is testable with a fake store
-// and no cluster.
-type PodGetter interface {
-	// PodByUID returns the pod with the given UID and true, or false when no pod
-	// on this node has that UID.
-	PodByUID(uid string) (*PodInfo, bool)
+// Interface is what the per-pod tiers need from the store. A pod is gone from
+// HasPod before OnPodDeleted's callbacks run for it, so a tier that checks HasPod
+// under the lock its callback takes never caches for a deleted pod. Store
+// implements it.
+type Interface interface {
+	// HasPod reports whether the pod is on this node.
+	HasPod(podUID string) bool
+	// OnPodDeleted has fn called with the UID of each pod that leaves this node.
+	// Callbacks must return promptly.
+	OnPodDeleted(fn func(podUID string)) error
 }
 
-// PodStore is a node-scoped view of pods backed by a shared informer.
-type PodStore struct {
+// Store is a node-scoped view of pods backed by a shared informer.
+type Store struct {
 	indexer  cache.Indexer
 	informer cache.SharedIndexInformer
 }
+
+var _ Interface = (*Store)(nil)
 
 // podUIDIndexFunc keys a pod object by its UID for the byPodUID index.
 func podUIDIndexFunc(obj interface{}) ([]string, error) {
@@ -126,19 +125,24 @@ func stripDownPod(obj interface{}) (interface{}, error) {
 	}, nil
 }
 
-// NewPodStore builds a pod store scoped to nodeName, starts its informer, and
+// New builds a pod store scoped to nodeName, starts its informer, and
 // blocks until the cache has synced or ctx is done. The field selector is what
 // scopes the list and watch to this node; it is applied through the informer
 // factory so both the initial list and the ongoing watch carry it.
-func NewPodStore(ctx context.Context, clientset kubernetes.Interface, nodeName string) (*PodStore, error) {
+func New(ctx context.Context, clientset kubernetes.Interface, nodeName string) (*Store, error) {
 	if nodeName == "" {
 		return nil, fmt.Errorf("node name is required to scope the pod store")
 	}
 
 	nodeSelector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
+	// No resync. A resync never asks the API server: it replays each cached pod
+	// to the handlers as an update from the pod to itself. podReplacedHandler
+	// ignores that, since the UID is the same, and a resync never produces a
+	// delete. Missed events come back through the reflector, which resumes the
+	// watch and relists on 410.
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		clientset,
-		podResyncInterval,
+		0,
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 			opts.FieldSelector = nodeSelector
 		}),
@@ -184,11 +188,14 @@ func NewPodStore(ctx context.Context, clientset kubernetes.Interface, nodeName s
 		"pods": len(indexer.ListKeys()),
 	}).Info("podstore: node-scoped pod informer synced")
 
-	return &PodStore{indexer: indexer, informer: podInformer}, nil
+	return &Store{indexer: indexer, informer: podInformer}, nil
 }
 
-// OnPodDeleted reuses this node's watch. Callbacks must return promptly.
-func (s *PodStore) OnPodDeleted(fn func(podUID string)) error {
+// OnPodDeleted calls fn with the UID of each pod that leaves this node's store:
+// deleted, or replaced by a same-named pod with a new UID, which a relist
+// delivers as an update with no delete. It reuses this node's watch. Callbacks
+// must return promptly.
+func (s *Store) OnPodDeleted(fn func(podUID string)) error {
 	if fn == nil {
 		return fmt.Errorf("pod deletion callback is required")
 	}
@@ -196,6 +203,9 @@ func (s *PodStore) OnPodDeleted(fn func(podUID string)) error {
 		return fmt.Errorf("pod store has no informer to report pod deletions from")
 	}
 	_, err := s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// Not for UID changes, which can't happen: for two pods sharing a name,
+		// whose delete and create a relist folds into one update.
+		UpdateFunc: podReplacedHandler(fn),
 		DeleteFunc: podDeletedHandler(fn),
 	})
 	if err != nil {
@@ -212,6 +222,21 @@ func podDeletedHandler(fn func(string)) func(interface{}) {
 		pod, ok := obj.(*corev1.Pod)
 		if ok && pod != nil && pod.UID != "" {
 			fn(string(pod.UID))
+		}
+	}
+}
+
+// podReplacedHandler reports the old UID when an update carries a different pod.
+// A pod's UID never changes, but the informer keys pods by namespace/name: a pod
+// deleted and recreated under the same name while the watch is down, such as a
+// StatefulSet pod, reaches the relist as one update from old pod to new and no
+// delete (client-go's SharedInformer doc). A resync keeps the UID and reports nothing.
+func podReplacedHandler(fn func(string)) func(interface{}, interface{}) {
+	return func(oldObj, newObj interface{}) {
+		oldPod, oldOK := oldObj.(*corev1.Pod)
+		newPod, newOK := newObj.(*corev1.Pod)
+		if oldOK && newOK && oldPod != nil && newPod != nil && oldPod.UID != "" && oldPod.UID != newPod.UID {
+			fn(string(oldPod.UID))
 		}
 	}
 }
@@ -243,14 +268,14 @@ func logPodEvent(log *logrus.Entry, verb string, obj interface{}) {
 	}).Debug("podstore: watch event")
 }
 
-// newPodStoreFromIndexer wraps a prepopulated indexer. It exists so the lookup
+// newStoreFromIndexer wraps a prepopulated indexer. It exists so the lookup
 // and projection logic can be tested without an informer or a cluster.
-func newPodStoreFromIndexer(indexer cache.Indexer) *PodStore {
-	return &PodStore{indexer: indexer}
+func newStoreFromIndexer(indexer cache.Indexer) *Store {
+	return &Store{indexer: indexer}
 }
 
 // HasPod checks the node-scoped cache without calling the API server.
-func (s *PodStore) HasPod(uid string) bool {
+func (s *Store) HasPod(uid string) bool {
 	if s == nil || s.indexer == nil || uid == "" {
 		return false
 	}
@@ -261,7 +286,7 @@ func (s *PodStore) HasPod(uid string) bool {
 // PodByUID returns the pod with uid from the node-scoped cache. A UID absent
 // from the store is a clean miss, which the attestor treats as an unresolvable
 // caller rather than an error.
-func (s *PodStore) PodByUID(uid string) (*PodInfo, bool) {
+func (s *Store) PodByUID(uid string) (*PodInfo, bool) {
 	objs, err := s.indexer.ByIndex(podByUIDIndex, uid)
 	if err != nil || len(objs) == 0 {
 		return nil, false

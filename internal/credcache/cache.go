@@ -43,6 +43,10 @@ const (
 	imdsRefreshInterval = 30 * time.Minute
 )
 
+// ErrForgotten is what Store returns, caching nothing, for a pod UID passed to
+// Forget: a pod deleted from the node.
+var ErrForgotten = errors.New("the pod was deleted")
+
 var (
 	promCacheError = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_identity_cache_errors",
@@ -143,12 +147,20 @@ type Opts struct {
 // evicts it at its eviction time. Both times come from the credentials' source.
 // Writes go by pod UID, as upstream's do. A refresh skips an entry removed or
 // replaced since the sweep picked it, and one that keeps the old credentials
-// doesn't put them back over a newer entry or a removed one.
+// doesn't put them back over a newer entry or a removed one. Nothing is stored
+// for a pod Forget dropped.
 type Cache struct {
 	items *expiring.Cache[string, *Entry]
 	// mu serializes every write, so keep's check that the cache still holds its
-	// entry and its write are one step.
+	// entry and its write are one step, and so are Store's check that the pod
+	// isn't forgotten and its write.
 	mu sync.Mutex
+	// forgotten holds the UIDs of deleted pods passed to Forget, and Store refuses
+	// them. Pod UIDs are never reused, so a UID only has to stay until the writes
+	// already running when Forget was called finish. The cache is an LRU of
+	// MaxSize; if it evicts a UID while one of those writes is still running, that
+	// write caches the deleted pod.
+	forgotten *expiring.Cache[string, struct{}]
 
 	delegate    credentials.CredentialRetriever
 	refreshWith func(e *Entry) (credentials.CredentialRetriever, TokenSource)
@@ -183,6 +195,7 @@ func New(opts Opts) *Cache {
 	}
 	c := &Cache{
 		items:            expiring.NewLru[string, *Entry](opts.MaxSize, opts.RenewalTtl, opts.CleanupInterval),
+		forgotten:        expiring.NewLru[string, struct{}](opts.MaxSize, expiring.NoExpiration, 0),
 		delegate:         opts.Delegate,
 		refreshWith:      opts.RefreshWith,
 		maxSize:          opts.MaxSize,
@@ -230,7 +243,7 @@ func (c *Cache) CredentialsWithinValidTtl(e *Entry) (time.Duration, bool) {
 
 // Store puts e in the cache for podUID, replacing whatever is there, and schedules
 // its refresh and eviction by source. It refuses an entry whose credentials
-// aren't within their valid TTL.
+// aren't within their valid TTL, and with ErrForgotten one for a forgotten pod.
 func (c *Cache) Store(ctx context.Context, podUID string, e *Entry) error {
 	if e == nil || e.Credentials == nil {
 		return errors.New("no credentials to cache")
@@ -240,11 +253,18 @@ func (c *Cache) Store(ctx context.Context, podUID string, e *Entry) error {
 		return fmt.Errorf("fetched credentials are expired or will expire within the next %0.2f seconds", credsDuration.Seconds())
 	}
 	refreshTtl, evictionTtl := c.ttls(e.source(), credsDuration)
-	func() {
+	err := func() error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if _, forgotten := c.forgotten.Get(podUID); forgotten {
+			return fmt.Errorf("not caching credentials for pod %s: %w", podUID, ErrForgotten)
+		}
 		c.items.SetWithRefreshExpire(podUID, e, refreshTtl, evictionTtl)
+		return nil
 	}()
+	if err != nil {
+		return err
+	}
 	logger.FromContext(ctx).WithFields(map[string]interface{}{
 		"refreshTtl":    refreshTtl,
 		"evictionTtl":   evictionTtl,
@@ -278,6 +298,15 @@ func (c *Cache) Delete(podUID string) {
 	c.items.Delete(podUID)
 }
 
+// Forget removes podUID's entry, if it has one, and has every later Store for
+// podUID fail with ErrForgotten. It's for a deleted pod, whose UID never recurs.
+func (c *Cache) Forget(podUID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forgotten.Set(podUID, struct{}{})
+	c.items.Delete(podUID)
+}
+
 // contains reports whether the cache holds e for podUID, past its eviction time
 // or not.
 func (c *Cache) contains(podUID string, e *Entry) bool {
@@ -307,7 +336,8 @@ func (c *Cache) ttls(source credentials.CredentialSource, credsDuration time.Dur
 
 // onRefresh is the sweep's refresh callback: renew e, drop it on an irrecoverable
 // failure, and otherwise keep it and retry later. It skips e once the cache no
-// longer holds it, since the sweep picks every due entry first.
+// longer holds it, since the sweep picks every due entry first, and is done with
+// a pod forgotten while it renewed.
 func (c *Cache) onRefresh(podUID string, e *Entry) {
 	ctx, cancel := context.WithTimeout(
 		logger.ContextWithField(e.logCtx(), "from", "renewal-thread"), renewalTimeout)
@@ -327,6 +357,10 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 		if err == nil {
 			// if we retrieved the credentials successfully, exit we don't need to do anything else
 			promCacheState.WithLabelValues("hit").Inc()
+			return
+		}
+		if errors.Is(err, ErrForgotten) {
+			log.Infof("Pod %s was deleted while its credentials refreshed, not caching them", podUID)
 			return
 		}
 
@@ -354,9 +388,9 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 const noRequestErrCode = "NoRequest"
 
 // renew fetches e's replacement through what RefreshWith gives it and stores it
-// for podUID, whatever the cache holds by then. On failure it also returns what
-// classifies the error: the TokenSource for a token error, the source otherwise,
-// and nil for an entry without a request.
+// for podUID, whatever the cache holds by then, unless podUID was forgotten. On
+// failure it also returns what classifies the error: the TokenSource for a token
+// error, the source otherwise, and nil for an entry without a request.
 func (c *Cache) renew(ctx context.Context, podUID string, e *Entry) (classifier, error) {
 	if e.Request == nil {
 		return nil, errors.New("cached credentials have no request to refresh them with")

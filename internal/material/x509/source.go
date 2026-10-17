@@ -10,6 +10,9 @@ package x509
 // the token cache also use. We reuse its storage and its background timer, but not
 // its idea of when to refresh, because all three of us want something different.
 // Ours is driven by command line flags. See renewal.go.
+//
+// A deleted pod's certificate goes when the pod store reports the deletion. An issuance
+// still running then checks the pod is there before storing, so it cannot put one back.
 
 import (
 	"context"
@@ -17,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,6 +34,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
@@ -76,8 +81,8 @@ type Issuer interface {
 	GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req sts.CertificateRequest) (*sts.IssuedCertificate, error)
 }
 
-// Opts configures the tier. Issuer, SessionProvider, Notifier and MaxCacheSize have
-// to be supplied; everything else falls back to the defaults above.
+// Opts configures the tier. Issuer, SessionProvider, Notifier, PodStore and MaxCacheSize
+// have to be supplied; everything else falls back to the defaults above.
 type Opts struct {
 	// Issuer makes the call to STS. Required.
 	Issuer Issuer
@@ -91,6 +96,11 @@ type Opts struct {
 	// pod wake and send the new one. Required: without it a replacement reaches a workload
 	// only when its stream is re-established.
 	Notifier workloadidentity.WorkloadNotifier
+
+	// PodStore is the attestor's node-scoped pod store. Its deletion events drop a
+	// pod's certificate and key, and every store checks the pod is still in it. Required:
+	// without it a deleted pod's key stays in memory until the certificate expires.
+	PodStore podstore.Interface
 
 	// MaxCacheSize is the most certificates we hold, one per pod, from --max-cache-size.
 	// Zero or negative is rejected rather than defaulted: the cache underneath reads zero
@@ -147,7 +157,14 @@ type Source struct {
 	issuer          Issuer
 	sessionProvider workloadidentity.SessionProvider
 	notifier        workloadidentity.WorkloadNotifier
+	pods            podstore.Interface
 	cache           *expiring.Cache[string, entry]
+
+	// storeMu makes store's presence check and cache write one step, and Invalidate
+	// holds it too, so an issuance finishing as its pod is deleted cannot repopulate the
+	// cache. onEvicted can run under it, from a delete or an LRU eviction; it only
+	// notifies the hub, which never calls back into the Source.
+	storeMu sync.Mutex
 
 	// group collapses several requests for one pod into a single call to STS. This is the
 	// normal case: a workload using the SPIFFE library opens one stream per material, Envoy
@@ -178,6 +195,9 @@ func New(opts Opts) (*Source, error) {
 	}
 	if opts.Notifier == nil {
 		return nil, errors.New("an X.509-SVID source needs a change notifier")
+	}
+	if opts.PodStore == nil {
+		return nil, errors.New("an X.509-SVID source needs the node-scoped pod store")
 	}
 	if opts.MaxCacheSize <= 0 {
 		return nil, fmt.Errorf("an X.509-SVID source needs a positive cache bound, got %d", opts.MaxCacheSize)
@@ -214,6 +234,7 @@ func New(opts Opts) (*Source, error) {
 		issuer:          opts.Issuer,
 		sessionProvider: opts.SessionProvider,
 		notifier:        opts.Notifier,
+		pods:            opts.PodStore,
 		// Each entry gets its own expiry when we store it, taken from the certificate,
 		// so the cache-wide default here is never actually used.
 		cache:          expiring.NewLru[string, entry](opts.MaxCacheSize, expiring.NoExpiration, opts.CleanupInterval),
@@ -230,6 +251,9 @@ func New(opts Opts) (*Source, error) {
 	}
 	s.cache.OnRefresh(s.onRefresh)
 	s.cache.OnEvicted(s.onEvicted)
+	if err := opts.PodStore.OnPodDeleted(s.Invalidate); err != nil {
+		return nil, fmt.Errorf("registering the X.509-SVID pod deletion callback: %w", err)
+	}
 	return s, nil
 }
 
@@ -240,6 +264,11 @@ func New(opts Opts) (*Source, error) {
 func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([]*x509svid.SVID, error) {
 	if w == nil || w.PodUID == "" {
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(nil, "cannot issue a certificate for an empty workload")
+	}
+	// A stream attests once and calls this on every wake, including the one Invalidate's
+	// eviction sends, so w can be a pod deleted since. Refuse it before the cache or STS.
+	if !s.pods.HasPod(w.PodUID) {
+		return nil, podGone(w)
 	}
 
 	if cached, ok := s.cache.Get(w.PodUID); ok && s.servable(cached.svid) {
@@ -273,11 +302,19 @@ func (s *Source) X509SVIDs(ctx context.Context, w *workloadidentity.Workload) ([
 	}
 }
 
-// Invalidate forgets the pod's certificate, and with it the private key. The pod watcher
-// calls this when a pod goes away. Kubernetes never reuses a pod UID, so nothing will ask
-// for this entry again.
+// Invalidate forgets the pod's certificate, and with it the private key. New registers it
+// as the pod store's deletion callback. storeMu isn't for the cache, which locks itself:
+// store checks HasPod and then writes, and without storeMu this delete could land between
+// the two and leave the deleted pod's certificate cached.
 func (s *Source) Invalidate(podUID string) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	s.cache.Delete(podUID)
+}
+
+// podGone is the answer for a pod the pod store no longer has.
+func podGone(w *workloadidentity.Workload) error {
+	return wierrors.ErrUnattestable.Wrapf(nil, "pod %s/%s is no longer in the node-scoped pod store", w.Namespace, w.PodName)
 }
 
 // servable says whether a certificate has enough life left to hand out.
@@ -292,15 +329,18 @@ func leaf(svid *x509svid.SVID) *cryptox509.Certificate {
 }
 
 // issueAndStore gets one certificate and puts it in the cache. The renewal flag only
-// affects which metrics the attempt is counted on.
-func (s *Source) issueAndStore(ctx context.Context, w *workloadidentity.Workload, renewal bool) (*x509svid.SVID, error) {
+// affects which metrics the attempt is counted on. If the pod was deleted meanwhile, store
+// keeps nothing and the attempt counts as a failure.
+func (s *Source) issueAndStore(ctx context.Context, w *workloadidentity.Workload, renewal bool) (_ *x509svid.SVID, err error) {
 	start := s.now()
+	defer func() { observeIssuance(err, s.now().Sub(start).Seconds(), renewal) }()
 	svid, err := s.issue(ctx, w)
-	observeIssuance(err, s.now().Sub(start).Seconds(), renewal)
 	if err != nil {
 		return nil, err
 	}
-	s.store(w, svid)
+	if err = s.store(w, svid); err != nil {
+		return nil, err
+	}
 	return svid, nil
 }
 
@@ -360,31 +400,48 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*x509
 // store caches the certificate under the pod's UID with two deadlines: when to replace
 // it, and when to discard it. They are separate so a failed replacement loses nothing.
 // Passing the replacement deadline leaves the entry in place, so a workload keeps using
-// what it holds while we retry. Only the real expiry removes it.
-func (s *Source) store(w *workloadidentity.Workload, svid *x509svid.SVID) {
-	now := s.now()
-	leafCert := leaf(svid)
-	renewAt := renewalPoint(leafCert.NotBefore, leafCert.NotAfter, s.renewFraction, s.renewJitter, s.draw)
-	s.cache.SetWithRefreshExpire(
-		w.PodUID,
-		entry{workload: w, svid: svid},
-		renewalDelay(now, renewAt),
-		leafCert.NotAfter.Sub(now),
-	)
+// what it holds while we retry. Only the real expiry removes it. A pod the pod store no
+// longer has gets nothing stored and ErrUnattestable back.
+func (s *Source) store(w *workloadidentity.Workload, svid *x509svid.SVID) error {
+	stored := func() bool {
+		s.storeMu.Lock()
+		defer s.storeMu.Unlock()
+		if !s.pods.HasPod(w.PodUID) {
+			return false
+		}
+		now := s.now()
+		leafCert := leaf(svid)
+		renewAt := renewalPoint(leafCert.NotBefore, leafCert.NotAfter, s.renewFraction, s.renewJitter, s.draw)
+		s.cache.SetWithRefreshExpire(
+			w.PodUID,
+			entry{workload: w, svid: svid},
+			renewalDelay(now, renewAt),
+			leafCert.NotAfter.Sub(now),
+		)
+		return true
+	}()
+	if !stored {
+		return podGone(w)
+	}
 
 	// After the cache holds the new certificate, never before: a stream woken first would
 	// re-read the old one and nothing would wake it again. In store rather than
 	// issueAndStore so it runs only on success, since a failed replacement changes nothing
 	// a stream could send.
 	s.notifier.NotifyWorkloadChange(w.PodUID)
+	return nil
 }
 
-// onRefresh replaces a certificate that is due. The cache's timer calls it, and the rate
-// limit paces a node whose certificates come due together. A failure keeps the certificate
-// the workload already holds, because taking a working one away turns a replacement
-// problem into an outage for that pod. The entry stays due, so the next sweep retries.
-// See workloadGone for the exception.
+// onRefresh replaces a due certificate when the cache's timer calls it, paced by the rate
+// limit. A failure keeps the certificate the workload holds, because taking a working one
+// away turns a replacement problem into an outage; the entry stays due, so the next sweep
+// retries. See workloadGone for the exception. A deleted pod's entry is dropped up front,
+// at no cost against the rate limit.
 func (s *Source) onRefresh(uid string, cached entry) {
+	if !s.pods.HasPod(uid) {
+		s.Invalidate(uid)
+		return
+	}
 	if !s.limiter.Allow() {
 		return
 	}
@@ -413,15 +470,16 @@ func (s *Source) onRefresh(uid string, cached entry) {
 		uid, leaf(cached.svid).NotAfter)
 }
 
-// workloadGone reports whether err means there is no workload left to serve. Dropping the
-// entry on these is the only thing that evicts a deleted pod's private key today, because
-// deletion reaches this tier only as a renewal failure; upstream issue 171 reports the same
-// bug on the credentials path. A named set rather than "not retryable": ErrIssuanceRefused
-// is also not retryable and says nothing about whether the pod exists.
+// workloadGone reports whether err means there is no workload left to serve. The deletion
+// callback normally drops a deleted pod's key first; these cover a pod the token or session
+// tier already treats as gone, and ErrUnattestable a pod deleted mid-renewal. A named set
+// rather than "not retryable": ErrIssuanceRefused is also not retryable and says nothing
+// about whether the pod exists.
 func workloadGone(err error) bool {
 	return errors.Is(err, wierrors.ErrNotEnrolled) ||
 		errors.Is(err, wierrors.ErrTokenMintForbidden) ||
-		errors.Is(err, wierrors.ErrSessionRefused)
+		errors.Is(err, wierrors.ErrSessionRefused) ||
+		errors.Is(err, wierrors.ErrUnattestable)
 }
 
 // onEvicted wakes the pod's streams, so one still holding the evicted certificate,

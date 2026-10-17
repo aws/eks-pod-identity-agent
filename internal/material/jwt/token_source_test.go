@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
@@ -18,7 +19,7 @@ func TestNewDefaultsToPacedBackgroundRenewal(t *testing.T) {
 	source, err := New(Opts{
 		Issuer:          successfulIssuer(t, &now, time.Hour),
 		SessionProvider: sessions(now.Add(time.Hour)),
-		PodStore:        &fakePodStore{},
+		PodStore:        &podstoretest.Store{},
 		MaxCacheSize:    100,
 		Duration:        time.Hour,
 		CleanupInterval: -1,
@@ -42,7 +43,7 @@ func TestNewRejectsRenewalFractionsOutsideTheIssuedLifetime(t *testing.T) {
 			_, err := New(Opts{
 				Issuer:          successfulIssuer(t, &now, 10*time.Minute),
 				SessionProvider: sessions(now.Add(time.Hour)),
-				PodStore:        &fakePodStore{},
+				PodStore:        &podstoretest.Store{},
 				MaxCacheSize:    100,
 				Duration:        time.Hour,
 				RenewalFraction: fraction,
@@ -57,7 +58,7 @@ func TestNewRequiresRequestedDuration(t *testing.T) {
 	_, err := New(Opts{
 		Issuer:          successfulIssuer(t, &now, 10*time.Minute),
 		SessionProvider: sessions(now.Add(time.Hour)),
-		PodStore:        &fakePodStore{},
+		PodStore:        &podstoretest.Store{},
 		MaxCacheSize:    100,
 	})
 	require.ErrorContains(t, err, "positive requested duration")
@@ -79,7 +80,7 @@ func TestNewRejectsRenewalBandsOutsideTheIssuedLifetime(t *testing.T) {
 			_, err := New(Opts{
 				Issuer:          successfulIssuer(t, &now, time.Hour),
 				SessionProvider: sessions(now.Add(time.Hour)),
-				PodStore:        &fakePodStore{},
+				PodStore:        &podstoretest.Store{},
 				MaxCacheSize:    100,
 				Duration:        time.Hour,
 				RenewalFraction: values.fraction,
@@ -98,7 +99,7 @@ func TestConcurrentRequestsShareOneIssuance(t *testing.T) {
 	t.Cleanup(unblock)
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
 	issuer.block = release
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 1)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 
 	const callers = 8
 	audienceSets := [][]string{
@@ -137,7 +138,7 @@ func TestConcurrentRequestsShareOneIssuance(t *testing.T) {
 func TestEquivalentAudienceSetsShareTheCacheWithoutMutatingTheCaller(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	issuer := successfulIssuer(t, &now, time.Hour)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 10)
 	requested := []string{"payments.example", "ledger.example", "payments.example"}
 
 	first, err := source.JWTSVIDs(context.Background(), workload(testPodUID), requested)
@@ -158,7 +159,7 @@ func TestEquivalentAudienceSetsShareTheCacheWithoutMutatingTheCaller(t *testing.
 func TestDifferentAudienceSetsDoNotShareTokens(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	issuer := successfulIssuer(t, &now, time.Hour)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 10)
 	for _, audiences := range [][]string{
 		{"ledger.example", "payments.example"},
 		{"payments.example"},
@@ -187,7 +188,7 @@ func TestInvalidAudienceSetsSkipSessionLookupAndSTS(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
 			issuer := successfulIssuer(t, &now, time.Hour)
 			provider := sessions(now.Add(time.Hour))
-			source := newTestSource(t, issuer, &fakePodStore{}, &now, 10)
+			source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 10)
 			source.sessionProvider = provider
 
 			svids, err := source.JWTSVIDs(context.Background(), workload(testPodUID), audiences)

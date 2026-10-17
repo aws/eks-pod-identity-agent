@@ -22,6 +22,7 @@ import (
 
 	// Initializes the agent's logger, which the tier logs a failed renewal
 	// through. Without it FromContext returns an entry over a nil logger.
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -49,10 +50,18 @@ func TestNewRejectsAnIncompleteConfiguration(t *testing.T) {
 		_, err := New(Opts{Issuer: issuer, SessionProvider: testSessions(time.Now()), MaxCacheSize: 1})
 		assert.ErrorContains(t, err, "change notifier")
 	})
+	t.Run("no pod store", func(t *testing.T) {
+		// Without one a deleted pod's key stays in memory until its certificate expires.
+		_, err := New(Opts{Issuer: issuer, SessionProvider: testSessions(time.Now()), Notifier: &fake.Subscriber{}, MaxCacheSize: 1})
+		assert.ErrorContains(t, err, "pod store")
+	})
 	t.Run("an unbounded cache is refused", func(t *testing.T) {
 		// expiring.NewLru reads zero as unlimited, and an unbounded cache of private
 		// keys is not something to arrive at by accident.
-		_, err := New(Opts{Issuer: issuer, SessionProvider: testSessions(time.Now()), Notifier: &fake.Subscriber{}, MaxCacheSize: 0})
+		_, err := New(Opts{
+			Issuer: issuer, SessionProvider: testSessions(time.Now()), Notifier: &fake.Subscriber{},
+			PodStore: &podstoretest.Store{}, MaxCacheSize: 0,
+		})
 		assert.ErrorContains(t, err, "positive cache bound")
 	})
 }
@@ -268,10 +277,9 @@ func TestFailedRenewalKeepsServingTheExistingCertificate(t *testing.T) {
 	assert.Equal(t, 2, issuer.calls(), "and serving it costs no further issuance")
 }
 
-// TestRenewalForAGonePodDropsTheCertificate is what evicts a deleted pod's key.
-// Deletion reaches this tier only as a renewal failure, so without this the agent holds
-// the key until the certificate expires, up to twelve hours. Upstream issue 171 reports
-// the same bug on the AWS credentials path.
+// TestRenewalForAGonePodDropsTheCertificate covers the renewal failures that mean the
+// pod is gone. The deletion callback normally drops the key first; these catch a pod
+// another tier already treats as gone while the pod store still has it.
 func TestRenewalForAGonePodDropsTheCertificate(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -291,6 +299,11 @@ func TestRenewalForAGonePodDropsTheCertificate(t *testing.T) {
 		{
 			name:     "EKS Auth refuses the session exchange",
 			renewErr: wierrors.ErrSessionRefused.Wrapf(nil, "pod is gone"),
+			wantKept: false,
+		},
+		{
+			name:     "the session tier has forgotten the deleted pod",
+			renewErr: wierrors.ErrUnattestable.Wrapf(nil, "pod is gone"),
 			wantKept: false,
 		},
 		{
@@ -351,6 +364,7 @@ func TestStoreNotifiesTheOpenStreams(t *testing.T) {
 		Issuer:          issuer,
 		SessionProvider: testSessions(now.Add(time.Hour)),
 		Notifier:        notifier,
+		PodStore:        &podstoretest.Store{},
 		MaxCacheSize:    10,
 		Duration:        6 * time.Hour,
 		RenewFraction:   0.5,
@@ -593,14 +607,174 @@ func TestInvalidateDropsTheEntryAndItsKey(t *testing.T) {
 
 	source.Invalidate(testPodUID)
 	_, ok := source.cache.Get(testPodUID)
-	require.False(t, ok, "pod deletion evicts the entry")
+	require.False(t, ok, "Invalidate evicts the entry")
 
-	// A pod UID is never reused, so in production nothing asks again. If something
-	// does, it gets a fresh keypair rather than the deleted one.
+	// The pod is still in the store here, so asking again gets a fresh keypair rather
+	// than the dropped one. After a real deletion the store refuses instead.
 	second, err := source.X509SVIDs(context.Background(), w)
 	require.NoError(t, err)
 	assert.Equal(t, 2, issuer.calls())
 	assert.NotEqual(t, first[0].PrivateKey.Public(), second[0].PrivateKey.Public())
+}
+
+// TestPodDeletionDropsTheCertificateAndWakesItsStreams covers the callback New registers
+// with the pod store: the key goes when the pod does, and the pod's streams wake so one
+// holding the certificate re-reads and is refused.
+func TestPodDeletionDropsTheCertificateAndWakesItsStreams(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+	}}
+	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
+	notifier := source.notifier.(*fake.Subscriber)
+	pods := source.pods.(*podstoretest.Store)
+
+	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+	require.NoError(t, err)
+	_, err = source.X509SVIDs(context.Background(), testWorkload("pod-b"))
+	require.NoError(t, err)
+
+	pods.Delete(testPodUID)
+
+	_, ok := source.cache.Get(testPodUID)
+	assert.False(t, ok, "the deleted pod's certificate and key are dropped")
+	_, ok = source.cache.Get("pod-b")
+	assert.True(t, ok, "another pod's are untouched")
+	assert.Equal(t, []string{testPodUID, "pod-b", testPodUID}, notifier.WorkloadChanges(),
+		"the deletion wakes the deleted pod's streams and no others")
+
+	_, err = source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+	assert.ErrorIs(t, err, wierrors.ErrUnattestable)
+}
+
+// TestX509SVIDsRefusesADeletedPod covers a request arriving after the pod store dropped
+// the pod but before the deletion callback ran: it is refused without a session or an
+// issuance, and the certificate still cached for the pod goes when the callback runs.
+func TestX509SVIDsRefusesADeletedPod(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+	}}
+	sessions := testSessions(now.Add(time.Hour))
+	source := newTestSource(t, issuer, sessions, clockAt(&now), func() float64 { return 0.5 })
+	pods := source.pods.(*podstoretest.Store)
+	w := testWorkload(testPodUID)
+
+	_, err := source.X509SVIDs(context.Background(), w)
+	require.NoError(t, err)
+	require.Equal(t, 1, sessions.Calls())
+
+	pods.Remove(testPodUID)
+
+	svids, err := source.X509SVIDs(context.Background(), w)
+	assert.Nil(t, svids)
+	require.ErrorIs(t, err, wierrors.ErrUnattestable)
+	assert.False(t, wierrors.IsRetryable(err), "the pod is not coming back")
+	assert.Equal(t, 1, issuer.calls(), "no certificate is requested for a deleted pod")
+	assert.Equal(t, 1, sessions.Calls(), "nor a session")
+
+	pods.Delete(testPodUID)
+	_, ok := source.cache.Get(testPodUID)
+	assert.False(t, ok, "the deletion callback drops the certificate still cached for it")
+}
+
+// TestIssuanceInFlightWhenThePodIsDeletedStoresNothing covers STS answering after the
+// deletion callback ran: the certificate is not cached, so its key is not kept, and the
+// caller is refused rather than handed a certificate for a pod that no longer exists.
+func TestIssuanceInFlightWhenThePodIsDeletedStoresNothing(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	release := make(chan struct{})
+	issuer := &fakeIssuer{
+		block: release,
+		respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+			return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+		},
+	}
+	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
+	notifier := source.notifier.(*fake.Subscriber)
+	pods := source.pods.(*podstoretest.Store)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+		result <- err
+	}()
+	require.Eventually(t, func() bool { return issuer.calls() == 1 }, time.Second, time.Millisecond)
+
+	pods.Delete(testPodUID)
+	close(release)
+
+	require.ErrorIs(t, <-result, wierrors.ErrUnattestable)
+	_, ok := source.cache.Get(testPodUID)
+	assert.False(t, ok, "the late certificate is not stored")
+	assert.Empty(t, notifier.WorkloadChanges(), "nothing changed that a stream could send")
+}
+
+// TestRenewalInFlightWhenThePodIsDeletedStoresNothing is the same race on the renewal
+// path, the one a long-running pod is more likely to hit.
+func TestRenewalInFlightWhenThePodIsDeletedStoresNothing(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	release := make(chan struct{})
+	issuer := &fakeIssuer{respond: func(attempt int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		if attempt > 1 {
+			<-release
+		}
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+	}}
+	source := newTestSource(t, issuer, testSessions(now.Add(time.Hour)), clockAt(&now), func() float64 { return 0.5 })
+	notifier := source.notifier.(*fake.Subscriber)
+	pods := source.pods.(*podstoretest.Store)
+
+	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+	require.NoError(t, err)
+	cached, ok := source.cache.Get(testPodUID)
+	require.True(t, ok)
+
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		source.onRefresh(testPodUID, cached)
+	}()
+	require.Eventually(t, func() bool { return issuer.calls() == 2 }, time.Second, time.Millisecond)
+
+	pods.Delete(testPodUID)
+	close(release)
+	<-renewed
+
+	_, ok = source.cache.Get(testPodUID)
+	assert.False(t, ok, "the replacement is not stored")
+	assert.Equal(t, []string{testPodUID, testPodUID}, notifier.WorkloadChanges(),
+		"the first issuance and the deletion notify, the refused replacement does not")
+}
+
+// TestRenewalForADeletedPodDropsWithoutIssuing covers a sweep reaching a pod the pod
+// store no longer has: the entry goes and nothing is asked of the session tier or STS.
+func TestRenewalForADeletedPodDropsWithoutIssuing(t *testing.T) {
+	ca := newTestCA(t)
+	now := time.Now()
+	issuer := &fakeIssuer{respond: func(_ int, req sts.CertificateRequest) (*sts.IssuedCertificate, error) {
+		return ca.issue(t, req.CertificateSigningRequestPEM, testSpiffeID, now, now.Add(6*time.Hour)), nil
+	}}
+	sessions := testSessions(now.Add(time.Hour))
+	source := newTestSource(t, issuer, sessions, clockAt(&now), func() float64 { return 0.5 })
+	pods := source.pods.(*podstoretest.Store)
+
+	_, err := source.X509SVIDs(context.Background(), testWorkload(testPodUID))
+	require.NoError(t, err)
+	cached, ok := source.cache.Get(testPodUID)
+	require.True(t, ok)
+
+	pods.Remove(testPodUID)
+	source.onRefresh(testPodUID, cached)
+
+	assert.Equal(t, 1, issuer.calls(), "no replacement is requested")
+	assert.Equal(t, 1, sessions.Calls(), "nor a session for one")
+	_, ok = source.cache.Get(testPodUID)
+	assert.False(t, ok, "the deleted pod's entry is dropped")
 }
 
 func TestEmptyWorkloadIsRejected(t *testing.T) {

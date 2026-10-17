@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	_ "go.amzn.com/eks/eks-pod-identity-agent/internal/test"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
@@ -24,42 +25,6 @@ const (
 	testPodUID   = "pod-uid-1"
 	testSpiffeID = "spiffe://example.org/ns/default/sa/payments"
 )
-
-type fakePodStore struct {
-	mu       sync.RWMutex
-	callback func(string)
-	removed  map[string]bool
-}
-
-func (w *fakePodStore) OnPodDeleted(callback func(string)) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.callback = callback
-	return nil
-}
-
-func (w *fakePodStore) HasPod(podUID string) bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return !w.removed[podUID]
-}
-
-func (w *fakePodStore) remove(podUID string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.removed == nil {
-		w.removed = make(map[string]bool)
-	}
-	w.removed[podUID] = true
-}
-
-func (w *fakePodStore) delete(podUID string) {
-	w.remove(podUID)
-	w.mu.RLock()
-	callback := w.callback
-	w.mu.RUnlock()
-	callback(podUID)
-}
 
 type issuanceRequest struct {
 	creds aws.Credentials
@@ -176,7 +141,7 @@ func successfulIssuer(t *testing.T, now *time.Time, lifetime time.Duration) *fak
 func newTestSource(
 	t *testing.T,
 	issuer Issuer,
-	watcher *fakePodStore,
+	watcher *podstoretest.Store,
 	now *time.Time,
 	maxAudienceSets int,
 ) *Source {
@@ -196,6 +161,6 @@ func newTestSource(
 		draw:                  func() float64 { return 0.5 },
 	})
 	require.NoError(t, err)
-	require.NotNil(t, watcher.callback)
+	require.Equal(t, 1, watcher.Registered())
 	return source
 }

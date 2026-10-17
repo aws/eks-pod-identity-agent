@@ -1,7 +1,7 @@
 package x509
 
 // Test scaffolding: a certificate authority that signs the agent's real requests,
-// and a fake issuer that records what it was asked for.
+// a fake issuer that records what it was asked for, and a fake pod store.
 //
 // The CA signs actual CSRs and produces actual certificates rather than returning
 // canned PEM, because most of what this tier has to get right is in the round trip:
@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
 )
@@ -207,13 +208,16 @@ func testSessions(expiresAt time.Time) *fake.SessionProvider {
 
 // newTestSource builds a Source with the janitor disabled and a clock and jitter
 // draw the test controls. Renewal is driven by calling RefreshOrEvictExpired
-// directly rather than by racing a sweep.
+// directly rather than by racing a sweep. The fake notifier and pod store are
+// reached through s.notifier and s.pods.
 func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.SessionProvider, now func() time.Time, draw func() float64) *Source {
 	t.Helper()
+	pods := &podstoretest.Store{}
 	s, err := New(Opts{
 		Issuer:          issuer,
 		SessionProvider: sessions,
 		Notifier:        &fake.Subscriber{},
+		PodStore:        pods,
 		MaxCacheSize:    10,
 		Duration:        6 * time.Hour,
 		RenewFraction:   0.5,
@@ -224,6 +228,7 @@ func newTestSource(t *testing.T, issuer Issuer, sessions workloadidentity.Sessio
 		draw:            draw,
 	})
 	require.NoError(t, err)
+	require.Equal(t, 1, pods.Registered(), "New registers for pod deletions")
 	return s
 }
 

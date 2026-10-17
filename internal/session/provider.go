@@ -6,12 +6,13 @@
 // its one rule, with RefreshWith sending every decorated entry to EKS Auth and
 // MinterTokens renewing its token close to expiry. Neither an exchange nor a
 // refresh of a decorated entry goes to the IMDS chain, whose answers aren't
-// decorated.
+// decorated. A pod's deletion drops its entry, whichever caller stored it.
 package session
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,6 +21,7 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -41,12 +43,14 @@ type Opts struct {
 	Cache *credcache.Cache
 	// EKSAuth is the EKS Auth client every exchange goes to.
 	EKSAuth credentials.CredentialRetriever
+	// PodStore reports the pod deletions the tier drops entries for.
+	PodStore podstore.Interface
 }
 
 // Provider is the workloadidentity.SessionProvider the agent uses. It serves a
 // decorated session from the shared cache while the cache says it's usable, and
-// exchanges otherwise. It doesn't watch pods, so a deleted pod's entry stays
-// until a refresh fails non-retryably or the entry expires.
+// exchanges otherwise. When a pod is deleted it has the cache forget the pod, so
+// neither an exchange nor a refresh in flight caches anything for it again.
 type Provider struct {
 	clusterName string
 	minter      workloadidentity.TokenMinter
@@ -77,14 +81,20 @@ func New(opts Opts) (*Provider, error) {
 			"while --max-credential-retention-before-renewal or --max-cache-size is zero")
 	case opts.EKSAuth == nil:
 		return nil, errors.New("session provider: an EKS Auth client is required")
+	case opts.PodStore == nil:
+		return nil, errors.New("session provider: the node-scoped pod store is required")
 	}
-	return &Provider{
+	p := &Provider{
 		clusterName: opts.ClusterName,
 		minter:      opts.Minter,
 		cache:       opts.Cache,
 		eksAuth:     opts.EKSAuth,
 		metrics:     defaultSessionMetrics(),
-	}, nil
+	}
+	if err := opts.PodStore.OnPodDeleted(p.forget); err != nil {
+		return nil, fmt.Errorf("session provider: registering the pod deletion callback: %w", err)
+	}
+	return p, nil
 }
 
 // Session returns a copy of the pod's decorated session: the cached one,
@@ -146,6 +156,23 @@ func (p *Provider) Invalidate(podUID string) {
 	p.cache.Delete(podUID)
 }
 
+// forget is the pod deletion callback New registers with the pod store. It drops
+// the pod's entry, whichever caller stored it, and has the cache refuse every
+// later store for the pod, one for an exchange or refresh in flight included.
+func (p *Provider) forget(podUID string) {
+	if podUID == "" {
+		return
+	}
+	if entry, ok := p.cache.Get(podUID); ok {
+		logCtx := entry.LogCtx
+		if logCtx == nil {
+			logCtx = context.Background()
+		}
+		logger.FromContext(logCtx).WithField("pod-uid", podUID).Info("Pod deleted, dropping its cached credentials")
+	}
+	p.cache.Forget(podUID)
+}
+
 // cached reports whether the cache still serves e for podUID. The cache knows an
 // entry by its credentials, so a Modify copy of e counts as e.
 func (p *Provider) cached(podUID string, e *credcache.Entry) bool {
@@ -180,7 +207,8 @@ func (p *Provider) joinForRequest(ctx context.Context, w *workloadidentity.Workl
 }
 
 // exchangeAndStore exchanges for w under renewalTimeout and stores the entry
-// before returning it, so it's cached by the time group releases the pod.
+// before returning it, so it's cached by the time group releases the pod. A pod
+// deleted before the store is ErrUnattestable.
 func (p *Provider) exchangeAndStore(ctx context.Context, w *workloadidentity.Workload) (*credcache.Entry, error) {
 	ctx, cancel := context.WithTimeout(ctx, renewalTimeout)
 	defer cancel()
@@ -190,6 +218,9 @@ func (p *Provider) exchangeAndStore(ctx context.Context, w *workloadidentity.Wor
 	}
 	storeCtx := logger.ContextWithField(ctx, "pod-uid", w.PodUID, "association-id", entry.Metadata.AssociationId())
 	if err := p.cache.Store(storeCtx, w.PodUID, entry); err != nil {
+		if errors.Is(err, credcache.ErrForgotten) {
+			return nil, wierrors.ErrUnattestable.Wrapf(err, "pod %s was deleted while its session was exchanged", w.PodUID)
+		}
 		return nil, wierrors.ErrSessionUnavailable.Wrapf(err, "caching the session for pod %s", w.PodUID)
 	}
 	return entry, nil

@@ -11,12 +11,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 )
 
 func TestInvalidateUnlocksAfterRecoveredEvictionPanic(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 10)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &podstoretest.Store{}, &now, 10)
 	_, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"payments.example"})
 	require.NoError(t, err)
 	source.cache.OnEvicted(func(cacheKey, *entry) {
@@ -34,7 +35,7 @@ func TestInvalidateUnlocksAfterRecoveredEvictionPanic(t *testing.T) {
 
 func TestPodDeletionEvictsEveryAudienceSetAndBlocksInflightStore(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	watcher := &fakePodStore{}
+	watcher := &podstoretest.Store{}
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
 	source := newTestSource(t, issuer, watcher, &now, 10)
 	_, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"one.example", "two.example"})
@@ -43,7 +44,7 @@ func TestPodDeletionEvictsEveryAudienceSetAndBlocksInflightStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, source.cache.Items(), 2)
 
-	watcher.delete(testPodUID)
+	watcher.Delete(testPodUID)
 	require.Empty(t, source.cache.Items())
 
 	release := make(chan struct{})
@@ -54,7 +55,7 @@ func TestPodDeletionEvictsEveryAudienceSetAndBlocksInflightStore(t *testing.T) {
 		result <- err
 	}()
 	require.Eventually(t, func() bool { return issuer.calls() == 3 }, time.Second, time.Millisecond)
-	watcher.delete("another-pod")
+	watcher.Delete("another-pod")
 	close(release)
 	require.Error(t, <-result)
 	require.Empty(t, source.cache.Items(), "a response arriving after deletion must not restore material")
@@ -64,7 +65,7 @@ func TestDeletedPodCannotIssueFromAnEarlierAttestation(t *testing.T) {
 	for name, notify := range map[string]bool{"callback pending": false, "callback delivered": true} {
 		t.Run(name, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
-			pods := &fakePodStore{}
+			pods := &podstoretest.Store{}
 			issuer := successfulIssuer(t, &now, time.Hour)
 			source := newTestSource(t, issuer, pods, &now, 10)
 			provider := sessions(now.Add(time.Hour))
@@ -72,9 +73,9 @@ func TestDeletedPodCannotIssueFromAnEarlierAttestation(t *testing.T) {
 			attestedBeforeDeletion := workload(testPodUID)
 
 			if notify {
-				pods.delete(testPodUID)
+				pods.Delete(testPodUID)
 			} else {
-				pods.remove(testPodUID)
+				pods.Remove(testPodUID)
 			}
 			svids, err := source.JWTSVIDs(context.Background(), attestedBeforeDeletion, []string{"payments.example"})
 			require.ErrorIs(t, err, wierrors.ErrUnattestable)
@@ -96,7 +97,7 @@ func TestDeletedPodCannotIssueFromAnEarlierAttestation(t *testing.T) {
 
 func TestPodAbsenceEvictsCachedTokensBeforeDeletionCallback(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pods := &fakePodStore{}
+	pods := &podstoretest.Store{}
 	issuer := successfulIssuer(t, &now, time.Hour)
 	source := newTestSource(t, issuer, pods, &now, 10)
 	w := workload(testPodUID)
@@ -106,7 +107,7 @@ func TestPodAbsenceEvictsCachedTokensBeforeDeletionCallback(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, source.cache.Items(), 2)
 
-	pods.remove(testPodUID)
+	pods.Remove(testPodUID)
 	svids, err := source.JWTSVIDs(context.Background(), w, []string{"one.example"})
 	require.ErrorIs(t, err, wierrors.ErrUnattestable)
 	require.Nil(t, svids)
@@ -117,7 +118,7 @@ func TestPodAbsenceEvictsCachedTokensBeforeDeletionCallback(t *testing.T) {
 
 func TestPodAbsenceRejectsInflightResponseBeforeDeletionCallback(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pods := &fakePodStore{}
+	pods := &podstoretest.Store{}
 	release := make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
@@ -132,7 +133,7 @@ func TestPodAbsenceRejectsInflightResponseBeforeDeletionCallback(t *testing.T) {
 	}()
 	require.Eventually(t, func() bool { return issuer.calls() == 1 }, time.Second, time.Millisecond)
 
-	pods.remove(testPodUID)
+	pods.Remove(testPodUID)
 	unblock()
 	require.ErrorIs(t, <-result, wierrors.ErrUnattestable)
 	require.Empty(t, source.cache.Items())
@@ -142,7 +143,7 @@ func TestPodAbsenceRejectsInflightResponseBeforeDeletionCallback(t *testing.T) {
 
 func TestPodDeletedDuringSessionLookupSkipsSTS(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pods := &fakePodStore{}
+	pods := &podstoretest.Store{}
 	issuer := successfulIssuer(t, &now, time.Hour)
 	source := newTestSource(t, issuer, pods, &now, 10)
 	provider := sessions(now.Add(time.Hour))
@@ -158,7 +159,7 @@ func TestPodDeletedDuringSessionLookupSkipsSTS(t *testing.T) {
 	defer cancel()
 	require.NoError(t, provider.WaitForBlocked(waitCtx, 1))
 
-	pods.delete(testPodUID)
+	pods.Delete(testPodUID)
 	provider.Release()
 	require.ErrorIs(t, <-result, wierrors.ErrUnattestable)
 	require.Equal(t, 1, provider.Calls())
@@ -170,7 +171,7 @@ func TestPodDeletedDuringSessionLookupSkipsSTS(t *testing.T) {
 
 func TestCallerCancellationCannotReleaseDeletionGuardBeforeIssuanceEnds(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	watcher := &fakePodStore{}
+	watcher := &podstoretest.Store{}
 	release := make(chan struct{})
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
 	issuer.block = release
@@ -187,7 +188,7 @@ func TestCallerCancellationCannotReleaseDeletionGuardBeforeIssuanceEnds(t *testi
 
 	cancel()
 	require.Error(t, <-result)
-	watcher.delete(testPodUID)
+	watcher.Delete(testPodUID)
 	close(release)
 
 	require.Eventually(t, func() bool {
@@ -201,7 +202,7 @@ func TestCallerCancellationCannotReleaseDeletionGuardBeforeIssuanceEnds(t *testi
 func TestAudienceSetLimitDoesNotEvictLiveTokens(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	issuer := successfulIssuer(t, &now, 10*time.Minute)
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 2)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 2)
 	_, err := source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"one.example", "two.example"})
 	require.NoError(t, err)
 	_, err = source.JWTSVIDs(context.Background(), workload(testPodUID), []string{"one.example"})
@@ -223,7 +224,7 @@ func TestAudienceSetLimitDoesNotEvictLiveTokens(t *testing.T) {
 
 func TestCacheSeparatesPodsWithTheSameAudience(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	watcher := &fakePodStore{}
+	watcher := &podstoretest.Store{}
 	issuer := successfulIssuer(t, &now, time.Hour)
 	source := newTestSource(t, issuer, watcher, &now, 1)
 	audiences := []string{"payments.example"}
@@ -237,7 +238,7 @@ func TestCacheSeparatesPodsWithTheSameAudience(t *testing.T) {
 
 	source.Invalidate("")
 	require.Len(t, source.cache.Items(), 2)
-	watcher.delete(testPodUID)
+	watcher.Delete(testPodUID)
 	require.Len(t, source.cache.Items(), 1)
 	cached, err := source.JWTSVIDs(context.Background(), workload("another-pod"), audiences)
 	require.NoError(t, err)
@@ -262,7 +263,7 @@ func TestAudienceSetLimitCountsInflightIssuanceAndReleasesFailedReservation(t *t
 		return respond(attempt, req)
 	}
 	issuer.block = release
-	source := newTestSource(t, issuer, &fakePodStore{}, &now, 1)
+	source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 
 	result := make(chan error, 1)
 	go func() {
@@ -286,7 +287,7 @@ func TestAudienceSetLimitCountsInflightIssuanceAndReleasesFailedReservation(t *t
 
 func TestAudienceSetLimitDoesNotDoubleCountAStoredReservation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 2)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &podstoretest.Store{}, &now, 2)
 	audiences := []string{"ledger.example", "payments.example"}
 	key := makeCacheKey(testPodUID, audiences)
 	require.NoError(t, source.reserveAudienceSet(key))
@@ -300,7 +301,7 @@ func TestAudienceSetLimitDoesNotDoubleCountAStoredReservation(t *testing.T) {
 
 func TestAudienceSetReservationSurvivesCacheExpiryDuringRenewal(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 1)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &podstoretest.Store{}, &now, 1)
 	audiences := []string{"ledger.example", "payments.example"}
 	key := makeCacheKey(testPodUID, audiences)
 	source.storeLocked(workload(testPodUID), audiences, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
@@ -322,7 +323,7 @@ func TestAudienceSetReservationSurvivesCacheExpiryDuringRenewal(t *testing.T) {
 
 func TestExpiredAudienceSetCannotBypassTheCap(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 1)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &podstoretest.Store{}, &now, 1)
 	w := workload(testPodUID)
 	expired := makeCacheKey(testPodUID, []string{"ledger.example"})
 	source.storeLocked(w, []string{"ledger.example"}, &jwtsvid.SVID{Expiry: now.Add(time.Hour)}, now)
@@ -340,7 +341,7 @@ func TestExpiredAudienceSetCannotBypassTheCap(t *testing.T) {
 
 func TestCacheStoresWorkloadAndAudienceSnapshots(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 1)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &podstoretest.Store{}, &now, 1)
 	w := workload(testPodUID)
 	audiences := []string{"ledger.example", "payments.example"}
 	key := makeCacheKey(testPodUID, audiences)
@@ -380,7 +381,7 @@ func TestAudienceSetKeysDoNotCollide(t *testing.T) {
 
 func TestCachedTokenIsNotServableAtExpiration(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &fakePodStore{}, &now, 1)
+	source := newTestSource(t, successfulIssuer(t, &now, time.Hour), &podstoretest.Store{}, &now, 1)
 	for _, tc := range []struct {
 		name string
 		svid *jwtsvid.SVID

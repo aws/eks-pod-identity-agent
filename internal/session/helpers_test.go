@@ -24,6 +24,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -131,6 +132,8 @@ type sessionFixture struct {
 	cache    *credcache.Cache
 	http     credentials.CredentialRetriever
 	provider *Provider
+	// pods is the provider's pod store, which a test deletes pods from.
+	pods *podstoretest.Store
 	// sourceBase is the credential source counts when the fixture was built. The
 	// fork rule counts on the process-wide collector, which every other test in
 	// the binary also increments, so sourceCount reports the delta since here.
@@ -202,6 +205,7 @@ func newSessionFixture(t *testing.T, configure ...func(*fixtureOpts)) *sessionFi
 		clock:     &sessionClock{now: time.Now()},
 		joins:     map[string]int{},
 		presented: map[int64]string{},
+		pods:      &podstoretest.Store{},
 	}
 	h.minter = &fake.TokenMinter{Func: h.mint}
 	h.answerWithSessions()
@@ -239,7 +243,7 @@ func newSessionFixture(t *testing.T, configure ...func(*fixtureOpts)) *sessionFi
 		AuthoritativeDelegate: client,
 		TokenValidator:        opts.validator,
 	})
-	provider, err := New(Opts{ClusterName: testClusterName, Minter: minter, Cache: h.cache, EKSAuth: client})
+	provider, err := New(Opts{ClusterName: testClusterName, Minter: minter, Cache: h.cache, EKSAuth: client, PodStore: h.pods})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

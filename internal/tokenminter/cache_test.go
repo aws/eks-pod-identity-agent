@@ -8,6 +8,8 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore/podstoretest"
 	wierrors "go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity/fake"
@@ -20,17 +22,21 @@ func clockAt(t *time.Time) func() time.Time {
 	return func() time.Time { return *t }
 }
 
-// newTestMinter builds a CachedMinter over a fake minter with the janitor
-// disabled, so a test drives expiry through the injected clock and invokes
-// onRefresh directly rather than racing the background sweep.
-//
-// The fake is pkg/workloadidentity/fake.TokenMinter, the same fake the other
-// tiers use, rather than one written for this package: CachedMinter decorates a
-// workloadidentity.TokenMinter, so the shared fake is exactly the seam.
+// newTestMinter builds a CachedMinter with the janitor off, so a test drives
+// expiry through the injected clock and calls onRefresh itself. raw is the shared
+// pkg/workloadidentity/fake.TokenMinter, the seam CachedMinter decorates. It has
+// no pod store, so presence checks are off.
 func newTestMinter(raw workloadidentity.TokenMinter, now func() time.Time) *CachedMinter {
+	return newTestMinterWithPods(raw, now, nil)
+}
+
+// newTestMinterWithPods is newTestMinter with presence checks against pods.
+// Nothing registers Invalidate, so a test plays the deletion callback itself.
+func newTestMinterWithPods(raw workloadidentity.TokenMinter, now func() time.Time, pods podstore.Interface) *CachedMinter {
 	return newCachedMinter(raw, CachedMinterOpts{
 		MaxCacheSize:    10,
 		CleanupInterval: -1,
+		PodStore:        pods,
 		now:             now,
 	})
 }
@@ -261,4 +267,114 @@ func TestOnRefresh_RetryableFailure_KeepsToken(t *testing.T) {
 	kept, ok := m.cache.Get(w.PodUID)
 	g.Expect(ok).To(BeTrue(), "a transient renewal failure must keep the existing token")
 	g.Expect(kept.token.Token).To(Equal("first"))
+}
+
+// TestMint_PodGone_RefusedWithoutMinting proves a pod the store no longer holds
+// is refused as unattestable, without a mint, and that the token it had cached
+// is dropped rather than served, even before its deletion callback has run.
+func TestMint_PodGone_RefusedWithoutMinting(t *testing.T) {
+	g := NewWithT(t)
+
+	clock := time.Now()
+	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "t1", ExpiresAt: clock.Add(time.Hour)}}
+	pods := &podstoretest.Store{}
+	m := newTestMinterWithPods(raw, clockAt(&clock), pods)
+	w := testWorkload()
+
+	_, err := m.Mint(context.Background(), w)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	pods.Remove(w.PodUID)
+	_, err = m.Mint(context.Background(), w)
+
+	g.Expect(err).To(MatchError(wierrors.ErrUnattestable))
+	g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
+	g.Expect(raw.Calls()).To(Equal(1), "a gone pod must not be minted for")
+	_, ok := m.cache.Get(w.PodUID)
+	g.Expect(ok).To(BeFalse(), "a gone pod's cached token must be dropped")
+}
+
+// TestMint_PodDeletedMidMint_StoresNothing proves a mint in flight when its pod
+// is deleted cannot store the token, and that every caller sharing the mint is
+// refused as unattestable. A caller that had not joined the flight when the pod
+// went is refused at entry or by its own flight's store check, so the outcome
+// holds for any interleaving.
+func TestMint_PodDeletedMidMint_StoresNothing(t *testing.T) {
+	g := NewWithT(t)
+
+	clock := time.Now()
+	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "late", ExpiresAt: clock.Add(time.Hour)}}
+	raw.Block()
+	pods := &podstoretest.Store{}
+	m := newTestMinterWithPods(raw, clockAt(&clock), pods)
+	w := testWorkload()
+
+	const n = 8
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := m.Mint(context.Background(), w)
+			errs <- err
+		}()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	g.Expect(raw.WaitForBlocked(ctx, 1)).To(Succeed())
+	// client-go's order: the pod leaves the store, then the callback runs.
+	pods.Remove(w.PodUID)
+	m.Invalidate(w.PodUID)
+	raw.Release()
+
+	for i := 0; i < n; i++ {
+		g.Expect(<-errs).To(MatchError(wierrors.ErrUnattestable))
+	}
+	_, ok := m.cache.Get(w.PodUID)
+	g.Expect(ok).To(BeFalse(), "a mint that finished after the deletion must not store its token")
+}
+
+// TestOnRefresh_PodGone_DropsWithoutMinting proves a renewal for a pod the store
+// no longer holds drops the entry instead of re-minting it.
+func TestOnRefresh_PodGone_DropsWithoutMinting(t *testing.T) {
+	g := NewWithT(t)
+
+	clock := time.Now()
+	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "t1", ExpiresAt: clock.Add(time.Hour)}}
+	pods := &podstoretest.Store{}
+	m := newTestMinterWithPods(raw, clockAt(&clock), pods)
+	w := testWorkload()
+
+	_, err := m.Mint(context.Background(), w)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	entry, ok := m.cache.Get(w.PodUID)
+	g.Expect(ok).To(BeTrue())
+	pods.Remove(w.PodUID)
+	m.onRefresh(w.PodUID, entry)
+
+	_, ok = m.cache.Get(w.PodUID)
+	g.Expect(ok).To(BeFalse(), "a gone pod's token must be dropped on renewal")
+	g.Expect(raw.Calls()).To(Equal(1), "a gone pod must not be re-minted")
+}
+
+// TestInvalidate_DropsEntry proves Invalidate removes a pod's token, so the next
+// lookup mints afresh.
+func TestInvalidate_DropsEntry(t *testing.T) {
+	g := NewWithT(t)
+
+	clock := time.Now()
+	raw := &fake.TokenMinter{Result: &workloadidentity.ProjectedToken{Token: "t1", ExpiresAt: clock.Add(time.Hour)}}
+	m := newTestMinter(raw, clockAt(&clock))
+	w := testWorkload()
+
+	_, err := m.Mint(context.Background(), w)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	m.Invalidate(w.PodUID)
+
+	_, ok := m.cache.Get(w.PodUID)
+	g.Expect(ok).To(BeFalse())
+	_, err = m.Mint(context.Background(), w)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(raw.Calls()).To(Equal(2), "an invalidated token must be minted again")
 }
