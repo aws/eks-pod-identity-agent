@@ -23,6 +23,13 @@ import (
 // certificate request. The name is fixed by RFC 7468.
 const pemTypeCertificateRequest = "CERTIFICATE REQUEST"
 
+// csrSubjectCommonName is a placeholder subject. STS does not parse the CSR, so an empty
+// one reaches the signer, which rejects it. It names the agent, not the workload, because
+// the agent does not choose the identity.
+//
+// TEMPORARY: delete once STS overwrites the subject and marks the SAN critical itself.
+const csrSubjectCommonName = "eks-workload-identity"
+
 // generateKey creates a new key pair of the configured kind for one certificate.
 //
 // It returns a crypto.Signer rather than the key, because a Signer does not expose the
@@ -64,11 +71,12 @@ func rsaKey(bits int, kind workloadidentity.KeyType) (crypto.Signer, error) {
 // buildCSR creates the certificate request we send to STS. It carries the public half of
 // the key pair and a signature made with the private half, which proves possession.
 //
-// It carries no name. STS takes the subject from the attested workload identity in the
-// session, and ignores any subject or SAN in the request.
+// It names no identity. The SPIFFE ID comes from the attested workload identity in the
+// session, never from the request, so the request carries no SAN and no extensions. Its
+// subject is the fixed csrSubjectCommonName placeholder, for the reason given there.
 func buildCSR(key crypto.Signer) (string, error) {
 	der, err := cryptox509.CreateCertificateRequest(rand.Reader, &cryptox509.CertificateRequest{
-		Subject: pkix.Name{},
+		Subject: pkix.Name{CommonName: csrSubjectCommonName},
 	}, key)
 	if err != nil {
 		return "", fmt.Errorf("building the certificate signing request: %w", err)
