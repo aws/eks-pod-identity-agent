@@ -141,7 +141,7 @@ type Server struct {
 	// shutdownWait bounds the graceful stop. It is injected rather than read from
 	// a package constant so a test can use a budget it is willing to wait out.
 	shutdownWait time.Duration
-	// pinMethod is how this kernel lets callers be pinned, logged at start.
+	// pinMethod is how callers are pinned, logged at start.
 	pinMethod pinMethod
 }
 
@@ -172,6 +172,9 @@ type Opts struct {
 	// option here can add to the chain and cannot take the gate or the limiter out of
 	// it.
 	ServerOptions []grpc.ServerOption
+	// PeerPidfd lets callers be pinned by SO_PEERPIDFD where the kernel has it.
+	// Off, every caller is pinned through its /proc handle.
+	PeerPidfd bool
 }
 
 // New binds the socket and returns a server ready to be driven.
@@ -181,7 +184,12 @@ type Opts struct {
 // bound is worth reporting where the process can still exit non-zero, and a caller
 // holding a Server knows the socket already exists, so nothing has to poll for it.
 func New(opts Opts) (*Server, error) {
-	method := probePinMethod()
+	// Default to the /proc handle on every node image, whatever its kernel.
+	// SO_PEERPIDFD only when opted in with PeerPidfd.
+	method := pinProcHandle
+	if opts.PeerPidfd {
+		method = probePinMethod()
+	}
 	lis, err := ListenUnix(opts.SocketPath, SocketMode)
 	if err != nil {
 		return nil, err

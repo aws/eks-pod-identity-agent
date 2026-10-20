@@ -124,6 +124,7 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	server, err := grpcserver.New(grpcserver.Opts{
 		SocketPath: configuration.WorkloadIdentitySocketPath,
 		Register:   registerWorkloadIdentityServices(tiers.handler, tiers.sdsHandler),
+		PeerPidfd:  opts.PeerPidfd,
 	})
 	if err != nil {
 		return nil, err

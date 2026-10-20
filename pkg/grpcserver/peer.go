@@ -4,9 +4,9 @@ package grpcserver
 // every RPC on the connection checks that the same process is still running, so a
 // PID the kernel has since given to another process is never attested.
 //
-// There are two tiers, picked once at boot. Where the kernel has SO_PEERPIDFD
-// (Linux 6.5+), the pin is a pidfd for the connector itself, taken from the
-// socket. Everywhere else it is SPIRE's peertracker check (peercred.go): a
+// There are two tiers, picked once at boot. With Opts.PeerPidfd set and a kernel
+// that has SO_PEERPIDFD (Linux 6.5+), the pin is a pidfd for the connector
+// itself, taken from the socket. Otherwise it is SPIRE's peertracker check (peercred.go): a
 // /proc/<pid> handle opened at the handshake, with start time and owner read
 // through it.
 

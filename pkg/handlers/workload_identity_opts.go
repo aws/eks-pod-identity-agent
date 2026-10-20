@@ -23,6 +23,7 @@ const (
 	FlagSVIDRenewalJitter      = "svid-renewal-jitter"
 	FlagSVIDKeyType            = "svid-key-type"
 	FlagNodeKubeconfig         = "node-kubeconfig"
+	FlagPeerPidfd              = "workload-identity-peer-pidfd"
 )
 
 // WorkloadIdentityServerOpts carries configuration from the command line into
@@ -86,6 +87,10 @@ type WorkloadIdentityServerOpts struct {
 	// it is one setting for the agent. JWT-SVIDs are unaffected, since STS signs those
 	// and the agent generates no key for them.
 	SVIDKeyType workloadidentity.KeyType
+	// PeerPidfd lets the socket pin callers by SO_PEERPIDFD where the kernel has
+	// it. Off, every caller is pinned through its /proc handle. Validate doesn't
+	// read it.
+	PeerPidfd bool
 	// CredentialCache is the credential cache every bind host serves from, so
 	// the session tier shares it. Nil when caching is off. It isn't a flag: cmd
 	// sets it, and Validate doesn't read it.

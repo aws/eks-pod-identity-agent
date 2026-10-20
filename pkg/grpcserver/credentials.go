@@ -50,10 +50,10 @@ type peerCredentials struct {
 var _ credentials.TransportCredentials = peerCredentials{}
 
 // NewPeerCredentials returns transport credentials that pin each accepted
-// connection's peer, reachable from a handler through PeerFromContext, with the
-// strongest tier this kernel offers.
+// connection's peer, reachable from a handler through PeerFromContext, through
+// its /proc handle, the default New uses.
 func NewPeerCredentials() credentials.TransportCredentials {
-	return peerCredentials{method: probePinMethod()}
+	return peerCredentials{method: pinProcHandle}
 }
 
 // warnPIDZero makes the first peer_pid_zero refusal a warning: it means the agent

@@ -48,6 +48,7 @@ var (
 	svidRenewalFraction    float64
 	svidRenewalJitter      float64
 	svidKeyType            string
+	peerPidfd              bool
 )
 
 var serverCmd = &cobra.Command{
@@ -248,6 +249,7 @@ func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServ
 		SVIDRenewalFraction: svidRenewalFraction,
 		SVIDRenewalJitter:   svidRenewalJitter,
 		SVIDKeyType:         workloadidentity.KeyType(svidKeyType),
+		PeerPidfd:           peerPidfd,
 	}
 }
 
@@ -353,4 +355,6 @@ func init() {
 		fmt.Sprintf("Key type generated for each X.509-SVID, one of %s", workloadidentity.KeyTypeList()))
 	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
 		"Jitter applied to X.509-SVID and JWT-SVID renewal points, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
+	serverCmd.Flags().BoolVar(&peerPidfd, handlers.FlagPeerPidfd, false,
+		"Pin workload identity callers by SO_PEERPIDFD on kernels that have it (Linux 6.5+). Off, or on an older kernel, callers are pinned through their /proc handle")
 }
