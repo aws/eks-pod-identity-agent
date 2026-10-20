@@ -160,14 +160,14 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	}
 
 	if _, withinTtl := r.cache.CredentialsWithinValidTtl(val); !withinTtl {
-		log.Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
+		log.WithField("podUID", podUID).Info("Identified that entry in cache contains credentials with small ttl or invalid ttl, will be deleted")
 		r.cache.Delete(podUID)
 		return nil, false
 	}
 
 	// If the cached credentials' token matches the incoming requests' token, return the credentials
 	if val.Request != nil && val.Request.ServiceAccountToken == request.ServiceAccountToken {
-		log.WithField("cache-hit", 1).Tracef("Using cached credentials")
+		log.WithField("podUID", podUID).WithField("cache-hit", 1).Tracef("Token match, using cached credentials")
 		return val.Credentials, true
 	}
 
@@ -181,7 +181,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 
 	// Validate the token
 	if err := tv.ValidateToken(ctx, request); err != nil {
-		log.Infof("Local token validation failed: %v, falling back to delegate", err)
+		log.WithField("podUID", podUID).Infof("Local token validation failed: %v, falling back to delegate", err)
 		promLocalValidation.WithLabelValues("failure").Inc()
 		return nil, false
 	}
@@ -189,7 +189,7 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 	r.cache.Modify(podUID, func(e *credcache.Entry) {
 		e.Request = request
 	})
-	log.WithField("cache-hit", 1).Tracef("Local validation succeeded, using cached credentials")
+	log.WithField("podUID", podUID).WithField("cache-hit", 1).Infof("Local validation succeeded, using cached credentials")
 	promLocalValidation.WithLabelValues("success").Inc()
 	return val.Credentials, true
 }
@@ -241,7 +241,7 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 
 	newCacheEntry, err := r.fetchCredentialsFromDelegate(ctx, delegate, request)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error getting credentials to cache: %w", err)
+		return nil, nil, fmt.Errorf("failed to fetch credentials from delegate for pod %s: %w", podUID, err)
 	}
 
 	if newCacheEntry.Credentials == nil {

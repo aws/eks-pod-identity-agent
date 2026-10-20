@@ -151,7 +151,7 @@ func (h *EksCredentialHandler) HandleRequest(resp http.ResponseWriter, req *http
 	ctx := logger.ContextWithField(req.Context(), "cluster-name", h.ClusterName)
 	log := logger.FromContext(ctx)
 
-	log.Infof("handling new request request from %s", req.RemoteAddr)
+	log.Infof("handling new request from %s", req.RemoteAddr)
 
 	eksCredentialsRequest := &credentials.EksCredentialsRequest{
 		ClusterName:         h.ClusterName,

@@ -125,8 +125,6 @@ func persistJWKCacheToDisk(ctx context.Context, cachePath string, jwks *JWKSet) 
 
 // checkK8sVersion verifies the API server is running Kubernetes >= 1.34.
 func (ac *apiserverClient) checkK8sVersion(ctx context.Context) error {
-	log := logger.FromContext(ctx)
-
 	raw, err := ac.clientset.Discovery().RESTClient().Get().
 		AbsPath(versionEndpoint).
 		DoRaw(ctx)
@@ -138,8 +136,6 @@ func (ac *apiserverClient) checkK8sVersion(ctx context.Context) error {
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return fmt.Errorf("failed to decode Kubernetes version response: %w", err)
 	}
-	log.Infof("Kubernetes API server version: %s.%s (full: %s)", info.Major, info.Minor, info.GitVersion)
-
 	v, err := utilversion.ParseGeneric(fmt.Sprintf("%s.%s", info.Major, info.Minor))
 	if err != nil {
 		return fmt.Errorf("unable to parse Kubernetes version: %w", err)

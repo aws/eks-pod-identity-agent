@@ -356,8 +356,6 @@ type fakeIMDSHandler struct{ pods map[string]string }
 func (f *fakeIMDSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	switch {
-	case strings.HasSuffix(p, "/latest/meta-data/") || strings.HasSuffix(p, "/latest/meta-data"):
-		io.WriteString(w, "iam-eks-1\n")
 	case strings.HasSuffix(p, "iam-eks-1/info"):
 		pods := make(map[string]string)
 		for uid := range f.pods {
