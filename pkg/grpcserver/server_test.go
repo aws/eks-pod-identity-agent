@@ -394,6 +394,16 @@ func TestNew_TheDefaultShutdownBudgetFitsTheTerminationGracePeriod(t *testing.T)
 	g.Expect(srv.shutdownWait).To(Equal(DefaultShutdownWait))
 }
 
+// TestNew_PinsThroughProcByDefault: without PeerPidfd, callers are pinned through
+// /proc even on a kernel that has SO_PEERPIDFD.
+func TestNew_PinsThroughProcByDefault(t *testing.T) {
+	g := NewWithT(t)
+
+	srv, err := New(Opts{SocketPath: tempSocketPath(t)})
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(srv.pinMethod).To(Equal(pinProcHandle))
+}
+
 // fatalSocketEnvVar carries the socket path to the child process in
 // TestRemoveSocket_RunsWhenTheProcessDiesFatally.
 const fatalSocketEnvVar = "GRPCSERVER_TEST_FATAL_SOCKET"
