@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -15,7 +16,9 @@ import (
 	imdscloud "go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/imds"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/kube"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 
@@ -41,6 +44,10 @@ type EksCredentialHandlerOpts struct {
 	RefreshQPS         int
 	EndpointOverridden bool
 	EnableIMDS         bool
+	// EnablePodLiveness turns on the node-scoped pod informer that lets the agent
+	// skip renewing (and promptly evict) credentials for pods no longer on the
+	// node. Off by default; when off the agent renews as before.
+	EnablePodLiveness bool
 }
 
 var (
@@ -113,6 +120,18 @@ func newCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts, ca
 	cacheOpts.RenewalTtl = opts.CredentialRenewal
 	cacheOpts.MaxSize = opts.MaxCacheSize
 	cacheOpts.RefreshQPS = opts.RefreshQPS
+	// When pod-liveness is enabled, build a node-scoped pod store so the cache can
+	// skip renewing credentials for pods that no longer exist and evict them
+	// promptly. The store reads this node's pods from the API server as the node
+	// identity (Node authorizer scopes it to this node, no extra RBAC). If it
+	// cannot be built, fail open: renewal proceeds for every entry as before.
+	if opts.EnablePodLiveness {
+		if store, serr := buildPodStore(ctx, opts.Cfg, opts.ClusterName); serr != nil {
+			logger.FromContext(ctx).Infof("pod store unavailable, renewals will not check pod liveness: %v", serr)
+		} else {
+			cacheOpts.PodChecker = store
+		}
+	}
 	manager.Cache = credcache.New(cacheOpts)
 	retrieverOpts := credsretriever.CachedCredentialRetrieverOpts{
 		Cache:                 manager.Cache,
@@ -124,6 +143,23 @@ func newCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts, ca
 	}
 	manager.Retriever = credsretriever.NewCachedCredentialRetriever(retrieverOpts)
 	return manager
+}
+
+// buildPodStore builds the node-identity Kubernetes client, resolves this agent's
+// node name from the API server (the client authenticates as system:node:<name>,
+// so SelfSubjectReview reports that name back), and starts a node-scoped pod
+// store whose list/watch carry a spec.nodeName field selector the Node authorizer
+// permits for the node identity. Any error is returned so the caller can fail open.
+func buildPodStore(ctx context.Context, cfg aws.Config, clusterName string) (*podstore.Store, error) {
+	clientset, err := kube.NewNodeClient(kube.NodeClientOpts{Cfg: cfg, ClusterName: clusterName})
+	if err != nil {
+		return nil, fmt.Errorf("building node-identity kubernetes client: %w", err)
+	}
+	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
+	if err != nil {
+		return nil, fmt.Errorf("resolving node name: %w", err)
+	}
+	return podstore.New(ctx, clientset, nodeName)
 }
 
 // buildCredentialRetriever returns a [imds, eksauth] chained retriever when
