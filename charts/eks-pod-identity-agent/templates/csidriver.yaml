@@ -1,0 +1,31 @@
+{{- /*
+The cluster-scoped CSIDriver object for the workload identity socket. The chart owns it,
+and renders it only when workload identity is on (never in an isolated region).
+
+See "Workload identity" in the chart README for why the chart owns this object, which
+fields are immutable, and what the tokenRequests declaration is for.
+*/}}
+{{- if eq (include "eks-pod-identity-agent.enableWorkloadIdentity" .) "true" }}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  # Must equal configuration.WorkloadIdentityCSIDriver and the driver the Pod Identity
+  # webhook names on an enrolled pod's volume.
+  name: spiffe.csi.eks.amazonaws.com
+  labels:
+  {{- include "eks-pod-identity-agent.labels" . | nindent 4 }}
+spec:
+  # A node-local bind mount: nothing for the attach/detach controller to do.
+  attachRequired: false
+  # The node service needs the pod's identity in the volume context to publish.
+  podInfoOnMount: true
+  # Inline ephemeral only. No PersistentVolume for this driver.
+  volumeLifecycleModes:
+    - Ephemeral
+  # Read-only bind mount, nothing to chown.
+  fsGroupPolicy: None
+  # Declared so a node identity is permitted to mint a ServiceAccount token for this
+  # audience; see the chart README. Matches configuration.EksAuthAudience.
+  tokenRequests:
+    - audience: pods.eks.amazonaws.com
+{{- end }}

@@ -35,6 +35,7 @@ The following table lists the configurable parameters for this chart and their d
 |---------------------------|---------------------------------------------------------|--------------------------|
 | `affinity`                | Map of node/pod affinities                              | (see `values.yaml`)      |
 | `agent.additionalArgs`    | Additional arguments to pass to the agent-container     | (see `values.yaml`)      |
+| `csiDriver.resources`     | Resources for the CSI driver sidecar                    | `{}`                     |
 | `env`                     | List of environment variables.                          | (see `values.yaml`)      |
 | `fullnameOverride`        | Override the fullname of the chart                      | `eks-pod-identity-agent` |
 | `image.pullPolicy`        | Container pull policy                                   | `Always`                 |
@@ -45,9 +46,100 @@ The following table lists the configurable parameters for this chart and their d
 | `nodeSelector`            | Node labels for pod assignment                          | `{}`                     |
 | `podAnnotations`          | annotations to add to each pod                          | `{}`                     |
 | `priorityClassName`       | Name of the priorityClass                               | `system-node-critical`   |
-| `resources`               | Resources for containers in pod                         | `{}`                     |
+| `resources`               | Resources for the agent container                       | `{}`                     |
 | `tolerations`             | Optional deployment tolerations                         | `all`                    |
 | `updateStrategy`          | Optional update strategy                                | `type: RollingUpdate`    |
+| `workloadIdentity.enabled`| Serve workload identity; see below                      | `false`                  |
 
 Specify each parameter using the `--set key=value[,key=value]` argument to `helm install` or provide a YAML file
 containing the values for the above parameters.
+
+## Workload identity
+
+Off by default. `workloadIdentity.enabled: true` passes `--enable-workload-identity=true` to
+the agent and adds everything below: the agent's socket directory, the CSI driver sidecar, the
+`CSIDriver` object, and `hostPID: true`, which attestation needs to read a caller's PID.
+Isolated regions never get any of it, whatever the value says. Turn it on only with an image
+built with workload identity, which ships `/eks-pod-identity-csi-driver`. Images without it
+(every release through v0.2.5) reject the flag and crash-loop.
+
+With it off, the rendered manifest has no workload identity piece at all.
+
+Pass `--enable-workload-identity` through `workloadIdentity.enabled`, not `agent.additionalArgs`.
+That map renders a key and its value as two arguments, and the agent reads a bare
+`--enable-workload-identity` as true and ignores a separate `false`.
+
+### Node credential
+
+Workload identity reads pods and mints their ServiceAccount tokens as the node
+(`system:node:<name>`), which the Node authorizer scopes to pods on that node. The agent reaches
+the API server through the in-cluster `kubernetes` Service and its CA, and authenticates with an
+IAM token it signs from its own AWS credentials, the way the kubelet's exec plugin does. Those
+credentials are the node's role (IMDS on EC2, the mounted credentials file on hybrid nodes), and
+the cluster's access entry (or `aws-auth` entry) for that role maps the token to the node. The
+chart mounts no kubeconfig or kubelet credential from the host.
+
+Two consequences:
+
+- The agent's ServiceAccount must carry no IAM role. With IRSA (or a Pod Identity association)
+  on it, the agent signs as that role, can't resolve its node, and exits at boot.
+- Boot needs the `kubernetes` Service reachable, which on a new node waits for kube-proxy. The
+  agent retries for about 30 seconds (longer when connections hang, since each attempt can wait
+  up to 30 seconds to connect), then exits. Workload identity failures at boot are fatal: the
+  kubelet restarts the agent with backoff, and the Pod Identity credential endpoint on that node
+  stays down until a boot succeeds.
+
+Clusters without IAM authentication, such as kind, point the agent at a kubeconfig with a client
+certificate instead: set `agent.additionalArgs` to `{"--node-kubeconfig": <path>}` (a string flag,
+so the two-argument rendering is fine) and mount the file and its certificate with
+`daemonsets.<name>.volumes` and `volumeMounts`. Those lists replace the chart's defaults, so copy
+the `jwk-cache` volume and mount from `values.yaml` into yours (and `aws-credentials` on the
+hybrid DaemonSets). A kubeconfig whose user runs an exec plugin is read for its server and CA
+only; the agent still signs the IAM token.
+
+### CSI driver
+
+The chart installs a cluster-scoped `CSIDriver` named `spiffe.csi.eks.amazonaws.com`, served by
+the `eks-pod-identity-agent-csi-driver` sidecar of each agent pod. It publishes the workload
+identity socket into pods the EKS Pod Identity webhook has enrolled. The sidecar runs
+`/eks-pod-identity-csi-driver`, a separate binary in the agent's image.
+
+**Why the object is required.** Kubernetes 1.33's `ServiceAccountNodeAudienceRestriction` only
+lets a node identity mint a ServiceAccount token for an audience the target pod already
+references — through a projected volume, or through the `tokenRequests` of a CSI driver one of
+its volumes names. Enrolled pods carry a CSI volume naming this driver, so this one declaration
+makes the agent's `TokenRequest` permissible fleet-wide with no change to any pod spec.
+
+It's rendered only when workload identity is on. Turning workload identity off deletes it and
+removes the sidecar, so first stop enrolling pods and roll the enrolled ones: a pod whose
+volume names this driver can't unmount it once the driver is gone and stays `Terminating`.
+
+The sidecar registers only once the agent's socket answers, so enrolled pods wait in
+`ContainerCreating` rather than start with an empty socket directory. After registration an
+agent restart is harmless: pods mount the socket directory, not the socket.
+
+### Sidecar mounts and privilege
+
+The agent binds its socket in `/var/run/secrets/pods.eks.amazonaws.com/workloadidentity`, a
+`hostPath` both containers mount. On each publish the sidecar bind mounts that directory onto
+the pod's volume target under `/var/lib/kubelet/pods`, read-only at every hop.
+
+`/var/lib/kubelet/pods` is mounted `mountPropagation: Bidirectional` so the kubelet sees those
+binds. Kubernetes allows Bidirectional only on a privileged container, so the sidecar is
+`privileged: true` — and the agent container, which every pod on the node talks to, is not.
+
+Each kubelet directory is mounted at its host path, because the kubelet opens the registered
+plugin socket and the publish targets in the host mount namespace.
+
+Two `hostPath` details are deliberate. The socket directory and the CSI plugin directories are
+`DirectoryOrCreate` since nothing else creates them on a first boot, while `/var/lib/kubelet/pods`
+is a strict `Directory` — its absence means the kubelet root is elsewhere and publishing there
+would write where nothing reads. And the socket directory is a `hostPath` rather than an
+`emptyDir` so it outlives the agent pod; an `emptyDir` restart would invalidate every bind mount
+already published into running workloads.
+
+### Updating the object
+
+Re-applying on a later add-on update is a no-op. `attachRequired` and `volumeLifecycleModes` are
+immutable after creation, so changing those two means deleting and recreating the object.
+`podInfoOnMount`, `fsGroupPolicy` and `tokenRequests` can be changed in place.

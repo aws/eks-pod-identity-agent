@@ -14,3 +14,4 @@ FROM --platform=$TARGETPLATFORM public.ecr.aws/eks-distro-build-tooling/eks-dist
 ARG TARGETOS TARGETARCH
 COPY --from=go-runner /go-runner /go-runner
 COPY --from=builder /workspace/_output/${TARGETARCH}/bin/eks-pod-identity-agent /eks-pod-identity-agent
+COPY --from=builder /workspace/_output/${TARGETARCH}/bin/eks-pod-identity-csi-driver /eks-pod-identity-csi-driver
