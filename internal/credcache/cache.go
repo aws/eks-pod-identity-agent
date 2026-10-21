@@ -298,9 +298,12 @@ func (c *Cache) containsLocked(podUID string, e *Entry) (*Entry, bool) {
 func (c *Cache) ttls(source credentials.CredentialSource, credsDuration time.Duration) (refresh, eviction time.Duration) {
 	// IMDS credentials have static-stability guarantees. Even if expired, static-stability may
 	// be enabled, so the credentials should still be honored. Hence, they are treated as having
-	// no expiration.
+	// no expiration (eviction-wise). The refresh interval is normally tied to the ~30-minute
+	// IMDS delivery cadence, but an operator-configured renewal TTL
+	// (--max-credential-retention-before-renewal) shorter than that takes precedence, so a
+	// smaller override still forces more frequent refreshes.
 	if source == credentials.SourceIMDS {
-		return imdsRefreshInterval, expiring.NoExpiration
+		return min(imdsRefreshInterval, c.renewalTtl), expiring.NoExpiration
 	}
 	return min(credsDuration, c.renewalTtl), credsDuration
 }
