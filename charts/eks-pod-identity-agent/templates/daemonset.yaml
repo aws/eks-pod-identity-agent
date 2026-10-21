@@ -85,6 +85,9 @@ spec:
             - "--metrics-port"
             - {{ $top.Values.metrics.port | quote }}
             {{- end }}
+            {{- if $top.Values.podLivenessCheck.enabled }}
+            - "--enable-pod-liveness"
+            {{- end }}
             {{- range $key, $value := $top.Values.agent.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}

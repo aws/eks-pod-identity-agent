@@ -35,6 +35,7 @@ var (
 	refreshQps              int
 	rotateCredentials       bool
 	enableIMDSCredentials   bool
+	enablePodLiveness       bool
 )
 
 var serverCmd = &cobra.Command{
@@ -116,6 +117,7 @@ func createServers(ctx context.Context, cfg aws.Config) []*server.Server {
 			RefreshQPS:         refreshQps,
 			EndpointOverridden: overrideEksAuthEndpoint != "",
 			EnableIMDS:         enableIMDSCredentials,
+			EnablePodLiveness:  enablePodLiveness,
 		})
 	}
 
@@ -200,5 +202,8 @@ func init() {
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
 	serverCmd.Flags().BoolVar(&enableIMDSCredentials, "enable-imds-credentials", false,
 		"Enable consuming credentials from IMDS when available on the node")
+	serverCmd.Flags().BoolVar(&enablePodLiveness, "enable-pod-liveness", false,
+		"Watch this node's pods and skip renewing (and promptly evict) credentials for pods that no longer exist. "+
+			"Requires the agent to run as the node identity. Off by default.")
 
 }
