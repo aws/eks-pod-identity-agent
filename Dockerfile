@@ -1,6 +1,6 @@
 
 
-ARG BUILDER=public.ecr.aws/eks-distro-build-tooling/golang:1.26.10
+ARG BUILDER=public.ecr.aws/eks-distro-build-tooling/golang:1.27.3
 
 FROM --platform=$BUILDPLATFORM ${BUILDER} as builder
 WORKDIR /workspace
@@ -8,7 +8,7 @@ COPY . .
 ARG TARGETOS TARGETARCH
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH make build
 
-FROM --platform=$TARGETPLATFORM public.ecr.aws/eks-distro-build-tooling/go-runner:v0.18.0-go-1.26-latest.al23 as go-runner
+FROM --platform=$TARGETPLATFORM public.ecr.aws/eks-distro-build-tooling/go-runner:v0.18.0-go-1.27-latest.al23 as go-runner
 FROM --platform=$TARGETPLATFORM public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base:latest-al23
 
 ARG TARGETOS TARGETARCH
