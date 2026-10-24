@@ -196,6 +196,21 @@ serviceAccount:
   #   create=false, name=""       -> omit serviceAccountName (default behaviour)
   name: ""
 
+# podLivenessCheck lets the agent watch pods on its node and skip renewing (and
+# promptly evict) credentials for pods that no longer exist, reducing needless
+# AssumeRoleForPodIdentity calls to EKS Auth under high pod churn.
+#
+# When enabled, the chart adds a NODE_NAME environment variable (downward API)
+# and grants the agent's ServiceAccount cluster-wide, read-only pods list/watch
+# via a ClusterRole. Because that grant must not be bound to the namespace
+# "default" ServiceAccount, enabling this REQUIRES a dedicated ServiceAccount:
+# set serviceAccount.create=true (or serviceAccount.name to a pre-existing one).
+#
+# Disabled by default so the chart's rendered output and permissions are
+# unchanged. When disabled, the agent fails open and renews as before.
+podLivenessCheck:
+  enabled: false
+
 tolerations:
   - operator: Exists
 
