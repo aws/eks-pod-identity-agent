@@ -10,13 +10,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	cryptox509 "crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // pemTypeCertificateRequest is the label in the "-----BEGIN ...-----" line of a
@@ -30,40 +27,16 @@ const pemTypeCertificateRequest = "CERTIFICATE REQUEST"
 // TEMPORARY: delete once STS overwrites the subject and marks the SAN critical itself.
 const csrSubjectCommonName = "eks-workload-identity"
 
-// generateKey creates a new key pair of the configured kind for one certificate.
+// generateKey creates a new ECDSA P-256 key pair for one certificate. P-256 is the SPIFFE
+// default and cheap to generate, which matters because the agent makes a key for every
+// pod at every renewal.
 //
 // It returns a crypto.Signer rather than the key, because a Signer does not expose the
-// secret as bytes. An unknown kind is an error rather than a fallback: the kind is checked
-// at startup, so reaching here with an unknown one means a caller skipped that check.
-func generateKey(kind workloadidentity.KeyType) (crypto.Signer, error) {
-	switch kind {
-	case workloadidentity.KeyTypeECP256:
-		return ecdsaKey(elliptic.P256(), kind)
-	case workloadidentity.KeyTypeECP384:
-		return ecdsaKey(elliptic.P384(), kind)
-	case workloadidentity.KeyTypeRSA2048:
-		return rsaKey(2048, kind)
-	case workloadidentity.KeyTypeRSA4096:
-		// Slow enough to notice. The agent generates a key for every pod at every
-		// renewal, which is why the default is an elliptic curve.
-		return rsaKey(4096, kind)
-	default:
-		return nil, fmt.Errorf("cannot generate a %q key: %w", string(kind), kind.Validate())
-	}
-}
-
-func ecdsaKey(curve elliptic.Curve, kind workloadidentity.KeyType) (crypto.Signer, error) {
-	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+// secret as bytes.
+func generateKey() (crypto.Signer, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generating a %s key: %w", string(kind), err)
-	}
-	return key, nil
-}
-
-func rsaKey(bits int, kind workloadidentity.KeyType) (crypto.Signer, error) {
-	key, err := rsa.GenerateKey(rand.Reader, bits)
-	if err != nil {
-		return nil, fmt.Errorf("generating a %s key: %w", string(kind), err)
+		return nil, fmt.Errorf("generating an ECDSA P-256 key: %w", err)
 	}
 	return key, nil
 }

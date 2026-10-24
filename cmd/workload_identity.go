@@ -207,7 +207,6 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		Duration:        opts.X509SVIDDuration,
 		RenewFraction:   opts.SVIDRenewalFraction,
 		RenewJitter:     opts.SVIDRenewalJitter,
-		KeyType:         opts.SVIDKeyType,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the X.509-SVID tier: %w", err)

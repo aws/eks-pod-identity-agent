@@ -21,7 +21,6 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/server"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 var (
@@ -47,7 +46,6 @@ var (
 	jwtSVIDDuration        time.Duration
 	svidRenewalFraction    float64
 	svidRenewalJitter      float64
-	svidKeyType            string
 	peerPidfd              bool
 )
 
@@ -248,7 +246,6 @@ func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServ
 		JWTSVIDDuration:     jwtSVIDDuration,
 		SVIDRenewalFraction: svidRenewalFraction,
 		SVIDRenewalJitter:   svidRenewalJitter,
-		SVIDKeyType:         workloadidentity.KeyType(svidKeyType),
 		PeerPidfd:           peerPidfd,
 	}
 }
@@ -351,8 +348,6 @@ func init() {
 		fmt.Sprintf("Lifetime requested for each JWT-SVID, between %s and %s", jwtLower, jwtUpper))
 	serverCmd.Flags().Float64Var(&svidRenewalFraction, handlers.FlagSVIDRenewalFraction, 0.5,
 		"Fraction of an SVID's issued lifetime at which renewal starts")
-	serverCmd.Flags().StringVar(&svidKeyType, handlers.FlagSVIDKeyType, string(workloadidentity.DefaultKeyType),
-		fmt.Sprintf("Key type generated for each X.509-SVID, one of %s", workloadidentity.KeyTypeList()))
 	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
 		"Jitter applied to X.509-SVID and JWT-SVID renewal points, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
 	serverCmd.Flags().BoolVar(&peerPidfd, handlers.FlagPeerPidfd, false,

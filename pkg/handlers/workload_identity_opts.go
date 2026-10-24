@@ -9,7 +9,6 @@ import (
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
-	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
 // Flag names for the workload identity tunables. They are declared here, beside
@@ -21,7 +20,6 @@ const (
 	FlagJWTSVIDDuration        = "jwt-svid-duration"
 	FlagSVIDRenewalFraction    = "svid-renewal-fraction"
 	FlagSVIDRenewalJitter      = "svid-renewal-jitter"
-	FlagSVIDKeyType            = "svid-key-type"
 	FlagNodeKubeconfig         = "node-kubeconfig"
 	FlagPeerPidfd              = "workload-identity-peer-pidfd"
 )
@@ -82,11 +80,6 @@ type WorkloadIdentityServerOpts struct {
 	// same renewal instant, which puts every renewal on the node into one burst
 	// against STS. Zero disables jitter, which is only useful in a test.
 	SVIDRenewalJitter float64
-	// SVIDKeyType is the kind of key pair generated for every X.509-SVID on this node.
-	// Empty means workloadidentity.DefaultKeyType, and workloadidentity.KeyType says why
-	// it is one setting for the agent. JWT-SVIDs are unaffected, since STS signs those
-	// and the agent generates no key for them.
-	SVIDKeyType workloadidentity.KeyType
 	// PeerPidfd lets the socket pin callers by SO_PEERPIDFD where the kernel has
 	// it. Off, every caller is pinned through its /proc handle. Validate doesn't
 	// read it.
@@ -182,21 +175,7 @@ func (o WorkloadIdentityServerOpts) Validate() error {
 		x509SVIDDurationEnvelope.validate(o.X509SVIDDuration),
 		jwtSVIDDurationEnvelope.validate(o.JWTSVIDDuration),
 		validateSVIDRenewal(o.SVIDRenewalFraction, o.SVIDRenewalJitter),
-		validateSVIDKeyType(o.SVIDKeyType),
 	)
-}
-
-// validateSVIDKeyType accepts an empty value, which means the default, and otherwise
-// checks the name against the kinds the agent can generate. Checked at startup so a
-// mistyped flag stops the agent rather than failing every pod on the node.
-func validateSVIDKeyType(k workloadidentity.KeyType) error {
-	if k == "" {
-		return nil
-	}
-	if err := k.Validate(); err != nil {
-		return fmt.Errorf("--%s: %w", FlagSVIDKeyType, err)
-	}
-	return nil
 }
 
 // validateSVIDRenewal checks the renewal point stays strictly inside the issued
