@@ -118,11 +118,6 @@ type Opts struct {
 	RenewFraction float64
 	RenewJitter   float64
 
-	// KeyType is the kind of key pair to generate, from --svid-key-type. Empty takes
-	// the default. An unknown value is rejected when the tier is built, rather than at
-	// the first issuance, so a mistyped flag stops the agent instead of failing pods.
-	KeyType workloadidentity.KeyType
-
 	// MinRemaining overrides defaultMinRemaining.
 	MinRemaining time.Duration
 
@@ -176,7 +171,6 @@ type Source struct {
 	duration       time.Duration
 	renewFraction  float64
 	renewJitter    float64
-	keyType        workloadidentity.KeyType
 	minRemaining   time.Duration
 	renewalTimeout time.Duration
 	issueTimeout   time.Duration
@@ -201,12 +195,6 @@ func New(opts Opts) (*Source, error) {
 	}
 	if opts.MaxCacheSize <= 0 {
 		return nil, fmt.Errorf("an X.509-SVID source needs a positive cache bound, got %d", opts.MaxCacheSize)
-	}
-	if opts.KeyType == "" {
-		opts.KeyType = workloadidentity.DefaultKeyType
-	}
-	if err := opts.KeyType.Validate(); err != nil {
-		return nil, fmt.Errorf("an X.509-SVID source cannot generate that key type: %w", err)
 	}
 	if opts.MinRemaining <= 0 {
 		opts.MinRemaining = defaultMinRemaining
@@ -242,7 +230,6 @@ func New(opts Opts) (*Source, error) {
 		duration:       opts.Duration,
 		renewFraction:  opts.RenewFraction,
 		renewJitter:    opts.RenewJitter,
-		keyType:        opts.KeyType,
 		minRemaining:   opts.MinRemaining,
 		renewalTimeout: opts.RenewalTimeout,
 		issueTimeout:   opts.IssueTimeout,
@@ -355,7 +342,7 @@ func (s *Source) issue(ctx context.Context, w *workloadidentity.Workload) (*x509
 		return nil, err
 	}
 
-	key, err := generateKey(s.keyType)
+	key, err := generateKey()
 	if err != nil {
 		return nil, wierrors.ErrIssuanceFailed.Wrapf(err, "generating a key for %s/%s", w.Namespace, w.PodName)
 	}
