@@ -350,6 +350,6 @@ func init() {
 		"Fraction of an SVID's issued lifetime at which renewal starts")
 	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
 		"Jitter applied to X.509-SVID and JWT-SVID renewal points, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
-	serverCmd.Flags().BoolVar(&peerPidfd, handlers.FlagPeerPidfd, false,
+	serverCmd.Flags().BoolVar(&peerPidfd, handlers.FlagPeerPidfd, true,
 		"Pin workload identity callers by SO_PEERPIDFD on kernels that have it (Linux 6.5+). Off, or on an older kernel, callers are pinned through their /proc handle")
 }

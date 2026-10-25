@@ -184,8 +184,8 @@ type Opts struct {
 // bound is worth reporting where the process can still exit non-zero, and a caller
 // holding a Server knows the socket already exists, so nothing has to poll for it.
 func New(opts Opts) (*Server, error) {
-	// Default to the /proc handle on every node image, whatever its kernel.
-	// SO_PEERPIDFD only when opted in with PeerPidfd.
+	// The /proc handle unless PeerPidfd is set. cmd sets it by default
+	// (--workload-identity-peer-pidfd).
 	method := pinProcHandle
 	if opts.PeerPidfd {
 		method = probePinMethod()
