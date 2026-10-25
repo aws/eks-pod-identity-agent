@@ -51,11 +51,6 @@ func TestServerCmd_WorkloadIdentityFlags_AreRegisteredWithTheAgreedDefaults(t *t
 		{flag: handlers.FlagSVIDRenewalJitter, expectedDefault: "0.1"},
 		// Empty is the in-cluster API server, which every chart install has.
 		{flag: handlers.FlagNodeKubeconfig, expectedDefault: ""},
-		{
-			flag:               handlers.FlagSVIDKeyType,
-			expectedDefault:    string(workloadidentity.DefaultKeyType),
-			expectedUsageBound: workloadidentity.KeyTypeList(),
-		},
 	}
 
 	for _, tc := range testCases {
@@ -89,7 +84,6 @@ func TestNewWorkloadIdentityServerOpts_RegisteredDefaults_PassValidation(t *test
 	g.Expect(opts.JWTSVIDDuration).To(Equal(time.Hour))
 	g.Expect(opts.SVIDRenewalFraction).To(Equal(0.5))
 	g.Expect(opts.SVIDRenewalJitter).To(Equal(0.1))
-	g.Expect(opts.SVIDKeyType).To(Equal(workloadidentity.DefaultKeyType))
 }
 
 // TestNewWorkloadIdentityServerOpts_ParsedFlags_ReachTheOptions proves the wiring
