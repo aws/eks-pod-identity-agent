@@ -531,7 +531,7 @@ func TestErrorMapping_HandlerRefusalsOfTheRequest(t *testing.T) {
 }
 
 // TestRPCMetrics_UnaryCountsSuccessUnderItsConstant pins the rpc label of the
-// unary RPCs to the constants T9's metrics use, with error none on a success.
+// unary RPCs to the constants the notifier's metrics use, with error none on a success.
 func TestRPCMetrics_UnaryCountsSuccessUnderItsConstant(t *testing.T) {
 	t.Run(workloadidentity.RPCFetchJWTSVID, func(t *testing.T) {
 		g := NewWithT(t)

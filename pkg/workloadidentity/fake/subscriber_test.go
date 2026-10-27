@@ -89,8 +89,8 @@ func subscriberSignals(ch <-chan struct{}) int {
 // subscriberDrainPrimes asserts every channel came back with exactly the prime
 // pending and consumes it, so the assertions after it count real publishes only.
 //
-// It doubles as the test that a live subscribe is primed, which is the part of T9
-// a handler can observe: a wait-then-send loop has nothing to send without it.
+// It doubles as the test that a live subscribe is primed, which is the part of the
+// notifier a handler can observe: a wait-then-send loop has nothing to send without it.
 func subscriberDrainPrimes(t *testing.T, channels ...<-chan struct{}) {
 	t.Helper()
 	for i, ch := range channels {

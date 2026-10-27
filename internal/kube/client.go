@@ -5,8 +5,8 @@
 // than as the agent's ServiceAccount. That is what makes the node-scoped reads
 // and writes safe: the Node authorizer restricts a node identity to the pods
 // bound to its own node, a property no ServiceAccount and RBAC grant can express.
-// Both consumers depend on it — the attestor's pod watch and node-name lookup
-// (T3), and the token minter's TokenRequest (T4) — so the client is built once
+// Both consumers depend on it — the attestor's pod watch and node-name lookup,
+// and the token minter's TokenRequest — so the client is built once
 // here and injected into both rather than each constructing its own. One
 // construction means one credential path, one connection pool, and one rate
 // limiter bounding the agent's total traffic to the API server.
@@ -19,7 +19,7 @@
 // internal/validation/apiserver_client.go still builds its own client from
 // rest.InClusterConfig() (the agent's ServiceAccount) for JWKS fetching, which
 // does not require the node identity. Whether that path also moves onto the node
-// credential is a deliberate T4 decision, not something to fold in by accident.
+// credential is a deliberate decision, not something to fold in by accident.
 package kube
 
 import (

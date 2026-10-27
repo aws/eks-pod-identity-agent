@@ -180,7 +180,7 @@ func TestObserveRPC_DurationObservedUnderRPCAndOutcome(t *testing.T) {
 }
 
 // TestObserveRPC_CountsUnderTheDeclaredNames pins that the counter is registered
-// under MetricRPCTotal with the rpc, outcome and error labels, so T9's
+// under MetricRPCTotal with the rpc, outcome and error labels, so the notifier's
 // subscription metrics and these spell the dimensions alike.
 func TestObserveRPC_CountsUnderTheDeclaredNames(t *testing.T) {
 	g := NewWithT(t)

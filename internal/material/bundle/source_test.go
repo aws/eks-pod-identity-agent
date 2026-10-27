@@ -25,7 +25,7 @@ import (
 )
 
 // newTestSource builds one provider's source over fetcher with a fake Subscriber
-// as its notifier, which is the T9 contract the tier signals through.
+// as its notifier, which is the subscription contract the tier signals through.
 func newTestSource(t *testing.T, fetcher Fetcher) (*providerSource, *fake.Subscriber) {
 	t.Helper()
 	notifier := &fake.Subscriber{}

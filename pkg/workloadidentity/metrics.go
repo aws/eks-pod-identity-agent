@@ -14,39 +14,39 @@ package workloadidentity
 // deliberately not folded into pod_identity_, so that dashboards and alarms for
 // the AWS credentials path and the SPIFFE path can be reasoned about apart.
 
-// Metric names. Each comment names the task that owns the collector and the
+// Metric names. Each comment names the component that owns the collector and the
 // label set it registers with.
 const (
 	// MetricPeerPinTotal counts connections by whether the handshake pinned
-	// their peer. T2: {outcome, reason}.
+	// their peer. gRPC server: {outcome, reason}.
 	MetricPeerPinTotal = "workload_identity_peer_pin_total"
-	// MetricAttestationTotal counts attestation attempts. T3: {outcome, reason}.
+	// MetricAttestationTotal counts attestation attempts. Attestor: {outcome, reason}.
 	MetricAttestationTotal = "workload_identity_attestation_total"
-	// MetricAttestationDuration observes attestation latency. T3: {outcome}.
+	// MetricAttestationDuration observes attestation latency. Attestor: {outcome}.
 	MetricAttestationDuration = "workload_identity_attestation_duration_seconds"
-	// MetricTokenMintTotal counts ServiceAccount token mints. T4: {outcome, error}.
+	// MetricTokenMintTotal counts ServiceAccount token mints. Token minter: {outcome, error}.
 	MetricTokenMintTotal = "workload_identity_token_mint_total"
-	// MetricTokenMintDuration observes token mint latency. T4: {outcome}.
+	// MetricTokenMintDuration observes token mint latency. Token minter: {outcome}.
 	MetricTokenMintDuration = "workload_identity_token_mint_duration_seconds"
-	// MetricSessionTotal counts AWS session exchanges. T5: {outcome, error}.
+	// MetricSessionTotal counts AWS session exchanges. Session provider: {outcome, error}.
 	MetricSessionTotal = "workload_identity_session_total"
-	// MetricSessionDuration observes session exchange latency. T5: {outcome}.
+	// MetricSessionDuration observes session exchange latency. Session provider: {outcome}.
 	MetricSessionDuration = "workload_identity_session_duration_seconds"
-	// MetricSvidIssuanceTotal counts SVID issuances. T7,T8: {format, outcome, error}.
+	// MetricSvidIssuanceTotal counts SVID issuances. X.509 and JWT sources: {format, outcome, error}.
 	MetricSvidIssuanceTotal = "workload_identity_svid_issuance_total"
-	// MetricSvidIssuanceDuration observes SVID issuance latency. T7,T8: {format, outcome}.
+	// MetricSvidIssuanceDuration observes SVID issuance latency. X.509 and JWT sources: {format, outcome}.
 	MetricSvidIssuanceDuration = "workload_identity_svid_issuance_duration_seconds"
-	// MetricSvidRenewalTotal counts SVID renewals. T7,T8: {format, outcome, error}.
+	// MetricSvidRenewalTotal counts SVID renewals. X.509 and JWT sources: {format, outcome, error}.
 	MetricSvidRenewalTotal = "workload_identity_svid_renewal_total"
-	// MetricBundleFetchTotal counts trust bundle fetches. T6: {outcome, error}.
+	// MetricBundleFetchTotal counts trust bundle fetches. Bundle source: {outcome, error}.
 	MetricBundleFetchTotal = "workload_identity_bundle_fetch_total"
-	// MetricBundleFetchDuration observes trust bundle fetch latency. T6: {outcome}.
+	// MetricBundleFetchDuration observes trust bundle fetch latency. Bundle source: {outcome}.
 	MetricBundleFetchDuration = "workload_identity_bundle_fetch_duration_seconds"
-	// MetricBundleChangeTotal counts detected trust bundle changes. T6: no labels.
+	// MetricBundleChangeTotal counts detected trust bundle changes. Bundle source: no labels.
 	MetricBundleChangeTotal = "workload_identity_bundle_change_total"
-	// MetricSubscriptionsActive gauges open stream subscriptions. T9: {rpc}.
+	// MetricSubscriptionsActive gauges open stream subscriptions. Notifier: {rpc}.
 	MetricSubscriptionsActive = "workload_identity_subscriptions_active"
-	// MetricNotificationTotal counts notifications delivered to streams. T9: {rpc, delivery}.
+	// MetricNotificationTotal counts notifications delivered to streams. Notifier: {rpc, delivery}.
 	//
 	// The second label was {outcome} when this name was declared. It is
 	// {delivery} instead because neither thing that can happen to a signal is a
@@ -58,7 +58,7 @@ const (
 	// MetricCacheTotal counts cache lookups. All tiers: {tier, result}.
 	MetricCacheTotal = "workload_identity_cache_total"
 	// MetricCredentialSourceTotal counts the credential source a refresh was
-	// routed to, by pod enrollment. T15: {source}.
+	// routed to, by pod enrollment. Session provider: {source}.
 	//
 	// It is the observable for the HOSM/WISE overlap: an enrolled pod must never
 	// refresh through IMDS, because the DR aggregator publishes undecorated
@@ -66,15 +66,15 @@ const (
 	// rather than a latency regression. Only a refresh is counted, since a sync
 	// is EKS Auth for every pod by construction.
 	MetricCredentialSourceTotal = "workload_identity_credential_source_total"
-	// MetricRPCTotal counts served RPCs. T10,T11: {rpc, outcome, error}.
+	// MetricRPCTotal counts served RPCs. Workload API and SDS handlers: {rpc, outcome, error}.
 	MetricRPCTotal = "workload_identity_rpc_total"
-	// MetricRPCDuration observes served RPC latency. T10,T11: {rpc, outcome}.
+	// MetricRPCDuration observes served RPC latency. Workload API and SDS handlers: {rpc, outcome}.
 	MetricRPCDuration = "workload_identity_rpc_duration_seconds"
 	// MetricVolumeMountTotal counts CSI publishes and unpublishes of the socket
-	// directory. T12: {operation, outcome}.
+	// directory. CSI driver: {operation, outcome}.
 	MetricVolumeMountTotal = "workload_identity_volume_mount_total"
 	// MetricRegistrationTotal counts what the kubelet decided about the CSI node
-	// plugin. T12: {outcome}.
+	// plugin. CSI driver: {outcome}.
 	//
 	// Separate from the mount metric because a refusal is terminal rather than
 	// retried: no publish follows it, so every enrolled pod on the node fails.

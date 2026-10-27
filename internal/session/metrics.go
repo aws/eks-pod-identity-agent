@@ -20,7 +20,7 @@ import (
 
 // cacheTotalHelp is the help text of the shared workload_identity_cache_total
 // counter. It must be byte-for-byte what every other tier registers it with,
-// T4's included: the registry treats the same name with a different help string
+// the token minter's included: the registry treats the same name with a different help string
 // as a conflicting collector, not as the one already registered, so reusing it
 // would fail.
 const cacheTotalHelp = "Count of workload identity cache lookups, by tier and result."
