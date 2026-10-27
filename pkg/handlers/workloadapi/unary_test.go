@@ -47,7 +47,7 @@ func unaryKey(podUID string, audiences []string) unaryTokenKey {
 }
 
 // unaryMintTokens points h.tokens at a func returning one JWT-SVID carrying every
-// requested audience, as T8 issues them, signed by h.jwt. Every token is signed
+// requested audience, as the JWT-SVID source issues them, signed by h.jwt. Every token is signed
 // here, on the test goroutine, so the fake only looks them up and never calls
 // t.Fatalf off it.
 func unaryMintTokens(h *harness) map[unaryTokenKey]string {
@@ -293,7 +293,7 @@ func TestValidateJWTSVID_BundleUnavailableIsUnavailableNotInvalid(t *testing.T) 
 	g.Expect(resp.GetSpiffeId()).To(Equal(unaryPeerID))
 }
 
-// The source resolves the caller's provider as T6 does, so an unenrolled caller is
+// The source resolves the caller's provider as the bundle source does, so an unenrolled caller is
 // refused with the Not enrolled code and an enrolled one is served.
 func TestValidateJWTSVID_NotEnrolledCallerIsPermissionDenied(t *testing.T) {
 	g := NewWithT(t)

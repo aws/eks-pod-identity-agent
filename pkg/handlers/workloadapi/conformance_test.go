@@ -357,7 +357,7 @@ func TestFetchJWTBundles_GoSpiffeReceivesProviderAuthorities(t *testing.T) {
 
 // conformanceJWTHarness serves tokens signed by the harness's JWT authority for
 // svidA, one per audience set in conformanceAudienceSets, each carrying the whole
-// set as T8 issues them. They are minted up front on the test goroutine, since
+// set as the JWT-SVID source issues them. They are minted up front on the test goroutine, since
 // the signer fails the test through t. It returns the tokens by joined set.
 func conformanceJWTHarness(t *testing.T) (*harness, map[string]string) {
 	t.Helper()

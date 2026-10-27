@@ -146,25 +146,25 @@ func newWorkloadIdentityError(kind Kind, label string, retryable bool) *Workload
 }
 
 var (
-	// ErrUnattestable is produced by the attestor (T3) when the pinned peer of an
-	// accepted connection cannot be resolved to a pod; by the bundle source (T6)
-	// for a nil workload; by the session tier (T5) for a token to renew that names
-	// no pod; and by the token minter (T4), session (T5), X.509 (T7) and JWT (T8)
+	// ErrUnattestable is produced by the attestor when the pinned peer of an
+	// accepted connection cannot be resolved to a pod; by the bundle source
+	// for a nil workload; by the session tier for a token to renew that names
+	// no pod; and by the token minter, session, X.509 and JWT
 	// tiers for a pod deleted from the node store. Not retryable.
 	ErrUnattestable = newWorkloadIdentityError(KindUnattestable, "unattestable", false)
 
-	// ErrNotEnrolled is produced by the token minter (T4) and the session
-	// provider (T5) when the attested pod has no workload identity association,
-	// and by the bundle source (T6) for a session that names no provider. Not
+	// ErrNotEnrolled is produced by the token minter and the session
+	// provider when the attested pod has no workload identity association,
+	// and by the bundle source for a session that names no provider. Not
 	// retryable: the pod has no association and a retry cannot create one.
 	ErrNotEnrolled = newWorkloadIdentityError(KindNotEnrolled, "not_enrolled", false)
 
-	// ErrTokenMintFailed is produced by the token minter (T4) when a TokenRequest
+	// ErrTokenMintFailed is produced by the token minter when a TokenRequest
 	// against the API server does not yield a pod-bound ServiceAccount token.
 	// Retryable: transient failures dominate on that path.
 	ErrTokenMintFailed = newWorkloadIdentityError(KindTokenMintFailed, "token_mint_failed", true)
 
-	// ErrTokenMintForbidden is produced by the token minter (T4) when the API
+	// ErrTokenMintForbidden is produced by the token minter when the API
 	// server refuses a TokenRequest for the EKS Auth audience. The usual cause is
 	// the CSIDriver object for spiffe.csi.eks.amazonaws.com not declaring
 	// tokenRequests for that audience, which the node audience restriction
@@ -172,62 +172,62 @@ var (
 	// creates or fixes that object.
 	ErrTokenMintForbidden = newWorkloadIdentityError(KindTokenMintForbidden, "token_mint_forbidden", false)
 
-	// ErrSessionUnavailable is produced by the session provider (T5) when the EKS
+	// ErrSessionUnavailable is produced by the session provider when the EKS
 	// Auth exchange does not yield a decorated session. Retryable: transient
 	// failures dominate on that path.
 	ErrSessionUnavailable = newWorkloadIdentityError(KindSessionUnavailable, "session_unavailable", true)
 
-	// ErrIssuanceFailed is produced by the certificate source (T7) and the token
-	// source (T8) when STS issuance fails. Retryable: STS issuance is a remote
+	// ErrIssuanceFailed is produced by the certificate source and the token
+	// source when STS issuance fails. Retryable: STS issuance is a remote
 	// call and a repeat can succeed.
 	ErrIssuanceFailed = newWorkloadIdentityError(KindIssuanceFailed, "issuance_failed", true)
 
-	// ErrIssuanceThrottled is produced by the certificate source (T7) and the
-	// token source (T8) when STS throttles issuance. Retryable: throttling is the
+	// ErrIssuanceThrottled is produced by the certificate source and the
+	// token source when STS throttles issuance. Retryable: throttling is the
 	// retryable case by definition. It is distinct from ErrIssuanceFailed so
 	// callers can back off differently.
 	ErrIssuanceThrottled = newWorkloadIdentityError(KindIssuanceThrottled, "issuance_throttled", true)
 
-	// ErrBundleUnavailable is produced by the bundle source (T6) when
+	// ErrBundleUnavailable is produced by the bundle source when
 	// sts:GetTrustBundles does not yield trust material. Retryable: the fetch is
 	// a remote call and a repeat can succeed.
 	ErrBundleUnavailable = newWorkloadIdentityError(KindBundleUnavailable, "bundle_unavailable", true)
 
-	// ErrInvalidAudience is produced by the token source (T8) and the Workload
-	// API handler (T10) for a caller-supplied audience the agent will never
+	// ErrInvalidAudience is produced by the token source and the Workload
+	// API handler for a caller-supplied audience the agent will never
 	// accept. Not retryable: the same request will be rejected the same way.
 	ErrInvalidAudience = newWorkloadIdentityError(KindInvalidAudience, "invalid_audience", false)
 
-	// ErrSessionRefused is produced by the session provider (T5) when EKS Auth
+	// ErrSessionRefused is produced by the session provider when EKS Auth
 	// refuses the exchange with AccessDenied (such as a role missing
 	// sts:SetContext) or InvalidToken. Not retryable: a repeat gets the same
 	// answer. It is distinct from ErrSessionUnavailable so a misconfigured role
 	// or node does not read as an EKS Auth outage.
 	ErrSessionRefused = newWorkloadIdentityError(KindSessionRefused, "session_refused", false)
 
-	// ErrBundleRefused is produced by the bundle source (T6) when STS refuses a
+	// ErrBundleRefused is produced by the bundle source when STS refuses a
 	// provider's bundles for a reason a repeat cannot change. Not retryable. It is
 	// distinct from ErrBundleUnavailable so a workload role missing
 	// sts:GetTrustBundles does not read as an STS outage.
 	ErrBundleRefused = newWorkloadIdentityError(KindBundleRefused, "bundle_refused", false)
 
-	// ErrIssuanceRefused is produced by the certificate source (T7) and the token
-	// source (T8) when STS refuses issuance for a reason a repeat cannot change, such
+	// ErrIssuanceRefused is produced by the certificate source and the token
+	// source when STS refuses issuance for a reason a repeat cannot change, such
 	// as a Provider with no outbound signer. Not retryable, which is what separates it
 	// from ErrIssuanceFailed.
 	ErrIssuanceRefused = newWorkloadIdentityError(KindIssuanceRefused, "issuance_refused", false)
 
-	// ErrInvalidToken is produced by the Workload API handler (T10) for a JWT-SVID
+	// ErrInvalidToken is produced by the Workload API handler for a JWT-SVID
 	// a caller presents to ValidateJWTSVID that fails validation against its
 	// provider's authorities. Not retryable: the same token fails the same way.
 	ErrInvalidToken = newWorkloadIdentityError(KindInvalidToken, "invalid_token", false)
 
-	// ErrInvalidRequest is produced by the Workload API handler (T10) for a
+	// ErrInvalidRequest is produced by the Workload API handler for a
 	// request missing a required field or carrying a malformed one, such as an
 	// unparsable SPIFFE ID. Not retryable: the same request is malformed again.
 	ErrInvalidRequest = newWorkloadIdentityError(KindInvalidRequest, "invalid_request", false)
 
-	// ErrNoIdentity is produced by the Workload API handler (T10) when an attested
+	// ErrNoIdentity is produced by the Workload API handler when an attested
 	// caller holds no SVID matching its request, which is SPIRE's "no identity
 	// issued". Not retryable: a repeat of the same request matches nothing again.
 	ErrNoIdentity = newWorkloadIdentityError(KindNoIdentity, "no_identity", false)
@@ -275,8 +275,8 @@ func IsRetryable(err error) bool {
 }
 
 // WorkloadIdentityTaxonomy returns every taxonomy member in kind order, so a
-// caller mapping the taxonomy onto gRPC status codes (T10, T11) can assert its
-// own mapping is total.
+// caller mapping the taxonomy onto gRPC status codes (the Workload API and SDS
+// handlers) can assert its own mapping is total.
 func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 	return []*WorkloadIdentityError{
 		ErrUnattestable,

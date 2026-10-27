@@ -1,6 +1,6 @@
 package attestation
 
-// Attestation metrics. T3 owns the collectors for the two attestation metric
+// Attestation metrics. The attestor owns the collectors for the two attestation metric
 // names declared in pkg/workloadidentity/metrics.go and registers them against
 // those names here. The names and label names are taken from that package rather
 // than written out again, so a rename there is a compile error here rather than a

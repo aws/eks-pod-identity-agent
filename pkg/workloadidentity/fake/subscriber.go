@@ -355,7 +355,7 @@ func (s *Subscriber) SubscribeCalls() int {
 // WorkloadChanges reports the pod UID of every per-pod publish, in call order.
 //
 // It records UIDs rather than counting calls because that is what the material
-// tiers are asserted on: T7 publishes once per successful store with the pod's own
+// tiers are asserted on: the X.509 source publishes once per successful store with the pod's own
 // UID and not at all on a failed renewal, which a count cannot tell apart.
 func (s *Subscriber) WorkloadChanges() []string {
 	s.mu.Lock()

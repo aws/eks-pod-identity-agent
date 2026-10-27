@@ -1,7 +1,7 @@
 package handlers
 
 // Collectors for the RPC metric names declared in pkg/workloadidentity. They live
-// here, beside the status mapping, because the Workload API (T10) and SDS (T11)
+// here, beside the status mapping, because the Workload API and SDS
 // handlers both emit them and a second promauto registration of a name panics.
 
 import (

@@ -10,8 +10,8 @@ import (
 )
 
 // This file maps the workload identity error taxonomy onto gRPC status codes for
-// both handlers on the workload identity socket, the SPIFFE Workload API (T10)
-// and Envoy SDS (T11). One table means a workload is never refused on one
+// both handlers on the workload identity socket, the SPIFFE Workload API
+// and Envoy SDS. One table means a workload is never refused on one
 // interface and served, or refused with a different code, on the other. The
 // clients are third-party SPIFFE libraries and Envoy, so where SPIRE has an
 // established answer it is the answer here.

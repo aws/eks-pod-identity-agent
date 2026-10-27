@@ -1,7 +1,7 @@
 package handlers
 
-// One RPC's progress and retry pace, shared by the Workload API (T10) and SDS
-// (T11) handlers so the RPC metrics mean the same thing on both: one RPC counts
+// One RPC's progress and retry pace, shared by the Workload API and SDS
+// handlers so the RPC metrics mean the same thing on both: one RPC counts
 // once, at the answer it gave or at the error that ended it before one, and a
 // caller that left counts neither way.
 

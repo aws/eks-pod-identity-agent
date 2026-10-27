@@ -1,7 +1,7 @@
 package kube
 
 // This file resolves the agent's own Kubernetes node name. The attestor's pod
-// store field selector and node recheck depend on it (T3). A wrong value is
+// store field selector and node recheck depend on it. A wrong value is
 // expensive and silent: spec.nodeName=<wrong> is a valid selector that matches
 // nothing, so the store stays empty and every attestation fails as "pod not in
 // store" rather than as a misconfiguration.
@@ -15,7 +15,7 @@ package kube
 // shapes.
 //
 // This only works because the client is the node. If that credential decision
-// changes (T4), the username stops being a node identity and this returns a hard
+// changes, the username stops being a node identity and this returns a hard
 // error rather than a wrong name; a ServiceAccount client would need the
 // downward-API fallback instead.
 

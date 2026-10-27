@@ -1,6 +1,6 @@
 package notify
 
-// T9 collectors for the subscription and notification metric names declared in
+// Collectors for the subscription and notification metric names declared in
 // pkg/workloadidentity/metrics.go. Names, labels and values are taken from that
 // package so a rename there is a compile error here.
 

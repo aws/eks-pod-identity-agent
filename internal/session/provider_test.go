@@ -524,7 +524,7 @@ func TestSessionProvider_ARefreshAnsweredUndecoratedLeavesSessionToExchange(t *t
 }
 
 // TestSessionProvider_ARefreshWhoseMintIsRefusedDropsTheSession proves a
-// refresh whose mint fails non-retryably, as T4's ErrTokenMintForbidden does,
+// refresh whose mint fails non-retryably, as the token minter's ErrTokenMintForbidden does,
 // drops the session without reaching EKS Auth. A refresh isn't a Session
 // exchange, so the failure isn't on the exchange metrics.
 func TestSessionProvider_ARefreshWhoseMintIsRefusedDropsTheSession(t *testing.T) {
@@ -750,7 +750,7 @@ func TestSessionProvider_InvalidateDuringARefreshNeverBringsBackTheOldSession(t 
 
 // TestSessionProvider_CallersThatInvalidateOneSessionShareOneReExchange proves
 // callers that saw one session fail, each calling Invalidate then Session as
-// T8's per-audience calls would, cost one re-exchange between them. Every
+// the JWT-SVID source's per-audience calls would, cost one re-exchange between them. Every
 // invalidation after the first finds nothing cached to drop, since the first
 // one's re-exchange is still running, and its caller joins that re-exchange.
 func TestSessionProvider_CallersThatInvalidateOneSessionShareOneReExchange(t *testing.T) {
@@ -1321,10 +1321,10 @@ func TestRegisterCacheTotal(t *testing.T) {
 		g.Expect(testutil.GatherAndCount(reg, workloadidentity.MetricCacheTotal)).To(Equal(1))
 	})
 
-	t.Run("reuses the collector T4 registered", func(t *testing.T) {
+	t.Run("reuses the collector the token minter registered", func(t *testing.T) {
 		g := NewWithT(t)
 		reg := prometheus.NewRegistry()
-		// T4's registration, verbatim from internal/tokenminter/metrics.go.
+		// The token minter's registration, verbatim from internal/tokenminter/metrics.go.
 		existing := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: workloadidentity.MetricCacheTotal,
 			Help: "Count of workload identity cache lookups, by tier and result.",

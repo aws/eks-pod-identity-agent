@@ -48,7 +48,7 @@ type minterTokens struct {
 
 var _ credcache.TokenSource = minterTokens{}
 
-// MinterTokens is the cache's TokenSource over minter. cmd passes T4's cached
+// MinterTokens is the cache's TokenSource over minter. cmd passes the token minter's cached
 // minter, the one the session tier exchanges with, so the cache's refreshes and
 // the tier's exchanges share one token cache.
 func MinterTokens(minter workloadidentity.TokenMinter) credcache.TokenSource {

@@ -348,8 +348,8 @@ func TestRenewalForAGonePodDropsTheCertificate(t *testing.T) {
 
 // TestStoreNotifiesTheOpenStreams covers what makes a replacement reach a workload.
 // Without it the agent holds a fresh certificate while the pod carries on with the old
-// one, which is T10's definition of done: a renewal produces a fresh response on an
-// already-open stream.
+// one. A renewal must produce a fresh response on an already-open Workload API
+// stream.
 func TestStoreNotifiesTheOpenStreams(t *testing.T) {
 	ca := newTestCA(t)
 	now := time.Now()
