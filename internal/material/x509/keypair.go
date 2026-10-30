@@ -11,7 +11,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	cryptox509 "crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
 )
@@ -19,13 +18,6 @@ import (
 // pemTypeCertificateRequest is the label in the "-----BEGIN ...-----" line of a
 // certificate request. The name is fixed by RFC 7468.
 const pemTypeCertificateRequest = "CERTIFICATE REQUEST"
-
-// csrSubjectCommonName is a placeholder subject. STS does not parse the CSR, so an empty
-// one reaches the signer, which rejects it. It names the agent, not the workload, because
-// the agent does not choose the identity.
-//
-// TEMPORARY: delete once STS overwrites the subject and marks the SAN critical itself.
-const csrSubjectCommonName = "eks-workload-identity"
 
 // generateKey creates a new ECDSA P-256 key pair for one certificate. P-256 is the SPIFFE
 // default and cheap to generate, which matters because the agent makes a key for every
@@ -45,12 +37,10 @@ func generateKey() (crypto.Signer, error) {
 // the key pair and a signature made with the private half, which proves possession.
 //
 // It names no identity. The SPIFFE ID comes from the attested workload identity in the
-// session, never from the request, so the request carries no SAN and no extensions. Its
-// subject is the fixed csrSubjectCommonName placeholder, for the reason given there.
+// session, never from the request, so the request carries no subject, no SAN and no
+// extensions.
 func buildCSR(key crypto.Signer) (string, error) {
-	der, err := cryptox509.CreateCertificateRequest(rand.Reader, &cryptox509.CertificateRequest{
-		Subject: pkix.Name{CommonName: csrSubjectCommonName},
-	}, key)
+	der, err := cryptox509.CreateCertificateRequest(rand.Reader, &cryptox509.CertificateRequest{}, key)
 	if err != nil {
 		return "", fmt.Errorf("building the certificate signing request: %w", err)
 	}

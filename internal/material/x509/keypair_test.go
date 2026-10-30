@@ -34,8 +34,8 @@ func TestGenerateKeyIsECDSAP256(t *testing.T) {
 }
 
 // TestBuildCSRNamesNoIdentity is the definition-of-done assertion on the request: it
-// carries a public key, a proof of possession, and a fixed placeholder subject, and
-// nothing that could be read as the agent naming an identity.
+// carries a public key and a proof of possession, and nothing that could be read as the
+// agent naming an identity.
 func TestBuildCSRNamesNoIdentity(t *testing.T) {
 	key, err := generateKey()
 	require.NoError(t, err)
@@ -54,13 +54,7 @@ func TestBuildCSRNamesNoIdentity(t *testing.T) {
 	assert.NoError(t, csr.CheckSignature(), "the request has to prove possession of the key")
 	assert.Equal(t, key.Public(), csr.PublicKey, "the request has to carry this issuance's public key")
 
-	// The subject is the fixed placeholder and nothing else: a blank one is currently
-	// rejected by the signer, and a workload-specific one would say the agent picks the
-	// identity. Asserting the exact value keeps this pinned to the one string that has
-	// to be deleted when STS starts overwriting the subject itself.
-	assert.Equal(t, csrSubjectCommonName, csr.Subject.CommonName)
-	assert.Equal(t, "CN="+csrSubjectCommonName, csr.Subject.String(),
-		"the subject carries the placeholder common name and no other attribute")
+	assert.Empty(t, csr.Subject.String(), "the request names no subject")
 	assert.Empty(t, csr.Extensions, "the request carries no extensions")
 	assert.Empty(t, csr.ExtraExtensions, "the request carries no extensions")
 	assert.Empty(t, csr.DNSNames)
