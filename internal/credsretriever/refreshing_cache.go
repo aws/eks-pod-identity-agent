@@ -2,6 +2,7 @@ package credsretriever
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -250,9 +251,13 @@ func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
 
 	// Store credentials in cache if they are valid. It might be that
 	// the credentials might have been either removed or inserted by another
-	// thread, but it won't matter, we'll just upsert as the cache is thread safe
+	// thread, but it won't matter, we'll just upsert as the cache is thread safe.
+	// A pod deleted since is still served what EKS Auth just vended, uncached.
 	if err := r.cache.Store(ctx, podUID, newCacheEntry); err != nil {
-		return nil, nil, err
+		if !errors.Is(err, credcache.ErrForgotten) {
+			return nil, nil, err
+		}
+		logger.FromContext(ctx).Infof("Pod %s was deleted, so its credentials aren't cached", podUID)
 	}
 	return newCacheEntry, newCacheEntry.Metadata, nil
 }

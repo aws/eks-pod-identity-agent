@@ -16,6 +16,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credsretriever"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/session"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/validation"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/credentials"
 
@@ -41,6 +42,16 @@ type EksCredentialHandlerOpts struct {
 	RefreshQPS         int
 	EndpointOverridden bool
 	EnableIMDS         bool
+	// CredentialRetriever, when set, is used as is, so callers can share one
+	// cache, and every field but ClusterName is then ignored. When nil, the
+	// handler builds its own with NewCredentialManager.
+	CredentialRetriever credentials.CredentialRetriever
+	// WorkloadIdentityTokens is set by cmd, with workload identity on, to the
+	// token source over the shared token minter. The cache then refreshes every
+	// entry EKS Auth decorated through EKS Auth, swapping its token close to
+	// expiry for one from it. Every other entry, and every entry while it's nil,
+	// refreshes through the general delegate with its stored token.
+	WorkloadIdentityTokens credcache.TokenSource
 }
 
 var (
@@ -50,12 +61,17 @@ var (
 	}, []string{"code"})
 )
 
-// NewEksCredentialHandler builds the handler over NewCredentialManager(ctx, opts).Retriever.
+// NewEksCredentialHandler builds the handler over opts.CredentialRetriever, or
+// over NewCredentialManager(ctx, opts).Retriever when that's nil.
 func NewEksCredentialHandler(ctx context.Context, opts EksCredentialHandlerOpts) *EksCredentialHandler {
+	credentialsRetriever := opts.CredentialRetriever
+	if credentialsRetriever == nil {
+		credentialsRetriever = NewCredentialManager(ctx, opts).Retriever
+	}
 	return &EksCredentialHandler{
 		RequestValidator:    validation.DefaultCredentialValidator{},
 		ClusterName:         opts.ClusterName,
-		CredentialRetriever: NewCredentialManager(ctx, opts).Retriever,
+		CredentialRetriever: credentialsRetriever,
 	}
 }
 
@@ -74,9 +90,11 @@ type CredentialManager struct {
 	EKSAuth credentials.CredentialRetriever
 }
 
-// NewCredentialManager builds the EKS Auth client, the [imds, eksauth] chain when
-// opts.EnableIMDS is set and IMDS answers, and, unless CredentialRenewal or
-// MaxCacheSize is zero, the cache and its retriever with a token validator.
+// NewCredentialManager builds the EKS Auth client and, unless CredentialRenewal or
+// MaxCacheSize is zero, the cache and its retriever with a token validator, over
+// the [imds, eksauth] chain when opts.EnableIMDS is set and IMDS answers. It
+// reads every field of opts but CredentialRetriever. cmd calls it once, so every
+// bind host and the workload identity tiers share one cache.
 func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) CredentialManager {
 	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
 	log := logger.FromContext(ctx)
@@ -97,7 +115,8 @@ func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) Cr
 
 // newCredentialManager is NewCredentialManager over delegates it's given: general
 // serves the handler without a cache and refreshes the cache, and authSvc serves
-// misses. cacheOpts carries the cache options only tests set.
+// misses. With opts.WorkloadIdentityTokens set, authSvc also refreshes decorated
+// entries. cacheOpts carries the cache options only tests set.
 //
 // The [imds, eksauth] chain is constructed only when caching is enabled. The IMDS
 // delegate cannot validate tokens, and without caching, the agent doesn't know
@@ -110,6 +129,12 @@ func newCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts, ca
 	}
 	general = buildCredentialRetriever(ctx, opts, general)
 	cacheOpts.Delegate = general
+	// Off, the agent issues nothing from a decorated session, so even a
+	// decorated entry refreshes through general and IMDS keeps static stability.
+	// On, only decorated entries refresh through authSvc with a current token.
+	if opts.WorkloadIdentityTokens != nil {
+		cacheOpts.RefreshWith = session.RefreshWith(authSvc, opts.WorkloadIdentityTokens)
+	}
 	cacheOpts.RenewalTtl = opts.CredentialRenewal
 	cacheOpts.MaxSize = opts.MaxCacheSize
 	cacheOpts.RefreshQPS = opts.RefreshQPS

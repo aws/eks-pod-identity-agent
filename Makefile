@@ -13,6 +13,7 @@ GOOS?=$(shell go env GOOS)
 GOARCH?=$(shell go env GOARCH)
 OUTPUT := _output/$(GOARCH)
 BINARY := $(OUTPUT)/bin/eks-pod-identity-agent
+CSI_DRIVER_BINARY := $(OUTPUT)/bin/eks-pod-identity-csi-driver
 
 # Directories
 TOOLS_DIR := hack/tools
@@ -57,6 +58,10 @@ build:
 		-X 'k8s.io/component-base/version/verflag.programName=eks-pod-identity-agent' \
 		-X 'go.amzn.com/eks/eks-pod-identity-agent/configuration.AgentVersion=$(VERSION)' " \
 		-o $(BINARY) .
+	@echo "Building eks-pod-identity-csi-driver for $(shell go env GOOS)/$(GOARCH)"
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build \
+		-ldflags "-X 'go.amzn.com/eks/eks-pod-identity-agent/configuration.AgentVersion=$(VERSION)'" \
+		-o $(CSI_DRIVER_BINARY) ./cmd/eks-pod-identity-csi-driver
 
 # Run the agent locally
 .PHONY: dev
@@ -71,6 +76,15 @@ clean:
 .PHONY: test
 test: generate-mocks
 	go test -race -cover -covermode=atomic ./...
+
+# test-pidreuse reproduces PID reuse against a pinned connection. Steering PIDs
+# needs CAP_SYS_ADMIN over a fresh PID namespace: root unshares one directly,
+# others get it through a user namespace.
+PIDREUSE_UNSHARE = $(if $(filter 0,$(shell id -u)),-pf,-Urpf)
+.PHONY: test-pidreuse
+test-pidreuse:
+	go test -c -o $(OUTPUT)/grpcserver.test ./pkg/grpcserver/
+	PIDREUSE_REQUIRED=1 unshare $(PIDREUSE_UNSHARE) --mount-proc $(OUTPUT)/grpcserver.test -test.run 'TestPeer_PIDReuse' -test.count=1 -test.v
 
 # test-verbose also prints output for tests that didn't fail
 # and sets the verbosity to 5

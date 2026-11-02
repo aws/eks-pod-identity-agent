@@ -7,15 +7,17 @@ import (
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
+	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 )
 
 const (
 	validKeyIDRegex = `^[0-9a-f]{40}$`
 	// expectedAudience is the audience injected by the EKS Pod Identity webhook into
-	// projected service account tokens.
+	// projected service account tokens. It is the same audience EKS Auth accepts,
+	// so it is aliased from configuration rather than copied.
 	// See: https://github.com/aws/amazon-eks-pod-identity-webhook/blob/272b85d83305dfa6b519685dc104fe045d86f6c0/main.go#L84
-	expectedAudience = "pods.eks.amazonaws.com"
+	expectedAudience = configuration.EksAuthAudience
 )
 
 var (

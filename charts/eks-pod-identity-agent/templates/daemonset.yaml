@@ -1,4 +1,9 @@
 {{- $top := . -}}
+{{- /*
+Whether this install gets workload identity; see the helper and "Workload identity" in
+the chart README.
+*/ -}}
+{{- $enableWorkloadIdentity := eq (include "eks-pod-identity-agent.enableWorkloadIdentity" $top) "true" -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -36,6 +41,10 @@ spec:
       serviceAccountName: {{ . }}
       {{- end }}
       hostNetwork: true
+      {{- if $enableWorkloadIdentity }}
+      {{- /* Attestation needs the peer's PID: without it SO_PEERCRED reports 0. */}}
+      hostPID: true
+      {{- end }}
       terminationGracePeriodSeconds: 30
       {{- with $top.Values.tolerations }}
       tolerations:
@@ -85,6 +94,10 @@ spec:
             - "--metrics-port"
             - {{ $top.Values.metrics.port | quote }}
             {{- end }}
+            {{- if $enableWorkloadIdentity }}
+            {{- /* One token: pflag reads a bare bool flag as true and ignores a separate value. */}}
+            - "--enable-workload-identity=true"
+            {{- end }}
             {{- range $key, $value := $top.Values.agent.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}
@@ -116,13 +129,18 @@ spec:
           - name: AWS_CA_BUNDLE
             value: /etc/pki/tls/certs/ca-bundle.crt
           {{- end }}
-          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumeMounts }}
+          {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $enableWorkloadIdentity $daemonset.volumeMounts }}
           volumeMounts:
           {{- end }}
           {{- if contains "-iso" $top.Values.env.AWS_REGION }}
           - name: ca-bundle
             mountPath: /etc/pki/tls/certs/ca-bundle.crt
             readOnly: true
+          {{- end }}
+          {{- if $enableWorkloadIdentity }}
+          {{- /* The agent binds its socket here; the CSI driver sidecar publishes it. */}}
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
           {{- end }}
           {{- if $daemonset.volumeMounts }}
           {{- toYaml $daemonset.volumeMounts | nindent 10}}
@@ -158,7 +176,47 @@ spec:
             initialDelaySeconds: 1
             timeoutSeconds: 10
           {{- end }}
-      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $daemonset.volumes }}
+        {{- if $enableWorkloadIdentity }}
+        {{- /*
+        The workload identity CSI node plugin, a separate binary in the agent's image. It is
+        privileged, because Kubernetes allows Bidirectional propagation only there, so the
+        agent above does not have to be. Each kubelet mountPath must equal its host path.
+        See "Workload identity" in the chart README.
+        */}}
+        - name: {{ $top.Chart.Name }}-csi-driver
+          image: {{ include "eks-pod-identity-agent.image" $ }}
+          imagePullPolicy: {{ $top.Values.image.pullPolicy }}
+          {{- /* Not a values knob: this container is privileged. */}}
+          command: ['/go-runner', '/eks-pod-identity-csi-driver']
+          args:
+            - "-v"
+            - "info"
+          env:
+          {{- /* The CSI node ID, from the downward API. */}}
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          volumeMounts:
+          - name: workload-identity-socket-dir
+            mountPath: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            readOnly: true
+          - name: csi-plugin-dir
+            mountPath: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+          - name: csi-plugin-registration-dir
+            mountPath: /var/lib/kubelet/plugins_registry
+          {{- /* Bidirectional, so the kubelet sees the bind mounts made in this container. */}}
+          - name: kubelet-pods-dir
+            mountPath: /var/lib/kubelet/pods
+            mountPropagation: Bidirectional
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          resources:
+            {{- /* Nil-safe: helm upgrade --reuse-values keeps an older chart's values, which have no csiDriver. */}}
+            {{- toYaml (default (dict) (default (dict) $top.Values.csiDriver).resources) | nindent 12 }}
+        {{- end }}
+      {{- if or (contains "-iso" $top.Values.env.AWS_REGION) $enableWorkloadIdentity $daemonset.volumes }}
       volumes:
       {{- end }}
         {{- if contains "-iso" $top.Values.env.AWS_REGION }}
@@ -166,6 +224,31 @@ spec:
           hostPath:
             path: /etc/pki/tls/certs/ca-bundle.crt
             type: File
+        {{- end }}
+        {{- if $enableWorkloadIdentity }}
+        {{- /*
+        Workload identity CSI volumes. The hostPath types are deliberate; see the chart
+        README.
+        */}}
+        - name: workload-identity-socket-dir
+          hostPath:
+            path: /var/run/secrets/pods.eks.amazonaws.com/workloadidentity
+            type: DirectoryOrCreate
+        {{- /* Holds the CSI plugin socket. */}}
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/spiffe.csi.eks.amazonaws.com
+            type: DirectoryOrCreate
+        {{- /* Watched by the kubelet for plugin registration. */}}
+        - name: csi-plugin-registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        {{- /* Where every publish target lives. Strict Directory, unlike the two above. */}}
+        - name: kubelet-pods-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         {{- end }}
         {{- if $daemonset.volumes }}
         {{- toYaml $daemonset.volumes | nindent 8}}

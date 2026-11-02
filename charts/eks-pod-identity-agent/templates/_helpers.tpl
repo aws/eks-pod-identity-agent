@@ -94,3 +94,14 @@ Resolve the ServiceAccount name to set on the pod.
   {{- .Values.serviceAccount.name }}
 {{- end -}}
 {{- end }}
+
+{{/*
+"true" when the install gets workload identity: the agent's flag, the host PID namespace,
+the CSIDriver object, the CSI driver sidecar and the agent's socket directory mount. Only
+when workloadIdentity.enabled is set, and never in an isolated region.
+*/}}
+{{- define "eks-pod-identity-agent.enableWorkloadIdentity" -}}
+{{- /* A nulled block means off. toString, so a --set-string "false" isn't a truthy string. */ -}}
+{{- $workloadIdentity := default (dict) .Values.workloadIdentity -}}
+{{- and (eq (toString $workloadIdentity.enabled) "true") (not (contains "-iso" .Values.env.AWS_REGION)) -}}
+{{- end }}
