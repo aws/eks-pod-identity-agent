@@ -40,6 +40,9 @@ func newTestService(handler func(*http.Request) (*http.Response, error)) *servic
 	imdsClient := imds.New(imds.Options{
 		HTTPClient:        mock,
 		ClientEnableState: imds.ClientEnabled,
+		// No retries in tests: mocked 5xx/transport failures would otherwise burn
+		// seconds of SDK backoff without changing the behavior under test.
+		Retryer: aws.NopRetryer{},
 	})
 	s := &service{
 		imdsClient: imdsClient,
@@ -79,6 +82,16 @@ func infoJSONWithCodes(pods map[string]string) string {
 	return string(b)
 }
 
+// infoJSONAt builds a success-coded namespace info JSON with a specific LastUpdated.
+func infoJSONAt(lastUpdated string, podUIDs ...string) string {
+	pods := make(map[string]string)
+	for _, uid := range podUIDs {
+		pods[uid] = credentials.PodCredentialSuccessCode
+	}
+	b, _ := json.Marshal(credentials.NamespaceInfo{Code: "Success", LastUpdated: lastUpdated, PodCredentials: pods})
+	return string(b)
+}
+
 func testCtx() context.Context {
 	return logger.ContextWithField(context.Background(), "test", "true")
 }
@@ -92,23 +105,6 @@ func fakeRequest(t *testing.T, podUID string) *credentials.EksCredentialsRequest
 		Nbf:    time.Now(),
 	})
 	return &credentials.EksCredentialsRequest{ServiceAccountToken: token, ClusterName: "test-cluster"}
-}
-
-// namespaceHandler returns a mock handler that lists iam-eks-1..n at the
-// metadata root and responds 200 for info/credential paths within those namespaces.
-func namespaceHandler(n int) func(*http.Request) (*http.Response, error) {
-	return func(req *http.Request) (*http.Response, error) {
-		path := req.URL.Path
-		// Root listing: return all iam-eks-* entries
-		if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-			var entries []string
-			for i := 1; i <= n; i++ {
-				entries = append(entries, fmt.Sprintf("iam-eks-%d", i))
-			}
-			return httpResponse(200, strings.Join(entries, "\n")), nil
-		}
-		return httpResponse(404, ""), nil
-	}
 }
 
 // --- readCredential tests ---
@@ -194,43 +190,6 @@ func TestReadCredential(t *testing.T) {
 			}
 		})
 	}
-}
-
-// --- discoverNamespaces tests ---
-
-func TestDiscoverNamespaces(t *testing.T) {
-	tests := []struct {
-		name      string
-		count     int
-		wantCount int
-	}{
-		{"ten namespaces", 10, 10},
-		{"five namespaces", 5, 5},
-		{"no namespaces", 0, 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Mock returns a root listing with iam-eks-1..count entries.
-			svc := newTestService(namespaceHandler(tt.count))
-			ns, err := svc.discoverNamespaces(context.Background())
-			require.NoError(t, err)
-			assert.Len(t, ns, tt.wantCount)
-		})
-	}
-
-	t.Run("non-sequential namespaces", func(t *testing.T) {
-		// Root listing includes non-EKS entries (iam, placement) that should be filtered out.
-		svc := newTestService(func(req *http.Request) (*http.Response, error) {
-			path := req.URL.Path
-			if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-				return httpResponse(200, "iam-eks-1\niam-eks-3\niam-eks-7\niam\nplacement"), nil
-			}
-			return httpResponse(404, ""), nil
-		})
-		ns, err := svc.discoverNamespaces(context.Background())
-		require.NoError(t, err)
-		assert.Equal(t, []string{"1", "3", "7"}, ns)
-	})
 }
 
 // --- readNamespaceInfo tests ---
@@ -342,16 +301,14 @@ func TestGetMetadata_SizeCap(t *testing.T) {
 func TestNamespaceMapping_Build(t *testing.T) {
 	tests := []struct {
 		name        string
-		rootListing string                                    // newline-delimited IMDS root listing response
-		infoByNS    map[string]func() (*http.Response, error) // namespace suffix → HTTP response for its /info file
+		infoByNS    map[string]func() (*http.Response, error) // namespace suffix → HTTP response for its /info file; absent namespaces 404 (gap)
 		prevMapping map[string]string                         // podUID → namespace map seeded before the build (for salvage cases)
 		wantPods    int                                       // expected total entries in podUID → namespace map
 		wantLookups map[string]string                         // podUID → namespace pairs that must exist
 		wantMissing []string                                  // podUIDs that must NOT be in the map
 	}{
 		{
-			name:        "multiple namespaces",
-			rootListing: "iam-eks-1\niam-eks-2",
+			name: "multiple namespaces",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a", "pod-b")), nil },
 				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-c")), nil },
@@ -361,10 +318,10 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			wantMissing: []string{"pod-missing"},
 		},
 		{
-			// No previous map, so there is nothing to salvage: a failed namespace
-			// simply contributes no pods this cycle.
-			name:        "partial failure with no previous map drops failed namespace",
-			rootListing: "iam-eks-1\niam-eks-2",
+			// A non-404 error on the last namespace does not end the set: probing
+			// continues to iam-eks-3 (404) and stops there. With no previous map
+			// there is nothing to salvage, so the failed namespace adds no pods.
+			name: "partial failure with no previous map drops failed namespace",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
 				"2": func() (*http.Response, error) { return httpResponse(500, "internal error"), nil },
@@ -373,10 +330,10 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			wantLookups: map[string]string{"pod-a": "1"},
 		},
 		{
-			// pod-c lives in ns2, ns2 read fails. ns2's pods are salvaged from
-			// the previous map so a transient failure does not look like removal.
-			name:        "partial failure salvages pods from failed namespace",
-			rootListing: "iam-eks-1\niam-eks-2",
+			// pod-c lives in ns2, ns2 read fails with a non-404 error. ns2's pods
+			// are salvaged from the previous map so a transient failure does not
+			// look like removal.
+			name: "partial failure salvages pods from failed namespace",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a", "pod-b")), nil },
 				"2": func() (*http.Response, error) { return httpResponse(500, "internal error"), nil },
@@ -389,8 +346,7 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			// pod-a reshuffled ns2→ns1; ns2 (its OLD home) fails. ns1 reads OK
 			// and reports pod-a, so the current-cycle namespace (1) wins over the
 			// salvaged previous namespace (2).
-			name:        "reshuffle beats salvage when new namespace reads successfully",
-			rootListing: "iam-eks-1\niam-eks-2",
+			name: "reshuffle beats salvage when new namespace reads successfully",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
 				"2": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
@@ -400,13 +356,12 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			wantLookups: map[string]string{"pod-a": "1"},
 		},
 		{
-			// pod-a reshuffled ns2→ns1; ns1 (its NEW home) fails. ns2 reads OK
-			// and no longer lists pod-a. The agent cannot tell relocation from
-			// removal while ns1 is dark, so on a partial scan we retain pod-a with
-			// its stale previous namespace (2) rather than evict a possibly-live
-			// pod. The stale home self-heals on the next clean scan.
-			name:        "partial failure retains pod with stale namespace (reshuffle into failed ns)",
-			rootListing: "iam-eks-1\niam-eks-2",
+			// pod-a reshuffled ns2→ns1; ns1 (its NEW home) fails with a non-404
+			// error. ns2 reads OK and no longer lists pod-a. The agent cannot tell
+			// relocation from removal while ns1 is dark, so on a partial scan we
+			// retain pod-a with its stale previous namespace (2) rather than evict
+			// a possibly-live pod. The stale home self-heals on the next clean scan.
+			name: "partial failure retains pod with stale namespace (reshuffle into failed ns)",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
 				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON()), nil },
@@ -418,8 +373,7 @@ func TestNamespaceMapping_Build(t *testing.T) {
 		{
 			// Complete scan (no namespace failed): a pod absent from the previous
 			// map is a confirmed removal and is NOT salvaged, so it is evicted.
-			name:        "complete scan evicts removed pod",
-			rootListing: "iam-eks-1\niam-eks-2",
+			name: "complete scan evicts removed pod",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
 				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON()), nil },
@@ -430,36 +384,41 @@ func TestNamespaceMapping_Build(t *testing.T) {
 			wantMissing: []string{"pod-gone"},
 		},
 		{
-			name:        "non-sequential namespaces",
-			rootListing: "iam-eks-1\niam-eks-3\niam-eks-7",
+			// A non-404 failure in the middle of a contiguous run does not stop
+			// probing: iam-eks-2 errors (500) but iam-eks-3 is still read, and only
+			// iam-eks-4 (404) ends the set.
+			name: "mid-run failure does not truncate later namespaces",
+			infoByNS: map[string]func() (*http.Response, error){
+				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-x", "pod-y")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
+				"3": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-z")), nil },
+			},
+			wantPods:    3,
+			wantLookups: map[string]string{"pod-x": "1", "pod-y": "1", "pod-z": "3"},
+		},
+		{
+			// iam-eks-1 404s immediately: no namespaces exist.
+			name:     "no namespaces",
+			infoByNS: map[string]func() (*http.Response, error){},
+			wantPods: 0,
+		},
+		{
+			// The 404 gap at iam-eks-3 ends the scan, so iam-eks-4 — though it
+			// exists — is never read. This is the contiguity contract: IMDS lays
+			// namespaces down from iam-eks-1 with no holes.
+			name: "gap halts probe before a later existing namespace",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-a")), nil },
-				"3": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-b")), nil },
-				"7": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-c")), nil },
+				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-b")), nil },
+				// "3" is absent → 404 gap.
+				"4": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-unreachable")), nil },
 			},
-			wantPods:    3,
-			wantLookups: map[string]string{"pod-a": "1", "pod-b": "3", "pod-c": "7"},
+			wantPods:    2,
+			wantLookups: map[string]string{"pod-a": "1", "pod-b": "2"},
+			wantMissing: []string{"pod-unreachable"},
 		},
 		{
-			name:        "non-sequential with gap and failure",
-			rootListing: "iam-eks-2\niam-eks-5\niam-eks-9",
-			infoByNS: map[string]func() (*http.Response, error){
-				"2": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-x", "pod-y")), nil },
-				"5": func() (*http.Response, error) { return httpResponse(500, "error"), nil },
-				"9": func() (*http.Response, error) { return httpResponse(200, infoJSON("pod-z")), nil },
-			},
-			wantPods:    3,
-			wantLookups: map[string]string{"pod-x": "2", "pod-y": "2", "pod-z": "9"},
-		},
-		{
-			name:        "no namespaces",
-			rootListing: "iam\nplacement",
-			infoByNS:    map[string]func() (*http.Response, error){},
-			wantPods:    0,
-		},
-		{
-			name:        "filters out non-success pods",
-			rootListing: "iam-eks-1",
+			name: "filters out non-success pods",
 			infoByNS: map[string]func() (*http.Response, error){
 				"1": func() (*http.Response, error) {
 					return httpResponse(200, infoJSONWithCodes(map[string]string{
@@ -476,12 +435,10 @@ func TestNamespaceMapping_Build(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Mock routes: root listing, per-namespace info files, 404 for everything else.
+			// Mock routes: per-namespace info files; any namespace not in infoByNS
+			// returns 404, forming the gap that ends sequential probing.
 			svc := newTestService(func(req *http.Request) (*http.Response, error) {
 				path := req.URL.Path
-				if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-					return httpResponse(200, tt.rootListing), nil
-				}
 				for ns, fn := range tt.infoByNS {
 					if strings.HasSuffix(path, "iam-eks-"+ns+"/info") {
 						return fn()
@@ -496,7 +453,7 @@ func TestNamespaceMapping_Build(t *testing.T) {
 				svc.storeMapping(tt.prevMapping)
 			}
 
-			// Build the mapping: discover namespaces → read info files → populate podUID map.
+			// Build the mapping: probe namespaces sequentially → read info files → populate podUID map.
 			require.NoError(t, svc.buildNamespaceMapping(testCtx()))
 			assert.Len(t, svc.loadMapping(), tt.wantPods)
 
@@ -515,15 +472,79 @@ func TestNamespaceMapping_Build(t *testing.T) {
 		})
 	}
 }
+// TestNamespaceMapping_MultiNamespacePod verifies that when a pod appears in
+// more than one namespace, the mapping picks the namespace whose info file has
+// the most recent LastUpdated.
+func TestNamespaceMapping_MultiNamespacePod(t *testing.T) {
+	tests := []struct {
+		name     string
+		infoByNS map[string]string // namespace suffix → info JSON (with per-ns LastUpdated)
+		podUID   string
+		wantNS   string
+	}{
+		{
+			name: "later namespace is newer",
+			infoByNS: map[string]string{
+				"1": infoJSONAt("2025-03-11T18:00:00Z", "pod-a"),
+				"2": infoJSONAt("2025-03-11T19:00:00Z", "pod-a"),
+			},
+			podUID: "pod-a",
+			wantNS: "2",
+		},
+		{
+			name: "earlier namespace is newer",
+			infoByNS: map[string]string{
+				"1": infoJSONAt("2025-03-11T19:00:00Z", "pod-a"),
+				"2": infoJSONAt("2025-03-11T18:00:00Z", "pod-a"),
+			},
+			podUID: "pod-a",
+			wantNS: "1",
+		},
+		{
+			// Equal timestamps: the first namespace read wins (no strict-newer replacement).
+			name: "equal timestamps keep first-read namespace",
+			infoByNS: map[string]string{
+				"1": infoJSONAt("2025-03-11T18:00:00Z", "pod-a"),
+				"2": infoJSONAt("2025-03-11T18:00:00Z", "pod-a"),
+			},
+			podUID: "pod-a",
+			wantNS: "1",
+		},
+		{
+			// An unparseable timestamp is treated as the zero time, so the
+			// namespace with a valid timestamp wins regardless of read order.
+			name: "parseable namespace beats unparseable one",
+			infoByNS: map[string]string{
+				"1": infoJSONAt("2025-03-11T18:00:00Z", "pod-a"),
+				"2": infoJSONAt("not-a-timestamp", "pod-a"),
+			},
+			podUID: "pod-a",
+			wantNS: "1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTestService(func(req *http.Request) (*http.Response, error) {
+				path := req.URL.Path
+				for ns, body := range tt.infoByNS {
+					if strings.HasSuffix(path, "iam-eks-"+ns+"/info") {
+						return httpResponse(200, body), nil
+					}
+				}
+				return httpResponse(404, ""), nil
+			})
+
+			require.NoError(t, svc.buildNamespaceMapping(testCtx()))
+			assert.Equal(t, tt.wantNS, svc.loadMapping()[tt.podUID])
+		})
+	}
+}
 
 func TestNamespaceMapping_BackgroundRefresh_UpdatesMap(t *testing.T) {
 	callCount := 0
 	// First info call returns one pod; subsequent calls return two (simulating new pod credential delivery).
 	svc := newTestService(func(req *http.Request) (*http.Response, error) {
 		path := req.URL.Path
-		if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-			return httpResponse(200, "iam-eks-1"), nil
-		}
 		if strings.HasSuffix(path, "iam-eks-1/info") {
 			callCount++
 			if callCount <= 1 {
@@ -670,9 +691,6 @@ func TestNewService_BuildsMappingOnConstruction(t *testing.T) {
 	svc := NewService(ctx, aws.Config{}, func(o *imds.Options) {
 		o.HTTPClient = &mockHTTPClient{handler: func(req *http.Request) (*http.Response, error) {
 			path := req.URL.Path
-			if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-				return httpResponse(200, "iam-eks-1"), nil
-			}
 			if strings.HasSuffix(path, "iam-eks-1/info") {
 				return httpResponse(200, infoJSON("pod-a")), nil
 			}
@@ -694,9 +712,6 @@ func TestNewService_EndToEnd_GetIamCredentials(t *testing.T) {
 	svc := NewService(ctx, aws.Config{}, func(o *imds.Options) {
 		o.HTTPClient = &mockHTTPClient{handler: func(req *http.Request) (*http.Response, error) {
 			path := req.URL.Path
-			if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-				return httpResponse(200, "iam-eks-1"), nil
-			}
 			if strings.HasSuffix(path, "iam-eks-1/info") {
 				return httpResponse(200, infoJSON("pod-a")), nil
 			}
@@ -791,6 +806,7 @@ func TestProbeIMDS_HTTPStatus_ReturnsExpectedAvailability(t *testing.T) {
 					return httpResponse(tt.status, tt.body), nil
 				}}
 				o.ClientEnableState = imds.ClientEnabled
+				o.Retryer = aws.NopRetryer{}
 			})
 			assert.Equal(t, tt.wantResult, result)
 		})
@@ -805,6 +821,7 @@ func TestProbeIMDS_TransportError_ReturnsFalse(t *testing.T) {
 			return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("connection refused")}
 		}}
 		o.ClientEnableState = imds.ClientEnabled
+		o.Retryer = aws.NopRetryer{}
 	})
 	assert.False(t, result)
 }
@@ -842,12 +859,8 @@ func TestGetIamCredentials_ForegroundTimeout(t *testing.T) {
 // TestBuildNamespaceMapping_RefreshBudget verifies that a build whose namespace
 // read hangs is bounded by refreshOpTimeout rather than blocking indefinitely.
 func TestBuildNamespaceMapping_RefreshBudget(t *testing.T) {
-	// Root listing returns quickly; the per-namespace info read blocks on context.
+	// Every namespace info read blocks until the refresh context deadline fires.
 	svc := newTestService(func(req *http.Request) (*http.Response, error) {
-		path := req.URL.Path
-		if strings.HasSuffix(path, "/latest/meta-data/") || strings.HasSuffix(path, "/latest/meta-data") {
-			return httpResponse(200, "iam-eks-1"), nil
-		}
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})
