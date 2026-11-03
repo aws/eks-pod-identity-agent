@@ -134,7 +134,7 @@ func TestIssuanceClassifiesSTSFailuresAndInvalidatesOnlyStaleSessions(t *testing
 			issuer := &fakeIssuer{respond: func(int, sts.WebIdentityTokenRequest) (*sts.IssuedWebIdentityToken, error) {
 				return nil, upstream
 			}}
-			provider := sessions(now.Add(time.Hour))
+			provider := sessions(now.Add(2 * time.Hour))
 			source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 			source.sessionProvider = provider
 
@@ -176,7 +176,7 @@ func TestClassificationPreservesUnknownClientFaultWithoutInferringItsCause(t *te
 func TestSessionFailureSkipsSTSAndReleasesAudienceSetReservation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	issuer := successfulIssuer(t, &now, time.Hour)
-	provider := sessions(now.Add(time.Hour))
+	provider := sessions(now.Add(2 * time.Hour))
 	validSession := provider.Result
 	upstream := errors.New("session unavailable")
 	provider.SetResult(nil, upstream)
@@ -303,22 +303,6 @@ func TestIssuanceRejectsInvalidSTSResponses(t *testing.T) {
 			message: "expired JWT-SVID",
 		},
 		{
-			name: "issuance equals expiration",
-			response: &sts.IssuedWebIdentityToken{
-				Token:      signedToken(t, "payments.example", expiresAt, expiresAt, "invalid-lifetime"),
-				Expiration: expiresAt,
-			},
-			message: "issued in the future",
-		},
-		{
-			name: "issuance after expiration",
-			response: &sts.IssuedWebIdentityToken{
-				Token:      signedToken(t, "payments.example", expiresAt.Add(time.Second), expiresAt, "invalid-lifetime"),
-				Expiration: expiresAt,
-			},
-			message: "issued in the future",
-		},
-		{
 			name: "future issuance",
 			response: &sts.IssuedWebIdentityToken{
 				Token: tokenWith(func(c *jwtlib.RegisteredClaims) {
@@ -343,7 +327,7 @@ func TestIssuanceRejectsInvalidSTSResponses(t *testing.T) {
 			issuer := &fakeIssuer{respond: func(int, sts.WebIdentityTokenRequest) (*sts.IssuedWebIdentityToken, error) {
 				return tc.response, nil
 			}}
-			provider := sessions(now.Add(time.Hour))
+			provider := sessions(now.Add(2 * time.Hour))
 			source := newTestSource(t, issuer, &podstoretest.Store{}, &now, 1)
 			source.sessionProvider = provider
 

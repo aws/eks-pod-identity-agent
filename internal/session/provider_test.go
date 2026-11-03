@@ -1743,8 +1743,13 @@ func TestSessionProvider_AFailedRefreshIsRetriedAfterTheRetryIntervalPlusJitter(
 	g.Expect(err).NotTo(HaveOccurred())
 	picked, _ := h.cache.Get(testSessionPodUID)
 
-	g.Eventually(h.server.Calls).WithTimeout(failures*(retryInterval+maxJitter+slack)).
+	g.Eventually(func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(exchanged)
+	}).WithTimeout(failures*(retryInterval+maxJitter+slack)).
 		WithPolling(5*time.Millisecond).Should(Equal(2+failures), "waiting for the retry after the last failure")
+	g.Expect(h.server.Calls()).To(Equal(2 + failures))
 	kept, ok := h.cache.Get(testSessionPodUID)
 	g.Expect(ok).To(BeTrue(), "a kept session must stay cached past its retry")
 	g.Expect(kept.Credentials).To(BeIdenticalTo(picked.Credentials))
