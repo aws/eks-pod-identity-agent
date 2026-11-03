@@ -110,7 +110,7 @@ func wiCallEveryTier(ctx context.Context, tiers *workloadIdentityTiers, clients 
 }
 
 // wiEnrolledExchange stands in for EKS Auth for an enrolled pod: it answers every
-// exchange with an hour-long session decorated with wiProviderArn, counting them.
+// exchange with a two-hour session decorated with wiProviderArn, counting them.
 type wiEnrolledExchange struct {
 	exchanges atomic.Int32
 }
@@ -122,7 +122,7 @@ func (e *wiEnrolledExchange) GetIamCredentials(context.Context, *credentials.Eks
 			AccessKeyId:     "ASIAWORKLOAD",
 			SecretAccessKey: "secret",
 			Token:           "session",
-			Expiration:      credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+			Expiration:      credentials.SdkCompliantExpirationTime{Time: time.Now().Add(2 * time.Hour)},
 		}, credentials.CredentialMetadata{
 			Association: "a-1", CredSource: credentials.SourceAuthService, Provider: wiProviderArn,
 		}, nil

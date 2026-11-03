@@ -146,7 +146,7 @@ func TestPodDeletedDuringSessionLookupSkipsSTS(t *testing.T) {
 	pods := &podstoretest.Store{}
 	issuer := successfulIssuer(t, &now, time.Hour)
 	source := newTestSource(t, issuer, pods, &now, 10)
-	provider := sessions(now.Add(time.Hour))
+	provider := sessions(now.Add(2 * time.Hour))
 	provider.Block()
 	t.Cleanup(provider.Release)
 	source.sessionProvider = provider
