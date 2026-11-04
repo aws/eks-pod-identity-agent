@@ -574,10 +574,10 @@ func (h *sessionFixture) waitForJoined(t *testing.T, podUID string, n int) {
 		Should(Equal(n), "waiting for %d callers in all to wait on an exchange for pod %s", n, podUID)
 }
 
-func (h *sessionFixture) session(podUID string) (*workloadidentity.WorkloadSession, error) {
+func (h *sessionFixture) session(podUID string, opts ...workloadidentity.SessionOption) (*workloadidentity.WorkloadSession, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), sessionTestTimeout)
 	defer cancel()
-	return h.provider.Session(ctx, sessionTestWorkload(podUID))
+	return h.provider.Session(ctx, sessionTestWorkload(podUID), opts...)
 }
 
 func (h *sessionFixture) cacheCount(result string) float64 {
@@ -622,10 +622,11 @@ type sessionResult struct {
 	err     error
 }
 
-func (h *sessionFixture) sessionAsync(ctx context.Context, podUID string) <-chan sessionResult {
+func (h *sessionFixture) sessionAsync(ctx context.Context, podUID string,
+	opts ...workloadidentity.SessionOption) <-chan sessionResult {
 	results := make(chan sessionResult, 1)
 	go func() {
-		session, err := h.provider.Session(ctx, sessionTestWorkload(podUID))
+		session, err := h.provider.Session(ctx, sessionTestWorkload(podUID), opts...)
 		results <- sessionResult{session: session, err: err}
 	}()
 	return results

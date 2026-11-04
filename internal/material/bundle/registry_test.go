@@ -94,7 +94,8 @@ func newTestSessions() *testSessions {
 	}
 }
 
-func (s *testSessions) Session(_ context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error) {
+func (s *testSessions) Session(_ context.Context, w *workloadidentity.Workload,
+	_ ...workloadidentity.SessionOption) (*workloadidentity.WorkloadSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
