@@ -310,7 +310,7 @@ func TestSessionProvider_ACallerThatMissedTheCacheJustBeforeAnExchangeFinishedFi
 
 	ctx := t.Context()
 	entry, err := h.provider.await(ctx, testSessionPodUID,
-		h.provider.joinForRequest(ctx, sessionTestWorkload(testSessionPodUID)))
+		h.provider.joinForRequest(ctx, sessionTestWorkload(testSessionPodUID), 0))
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(entry.Credentials.AccessKeyId).To(Equal(exchangeKey(1)))

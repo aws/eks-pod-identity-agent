@@ -58,24 +58,16 @@ func (s *Source) issue(
 	w *workloadidentity.Workload,
 	audiences []string,
 ) (*jwtsvid.SVID, time.Time, error) {
-	session, err := s.sessionProvider.Session(ctx, w)
+	// STS rejects a JWT that outlives the session asking for it, so ask for one
+	// with the token's lifetime left, plus the issuance budget for latency.
+	session, err := s.sessionProvider.Session(ctx, w, workloadidentity.MinRemaining(s.duration+s.renewalTimeout))
 	if err != nil {
 		return nil, time.Time{}, err
-	}
-	startedAt := s.now()
-	// STS rejects JWT lifetimes that exceed the session's remaining lifetime.
-	// Refresh even if the cached credentials have not expired yet.
-	if s.availableLifetime(session, startedAt) < s.duration {
-		s.sessionProvider.Invalidate(w.PodUID)
-		session, err = s.sessionProvider.Session(ctx, w)
-		if err != nil {
-			return nil, time.Time{}, err
-		}
 	}
 	if err := s.checkPod(w.PodUID); err != nil {
 		return nil, time.Time{}, err
 	}
-
+	startedAt := s.now()
 	issued, err := s.issuer.GetWebIdentityToken(ctx, session.Credentials, sts.WebIdentityTokenRequest{
 		Audiences: slices.Clone(audiences),
 		Duration:  s.duration,
@@ -100,11 +92,6 @@ func (s *Source) issue(
 			"STS returned an expired JWT-SVID for %s/%s and audiences %q", w.Namespace, w.PodName, audiences)
 	}
 	return svid, tokenIssuedAt, nil
-}
-
-func (s *Source) availableLifetime(session *workloadidentity.WorkloadSession, now time.Time) time.Duration {
-	// Leave the issuance budget for latency before STS computes the token's expiration.
-	return max(session.ExpiresAt.Sub(now), 0) - s.renewalTimeout
 }
 
 var staleSessionCodes = set.New(

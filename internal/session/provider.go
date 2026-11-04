@@ -98,36 +98,49 @@ func New(opts Opts) (*Provider, error) {
 }
 
 // Session returns a copy of the pod's decorated session: the cached one,
-// whichever caller stored it, while the cache says it's usable, otherwise one
-// from an exchange shared by every caller for the pod. An EKS Auth refusal is
+// whichever caller stored it, while it's usable and has opts' MinRemaining left,
+// otherwise one from an exchange shared by every caller for the pod. A failed
+// exchange leaves the cached session in place. An EKS Auth refusal is
 // ErrSessionRefused; wierrors.IsRetryable decides for every error it returns.
-func (p *Provider) Session(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error) {
+func (p *Provider) Session(ctx context.Context, w *workloadidentity.Workload,
+	opts ...workloadidentity.SessionOption) (*workloadidentity.WorkloadSession, error) {
 	if w == nil || w.PodUID == "" {
 		return nil, wierrors.ErrSessionUnavailable.Wrapf(nil, "cannot exchange a session for an empty workload")
 	}
 	log := logger.FromContext(ctx)
+	minRemaining := workloadidentity.NewSessionOptions(opts...).MinRemaining
 
-	entry, ok := p.cache.Get(w.PodUID)
+	held, ok := p.cache.Get(w.PodUID)
 	switch {
-	case !ok || !decorated(entry):
+	case !ok || !decorated(held):
 		log.WithField("cache-hit", 0).Tracef("Could not find a session in cache, exchanging a token with EKS Auth")
 		p.metrics.observeCache(workloadidentity.CacheResultMiss)
-	case p.usable(entry):
+	case p.lasts(held, minRemaining):
 		log.WithField("cache-hit", 1).Tracef("Using cached session")
 		p.metrics.observeCache(workloadidentity.CacheResultHit)
-		return toWorkloadSession(entry), nil
+		return toWorkloadSession(held), nil
+	case p.usable(held):
+		log.Infof("The cached session has less than the %s the caller needs left, will exchange a new one", minRemaining)
+		p.metrics.observeCache(workloadidentity.CacheResultExpired)
 	default:
 		log.Info("Identified that the cached session expires within the floor, will exchange a new one")
 		p.metrics.observeCache(workloadidentity.CacheResultExpired)
 	}
 
-	entry, err := p.fetch(ctx, w)
-	if err == nil && !p.cached(w.PodUID, entry) {
+	entry, err := p.fetch(ctx, w, minRemaining)
+	switch {
+	case err != nil:
+	case !p.cached(w.PodUID, entry):
 		// The answer left the cache before it was handed out, possibly because
 		// this caller invalidated it, so a second join reaches a later exchange.
 		// Asking once more costs at most one exchange.
 		log.Info("Session left the cache before it could be handed out, asking again")
-		entry, err = p.fetch(ctx, w)
+		entry, err = p.fetch(ctx, w, minRemaining)
+	case ok && entry.Credentials == held.Credentials && !p.lasts(entry, minRemaining):
+		// The exchange this caller joined was started by a caller needing less,
+		// and it kept the session this caller turned down.
+		log.Infof("Joined an exchange that kept the session with less than %s left, asking again", minRemaining)
+		entry, err = p.fetch(ctx, w, minRemaining)
 	}
 	if err != nil {
 		return nil, err
@@ -182,24 +195,26 @@ func (p *Provider) cached(podUID string, e *credcache.Entry) bool {
 
 // fetch joins the pod's exchange in flight, or starts one, and waits for the
 // entry it answers with. A caller already gone starts no exchange.
-func (p *Provider) fetch(ctx context.Context, w *workloadidentity.Workload) (*credcache.Entry, error) {
+func (p *Provider) fetch(ctx context.Context, w *workloadidentity.Workload, minRemaining time.Duration) (*credcache.Entry, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, wierrors.ErrSessionUnavailable.Wrapf(err, "gave up before exchanging a session for pod %s", w.PodUID)
 	}
-	return p.await(ctx, w.PodUID, p.joinForRequest(ctx, w))
+	return p.await(ctx, w.PodUID, p.joinForRequest(ctx, w, minRemaining))
 }
 
-// joinForRequest joins the pod's exchange in flight, or starts one that rechecks
-// the cache first, for a caller that missed it just before another exchange
-// stored. The exchange keeps ctx's values but not its cancellation, so a caller
-// giving up never fails the others, and an abandoned exchange still stores.
-func (p *Provider) joinForRequest(ctx context.Context, w *workloadidentity.Workload) <-chan singleflight.Result {
+// joinForRequest joins the pod's exchange in flight, or starts one that first
+// rechecks the cache for a session with minRemaining left, which another
+// exchange may have stored since this caller missed. The exchange keeps ctx's
+// values but not its cancellation, so a caller giving up never fails the others,
+// and an abandoned exchange still stores.
+func (p *Provider) joinForRequest(ctx context.Context, w *workloadidentity.Workload,
+	minRemaining time.Duration) <-chan singleflight.Result {
 	// The exchange can outlive Session, so it mustn't read a struct the caller
 	// can change.
 	workload := *w
 	detached := context.WithoutCancel(ctx)
 	return p.group.DoChan(workload.PodUID, func() (any, error) {
-		if entry, ok := p.cache.Get(workload.PodUID); ok && p.servable(entry) {
+		if entry, ok := p.cache.Get(workload.PodUID); ok && p.lasts(entry, minRemaining) {
 			return entry, nil
 		}
 		return p.exchangeAndStore(detached, &workload)
@@ -260,9 +275,14 @@ func (p *Provider) usable(e *credcache.Entry) bool {
 	return ok
 }
 
-// servable is the one condition under which this tier hands a cached entry out.
-func (p *Provider) servable(e *credcache.Entry) bool {
-	return decorated(e) && p.usable(e)
+// lasts reports whether this tier can hand e out to a caller needing
+// minRemaining: decorated, usable, and with at least that long left.
+func (p *Provider) lasts(e *credcache.Entry, minRemaining time.Duration) bool {
+	if !decorated(e) {
+		return false
+	}
+	remaining, ok := p.cache.CredentialsWithinValidTtl(e)
+	return ok && remaining >= minRemaining
 }
 
 // exchange runs one exchange for Session callers and records it on the
