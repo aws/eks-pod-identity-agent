@@ -12,7 +12,7 @@ require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
-	github.com/go-jose/go-jose/v4 v4.1.5
+	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/onsi/gomega v1.38.2
 	github.com/prometheus/client_golang v1.25.0
