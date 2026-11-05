@@ -38,6 +38,24 @@ type cachedCredentialRetriever struct {
 	// tokenValidator performs local JWT validation when available
 	tokenValidator atomic.Value // stores tokenValidator interface
 	tvInitInFlight atomic.Bool
+	// localValidationEnabled makes tryServingFromCache check a token that differs
+	// from the cached one with tokenValidator, building one if it's unset. When
+	// false, such a token goes to authoritativeDelegate and no validator is built.
+	localValidationEnabled bool
+
+	// buildValidator builds the validator that tryInitTokenValidator stores. Tests
+	// replace it to count builds.
+	buildValidator func(context.Context) (tokenValidator, error)
+}
+
+// buildTokenValidator is the default buildValidator. It returns an untyped nil
+// on failure, so a failed build is never stored as a non-nil validator.
+func buildTokenValidator(ctx context.Context) (tokenValidator, error) {
+	tv, err := validation.NewTokenValidator(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return tv, nil
 }
 
 // type assertion
@@ -46,7 +64,7 @@ var _ credentials.CredentialRetriever = &cachedCredentialRetriever{}
 var (
 	promLocalValidation = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_identity_local_validation",
-		Help: "Outcome of local token validation: success, failure, or skipped",
+		Help: "Outcome of local token validation: success, failure, skipped, or disabled",
 	}, []string{"result"},
 	)
 )
@@ -66,6 +84,10 @@ type CachedCredentialRetrieverOpts struct {
 	// AuthoritativeDelegate fetches credentials on a miss: EKS Auth.
 	AuthoritativeDelegate credentials.CredentialRetriever
 	TokenValidator        tokenValidator
+	// EnableLocalValidation turns on local validation of a token that differs
+	// from the cached one, using TokenValidator, or a validator the retriever
+	// builds when that's nil. When it's false, the retriever ignores TokenValidator.
+	EnableLocalValidation bool
 }
 
 // NewCachedCredentialRetriever creates a credential retriever that serves and
@@ -84,8 +106,10 @@ func newCachedCredentialRetriever(opts CachedCredentialRetrieverOpts) *cachedCre
 		delegate:                   opts.Delegate,
 		authoritativeDelegate:      opts.AuthoritativeDelegate,
 		internalActiveRequestCache: expiring.NewLru[string, error](opts.Cache.MaxSize(), 0, 0),
+		localValidationEnabled:     opts.EnableLocalValidation,
+		buildValidator:             buildTokenValidator,
 	}
-	if opts.TokenValidator != nil {
+	if opts.TokenValidator != nil && opts.EnableLocalValidation {
 		retriever.tokenValidator.Store(opts.TokenValidator)
 	}
 	return retriever
@@ -172,6 +196,11 @@ func (r *cachedCredentialRetriever) tryServingFromCache(ctx context.Context,
 		return val.Credentials, true
 	}
 
+	if !r.localValidationEnabled {
+		promLocalValidation.WithLabelValues("disabled").Inc()
+		return nil, false
+	}
+
 	// Otherwise, attempt to validate the token locally
 	tv, ok := r.tokenValidator.Load().(tokenValidator)
 	if !ok {
@@ -205,7 +234,7 @@ func (r *cachedCredentialRetriever) tryInitTokenValidator(ctx context.Context) {
 	go func() {
 		defer r.tvInitInFlight.Store(false)
 		log := logger.FromContext(ctx)
-		newTv, err := validation.NewTokenValidator(ctx)
+		newTv, err := r.buildValidator(ctx)
 		if err != nil {
 			log.Infof("Token validator init failed: %v", err)
 			return

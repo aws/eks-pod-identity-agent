@@ -294,6 +294,30 @@ func TestBuildSharedCredentialManager_On_RefreshesWithTheTiersMinter(t *testing.
 	g.Expect(client.tokenRequests()).To(HaveLen(1))
 }
 
+// TestCreateServers_EnableLocalValidationFlag_ReachesTheCredentialManager pins
+// the flag's name and its default of true, and proves that the default and
+// --enable-local-validation=false both reach the shared credential manager.
+func TestCreateServers_EnableLocalValidationFlag_ReachesTheCredentialManager(t *testing.T) {
+	g := NewWithT(t)
+	// A literal, so renaming the constant can't rename the flag unnoticed.
+	g.Expect(handlers.FlagEnableLocalValidation).To(Equal("enable-local-validation"))
+	flag := serverCmd.Flags().Lookup(handlers.FlagEnableLocalValidation)
+	g.Expect(flag).ToNot(BeNil(), "flag --%s is not registered on the server command", handlers.FlagEnableLocalValidation)
+	g.Expect(flag.DefValue).To(Equal("true"))
+	t.Cleanup(func() { _ = serverCmd.Flags().Set(handlers.FlagEnableLocalValidation, flag.DefValue) })
+	built := captureCredentialManagerOpts(t)
+
+	_, err := createServers(t.Context(), aws.Config{})
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(serverCmd.Flags().Set(handlers.FlagEnableLocalValidation, "false")).To(Succeed())
+	_, err = createServers(t.Context(), aws.Config{})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(*built).To(HaveLen(2))
+	g.Expect((*built)[0].EnableLocalValidation).To(BeTrue(), "the default")
+	g.Expect((*built)[1].EnableLocalValidation).To(BeFalse())
+}
+
 // captureCredentialManagerOpts makes newCredentialManager record the options
 // each manager is built with, for the rest of the test.
 func captureCredentialManagerOpts(t *testing.T) *[]handlers.EksCredentialHandlerOpts {

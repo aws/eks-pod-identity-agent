@@ -36,6 +36,7 @@ var (
 	refreshQps              int
 	rotateCredentials       bool
 	enableIMDSCredentials   bool
+	enableLocalValidation   bool
 
 	// Workload identity tunables. The values the workload identity path shares
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
@@ -164,13 +165,14 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	}
 
 	credentialOpts := handlers.EksCredentialHandlerOpts{
-		Cfg:                cfg,
-		ClusterName:        clusterName,
-		CredentialRenewal:  maxCredentialRenewal,
-		MaxCacheSize:       maxCacheSize,
-		RefreshQPS:         refreshQps,
-		EndpointOverridden: overrideEksAuthEndpoint != "",
-		EnableIMDS:         enableIMDSCredentials,
+		Cfg:                   cfg,
+		ClusterName:           clusterName,
+		CredentialRenewal:     maxCredentialRenewal,
+		MaxCacheSize:          maxCacheSize,
+		RefreshQPS:            refreshQps,
+		EndpointOverridden:    overrideEksAuthEndpoint != "",
+		EnableIMDS:            enableIMDSCredentials,
+		EnableLocalValidation: enableLocalValidation,
 	}
 	workloadIdentityOpts := newWorkloadIdentityServerOpts(cfg)
 	wiClients, err := buildSharedCredentialManager(ctx, &credentialOpts, &workloadIdentityOpts)
@@ -325,6 +327,8 @@ func init() {
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
 	serverCmd.Flags().BoolVar(&enableIMDSCredentials, "enable-imds-credentials", false,
 		"Enable consuming credentials from IMDS when available on the node")
+	serverCmd.Flags().BoolVar(&enableLocalValidation, handlers.FlagEnableLocalValidation, true,
+		"Validate rotated service account tokens locally instead of sending them to EKS Auth (Kubernetes 1.34+)")
 
 	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, false,
 		"Serve SPIFFE workload identity on its socket. When on, boot fails if the API server can't be reached as the node")

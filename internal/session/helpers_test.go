@@ -242,6 +242,7 @@ func newSessionFixture(t *testing.T, configure ...func(*fixtureOpts)) *sessionFi
 		Delegate:              delegate,
 		AuthoritativeDelegate: client,
 		TokenValidator:        opts.validator,
+		EnableLocalValidation: true,
 	})
 	provider, err := New(Opts{ClusterName: testClusterName, Minter: minter, Cache: h.cache, EKSAuth: client, PodStore: h.pods})
 	if err != nil {

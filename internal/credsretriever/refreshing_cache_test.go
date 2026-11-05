@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -690,6 +691,7 @@ func TestCachedCredentialRetriever_UncachedPodDelegateFailure_ReturnsEmptyCreden
 	}, CachedCredentialRetrieverOpts{
 		Delegate:              delegate,
 		AuthoritativeDelegate: delegate,
+		EnableLocalValidation: true,
 	})
 
 	// Pre-populate the cache with an entry for a pod UID using an initial JWT
@@ -806,6 +808,7 @@ func TestCachedCredentialRetriever_ValidateTokenOnlyWhenExpected(t *testing.T) {
 				Delegate:              delegate,
 				AuthoritativeDelegate: delegate,
 				TokenValidator:        spy,
+				EnableLocalValidation: true,
 			})
 
 			cachedJWT := test.CreateToken(t, test.TokenConfig{
@@ -882,6 +885,7 @@ func TestCachedCredentialRetriever_ValidateTokenOutcome(t *testing.T) {
 			Delegate:              mockcreds.NewMockCredentialRetriever(ctrl),
 			AuthoritativeDelegate: mockcreds.NewMockCredentialRetriever(ctrl),
 			TokenValidator:        spy,
+			EnableLocalValidation: true,
 		})
 
 		// Create a token and put it in the credentials cache
@@ -959,6 +963,7 @@ func TestCachedCredentialRetriever_TamperedPodUID_DoesNotReturnOtherPodCreds(t *
 		Delegate:              delegate,
 		AuthoritativeDelegate: delegate,
 		TokenValidator:        spy,
+		EnableLocalValidation: true,
 	})
 
 	// Cache credentials for the victim pod
@@ -1170,6 +1175,7 @@ func TestCachedCredentialRetriever_DelegateRouting(t *testing.T) {
 				Delegate:              generalDelegate,
 				AuthoritativeDelegate: authoritativeDelegate,
 				TokenValidator:        &spyTokenValidator{validateTokenErr: tc.validationErr},
+				EnableLocalValidation: true,
 			})
 
 			// Create the token the request will carry (also used to seed the cache).
@@ -1308,6 +1314,85 @@ func (r *countingRetriever) requests() []*credentials.EksCredentialsRequest {
 
 func (*countingRetriever) String() string                       { return "counting" }
 func (*countingRetriever) IsIrrecoverable(error) (string, bool) { return "Unknown", false }
+
+// TestCachedCredentialRetriever_RotatedToken_FollowsEnableLocalValidation proves
+// that with the option off, a rotated token goes straight to the authoritative
+// delegate and the retriever neither uses the given validator nor builds one.
+// With it on and no validator, the token triggers one lazy build, which shows the
+// build counter works. Exact token matches come from the cache in every case.
+func TestCachedCredentialRetriever_RotatedToken_FollowsEnableLocalValidation(t *testing.T) {
+	for _, tc := range []struct {
+		enabled, withValidator bool
+		counted                string
+		builds                 int32
+	}{
+		{enabled: false, withValidator: true, counted: "disabled", builds: 0},
+		{enabled: false, withValidator: false, counted: "disabled", builds: 0},
+		{enabled: true, withValidator: false, counted: "skipped", builds: 1},
+	} {
+		t.Run(fmt.Sprintf("enabled %v validator given %v", tc.enabled, tc.withValidator), func(t *testing.T) {
+			g := NewWithT(t)
+			ctrl := gomock.NewController(t)
+			ctx := context.Background()
+			const podUID = "test-pod-rotated-token"
+
+			delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+			spy := &spyTokenValidator{}
+			opts := CachedCredentialRetrieverOpts{
+				Delegate:              delegate,
+				AuthoritativeDelegate: delegate,
+				EnableLocalValidation: tc.enabled,
+			}
+			if tc.withValidator {
+				opts.TokenValidator = spy
+			}
+			retriever := newTestRetriever(credcache.Opts{RenewalTtl: time.Hour, MaxSize: 5, RefreshQPS: 1}, opts)
+			var builds atomic.Int32
+			retriever.buildValidator = func(context.Context) (tokenValidator, error) {
+				builds.Add(1)
+				return nil, errors.New("no cluster in tests")
+			}
+
+			now := time.Now()
+			cachedJWT := test.CreateToken(t, test.TokenConfig{Expiry: now.Add(time.Hour), Iat: now, Nbf: now, PodUID: podUID})
+			seed(t, retriever, podUID, &credcache.Entry{
+				LogCtx:  ctx,
+				Request: &credentials.EksCredentialsRequest{ServiceAccountToken: cachedJWT},
+				Credentials: &credentials.EksCredentialsResponse{
+					AccessKeyId: "AKIA-CACHED",
+					Expiration:  credentials.SdkCompliantExpirationTime{Time: now.Add(time.Hour)},
+				},
+			})
+			rotated := &credentials.EksCredentialsRequest{ServiceAccountToken: test.CreateToken(t, test.TokenConfig{
+				Expiry: now.Add(time.Hour), Iat: now.Add(time.Minute), Nbf: now, PodUID: podUID,
+			})}
+			delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).
+				Return(&credentials.EksCredentialsResponse{
+					AccessKeyId: "AKIA-EKS-AUTH",
+					Expiration:  credentials.SdkCompliantExpirationTime{Time: now.Add(time.Hour)},
+				}, responseMetadataTest("test"), nil).Times(1)
+			countedBefore := testutil.ToFloat64(promLocalValidation.WithLabelValues(tc.counted))
+
+			hit, _, err := retriever.GetIamCredentials(ctx, &credentials.EksCredentialsRequest{ServiceAccountToken: cachedJWT})
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(hit.AccessKeyId).To(Equal("AKIA-CACHED"))
+
+			got, _, err := retriever.GetIamCredentials(ctx, rotated)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(got.AccessKeyId).To(Equal("AKIA-EKS-AUTH"))
+			g.Expect(spy.validateTokenCalled).To(BeFalse())
+			g.Expect(testutil.ToFloat64(promLocalValidation.WithLabelValues(tc.counted))).To(Equal(countedBefore + 1))
+			// The lazy build runs on its own goroutine, so wait for it, or long
+			// enough that a stray build would have shown up.
+			if tc.builds > 0 {
+				g.Eventually(builds.Load).Should(Equal(tc.builds))
+			} else {
+				g.Consistently(builds.Load).WithTimeout(200 * time.Millisecond).Should(BeZero())
+				g.Expect(retriever.tokenValidator.Load()).To(BeNil())
+			}
+		})
+	}
+}
 
 // newTestRetriever builds a cachedCredentialRetriever over a new cache built
 // from cacheOpts. A zero CleanupInterval puts the cache's sweep an hour away, and

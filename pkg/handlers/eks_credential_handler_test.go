@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	sdkimds "github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
@@ -181,6 +182,112 @@ func TestNewCredentialManager_CacheRefreshesThroughTheGeneralDelegate(t *testing
 	}).WithTimeout(5 * time.Second).WithPolling(renewal / 5).Should(Equal("AKIA-REFRESHED"))
 	g.Expect(authSvc.calls()).To(Equal(1), "only the miss goes to EKS Auth")
 	g.Expect(manager.EKSAuth).To(BeIdenticalTo(authSvc))
+}
+
+// TestNewTokenValidator_BuildsOnlyWhenEnabled pins the startup gate, the only
+// thing that stops the boot-time /version and /openid/v1/jwks fetch when local
+// validation is off. Off never calls build, and on calls it once.
+func TestNewTokenValidator_BuildsOnlyWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		enabled  bool
+		buildErr error
+		builds   int
+		wantTV   bool
+	}{
+		{name: "on", enabled: true, builds: 1, wantTV: true},
+		{name: "on and the build fails", enabled: true, buildErr: fmt.Errorf("no cluster"), builds: 1},
+		{name: "off", enabled: false, builds: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			builds := 0
+			built := &validation.TokenValidator{}
+
+			tv := newTokenValidator(context.Background(), EksCredentialHandlerOpts{
+				EnableLocalValidation: tc.enabled,
+				EndpointOverridden:    true,
+			}, func(context.Context) (*validation.TokenValidator, error) {
+				builds++
+				if tc.buildErr != nil {
+					return nil, tc.buildErr
+				}
+				return built, nil
+			})
+
+			g.Expect(builds).To(Equal(tc.builds))
+			if tc.wantTV {
+				g.Expect(tv).To(BeIdenticalTo(built))
+				g.Expect(tv.EndpointOverridden).To(BeTrue())
+			} else {
+				g.Expect(tv).To(BeNil())
+			}
+		})
+	}
+}
+
+// TestNewCredentialManager_EnableLocalValidation_ReachesTheRetriever proves the
+// option reaches the cache's retriever. The validator has no key source, so with
+// the option on, a rotated token for a cached pod fails validation, and with it
+// off, the retriever ignores the validator. Either way the token goes to EKS Auth
+// and no real validator is built.
+func TestNewCredentialManager_EnableLocalValidation_ReachesTheRetriever(t *testing.T) {
+	for _, tc := range []struct {
+		enabled             bool
+		counted, notCounted string
+	}{
+		{enabled: true, counted: "failure", notCounted: "disabled"},
+		{enabled: false, counted: "disabled", notCounted: "failure"},
+	} {
+		t.Run(fmt.Sprintf("enabled %v", tc.enabled), func(t *testing.T) {
+			g := NewWithT(t)
+			ctx := context.Background()
+			general := &recordingRetriever{name: "chained-retriever", accessKeyId: "AKIA-GENERAL"}
+			authSvc := &recordingRetriever{name: "eks-auth", accessKeyId: "AKIA-EKS-AUTH"}
+			manager := newCredentialManager(ctx, EksCredentialHandlerOpts{
+				CredentialRenewal:     time.Hour,
+				MaxCacheSize:          10,
+				RefreshQPS:            5,
+				EnableLocalValidation: tc.enabled,
+			}, credcache.Opts{}, general, authSvc, &validation.TokenValidator{})
+			first := chainTestRequest(t, "pod-1")
+			rotated := *first
+			rotated.ServiceAccountToken = test.CreateToken(t, test.TokenConfig{
+				Expiry: time.Now().Add(time.Hour), Iat: time.Now().Add(time.Minute), Nbf: time.Now(), PodUID: "pod-1",
+			})
+			countedBefore := localValidationCount(g, tc.counted)
+			notCountedBefore := localValidationCount(g, tc.notCounted)
+
+			_, _, err := manager.Retriever.GetIamCredentials(ctx, first)
+			g.Expect(err).ToNot(HaveOccurred())
+			_, _, err = manager.Retriever.GetIamCredentials(ctx, &rotated)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			g.Expect(authSvc.calls()).To(Equal(2), "the rotated token goes to EKS Auth too")
+			g.Expect(localValidationCount(g, tc.counted)).To(Equal(countedBefore + 1))
+			g.Expect(localValidationCount(g, tc.notCounted)).To(Equal(notCountedBefore))
+		})
+	}
+}
+
+// localValidationCount reads pod_identity_local_validation{result} from the
+// default registry, where promauto registered the retriever's counter.
+func localValidationCount(g Gomega, result string) float64 {
+	families, err := prometheus.DefaultGatherer.Gather()
+	g.Expect(err).ToNot(HaveOccurred())
+	for _, family := range families {
+		if family.GetName() != "pod_identity_local_validation" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, pair := range metric.GetLabel() {
+				if pair.GetName() == "result" && pair.GetValue() == result {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // recordingRetriever serves new hour-long credentials with accessKeyId,

@@ -42,6 +42,11 @@ type EksCredentialHandlerOpts struct {
 	RefreshQPS         int
 	EndpointOverridden bool
 	EnableIMDS         bool
+	// EnableLocalValidation lets the cache check a token that differs from its pod's
+	// cached one against the API server's /openid/v1/jwks keys. When it's false, the
+	// agent never calls the API server for /version or /openid/v1/jwks and sends such
+	// a token to EKS Auth. cmd defaults it to true, but the zero value is false.
+	EnableLocalValidation bool
 	// CredentialRetriever, when set, is used as is, so callers can share one
 	// cache, and every field but ClusterName is then ignored. When nil, the
 	// handler builds its own with NewCredentialManager.
@@ -53,6 +58,10 @@ type EksCredentialHandlerOpts struct {
 	// refreshes through the general delegate with its stored token.
 	WorkloadIdentityTokens credcache.TokenSource
 }
+
+// FlagEnableLocalValidation names the flag that sets
+// EksCredentialHandlerOpts.EnableLocalValidation.
+const FlagEnableLocalValidation = "enable-local-validation"
 
 var (
 	promHttpStatus = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -91,26 +100,38 @@ type CredentialManager struct {
 }
 
 // NewCredentialManager builds the EKS Auth client and, unless CredentialRenewal or
-// MaxCacheSize is zero, the cache and its retriever with a token validator, over
-// the [imds, eksauth] chain when opts.EnableIMDS is set and IMDS answers. It
-// reads every field of opts but CredentialRetriever. cmd calls it once, so every
-// bind host and the workload identity tiers share one cache.
+// MaxCacheSize is zero, the cache and its retriever (with a token validator when
+// opts.EnableLocalValidation is on) over the [imds, eksauth] chain when EnableIMDS
+// is set and IMDS answers. It reads every opts field but CredentialRetriever. cmd
+// calls it once, so every bind host and the workload identity tiers share one cache.
 func NewCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts) CredentialManager {
 	ctx = logger.ContextWithField(ctx, "cluster-name", opts.ClusterName)
-	log := logger.FromContext(ctx)
 	credentialsRetriever := eksauth.NewService(ctx, opts.Cfg, opts.EnableIMDS)
 
 	var authSvc credentials.CredentialRetriever = credentialsRetriever
 
-	tv, err := validation.NewTokenValidator(ctx)
+	tv := newTokenValidator(ctx, opts, validation.NewTokenValidator)
+	return newCredentialManager(ctx, opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+}
+
+// newTokenValidator calls build to make the validator that checks rotated tokens
+// locally; build also starts the boot-time JWKS fetch. It returns nil without
+// calling build when opts.EnableLocalValidation is false, and nil when build
+// fails. The cache retries a failed build later, but never a disabled one.
+func newTokenValidator(ctx context.Context, opts EksCredentialHandlerOpts,
+	build func(context.Context) (*validation.TokenValidator, error)) *validation.TokenValidator {
+	log := logger.FromContext(ctx)
+	if !opts.EnableLocalValidation {
+		log.Info("Local token validation is disabled")
+		return nil
+	}
+	tv, err := build(ctx)
 	if err != nil {
 		log.Infof("failed to initialize token validator: %v", err)
+		return nil
 	}
-	if tv != nil {
-		tv.EndpointOverridden = opts.EndpointOverridden
-	}
-
-	return newCredentialManager(ctx, opts, credcache.Opts{}, credentialsRetriever, authSvc, tv)
+	tv.EndpointOverridden = opts.EndpointOverridden
+	return tv
 }
 
 // newCredentialManager is NewCredentialManager over delegates it's given: general
@@ -143,6 +164,7 @@ func newCredentialManager(ctx context.Context, opts EksCredentialHandlerOpts, ca
 		Cache:                 manager.Cache,
 		Delegate:              general,
 		AuthoritativeDelegate: authSvc,
+		EnableLocalValidation: opts.EnableLocalValidation,
 	}
 	if tv != nil {
 		retrieverOpts.TokenValidator = tv
