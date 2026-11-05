@@ -98,6 +98,9 @@ spec:
             {{- /* One token: pflag reads a bare bool flag as true and ignores a separate value. */}}
             - "--enable-workload-identity=true"
             {{- end }}
+            {{- if $top.Values.podLivenessCheck.enabled }}
+            - "--enable-pod-liveness"
+            {{- end }}
             {{- range $key, $value := $top.Values.agent.additionalArgs }}
             - {{ $key | quote }}
             - {{ $value | quote }}
