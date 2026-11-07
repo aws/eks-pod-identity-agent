@@ -82,7 +82,7 @@ func (s *service) GetIamCredentials(ctx context.Context,
 		input.Zone = aws.String(s.nodeMetadata.Zone)
 	}
 
-	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, input, withWorkloadIdentityProviderArn)
+	creds, err := s.eksAuthService.AssumeRoleForPodIdentity(ctx, input)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to fetch credentials from EKS Auth: %w", err)
 	}
@@ -108,9 +108,9 @@ func (s *service) GetIamCredentials(ctx context.Context,
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to parse arn from assumed role: %v", err)
 	}
-	// EKS Auth sets the member only on an enrolled vend. A missing or unreadable
-	// one reads as not enrolled rather than failing every pod's credentials.
-	providerArn, _ := creds.ResultMetadata.Get(workloadIdentityProviderArnKey{}).(string)
+	// EKS Auth sets the member only on an enrolled vend. A missing one reads as
+	// not enrolled rather than failing every pod's credentials.
+	providerArn := aws.ToString(creds.WorkloadIdentityProviderArn)
 
 	return &credentials.EksCredentialsResponse{
 			AccessKeyId:     *creds.Credentials.AccessKeyId,

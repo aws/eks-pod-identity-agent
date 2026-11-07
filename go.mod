@@ -3,12 +3,12 @@ module go.amzn.com/eks/eks-pod-identity-agent
 go 1.27.3
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.43.7
+	github.com/aws/aws-sdk-go-v2 v1.47.8
 	github.com/aws/aws-sdk-go-v2/config v1.32.29
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.30
-	github.com/aws/aws-sdk-go-v2/service/eksauth v1.16.4
+	github.com/aws/aws-sdk-go-v2/service/eksauth v1.24.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.44.0
-	github.com/aws/smithy-go v1.27.8
+	github.com/aws/smithy-go v1.28.8
 	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
@@ -41,8 +41,8 @@ require (
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.28 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.38 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.38 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.11 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.11 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.31 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.30 // indirect
