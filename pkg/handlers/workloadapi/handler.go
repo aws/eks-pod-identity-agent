@@ -154,11 +154,10 @@ func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 		want = id
 	}
 
-	caller, err := handlers.Attest(ctx, h.opts.Attestor)
+	ctx, caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
 		return nil, ctx, err
 	}
-	ctx = handlers.WithCaller(ctx, caller)
 	svids, err := h.opts.Tokens.JWTSVIDs(ctx, caller, audiences)
 	if err != nil {
 		return nil, ctx, err
@@ -201,11 +200,10 @@ func (h *Handler) validateJWTSVID(ctx context.Context, req *workload.ValidateJWT
 		return nil, ctx, wierrors.ErrInvalidRequest.Wrapf(nil, "a JWT-SVID must be specified")
 	}
 
-	caller, err := handlers.Attest(ctx, h.opts.Attestor)
+	ctx, caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
 		return nil, ctx, err
 	}
-	ctx = handlers.WithCaller(ctx, caller)
 	// Taken first and mapped like any tier error: ParseAndValidate turns a
 	// source error into its own invalid token error, which would report an STS
 	// outage as a bad token. The source is point-in-time and fetches nothing.

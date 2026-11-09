@@ -118,11 +118,10 @@ func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 	// Nothing here retries, unlike the stream: a unary caller has its own
 	// deadline to spend, so a transient tier failure is answered with a retryable
 	// code and the caller decides.
-	caller, err := handlers.Attest(ctx, h.opts.Attestor)
+	ctx, caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
 		return nil, ctx, err
 	}
-	ctx = handlers.WithCaller(ctx, caller)
 
 	// The lease carries the enrollment refusal, so a workload naming no provider
 	// is turned away here with the code the stream gives it. It also starts the
@@ -186,14 +185,17 @@ func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDisco
 	// Each setup step is awaited, so a transient failure before the first
 	// response blocks the stream rather than ending it. nil signals: the
 	// subscription that would provide them is itself one of these steps.
+	// Attest's context is taken only once Await returns, so a failed attempt
+	// never changes the ctx the next attempt starts from.
 	var caller *workloadidentity.Workload
+	var attested context.Context
 	if err := state.Await(ctx, nil, func() (err error) {
-		caller, err = handlers.Attest(ctx, h.opts.Attestor)
+		attested, caller, err = handlers.Attest(ctx, h.opts.Attestor)
 		return err
 	}); err != nil {
 		return err
 	}
-	ctx = handlers.WithCaller(ctx, caller)
+	ctx = attested
 	log := logger.FromContext(ctx)
 
 	// Held for the stream's life, not around each read: this stream reads the

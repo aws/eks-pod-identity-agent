@@ -10,29 +10,24 @@ import (
 )
 
 // Attest resolves the caller from the Peer the transport pinned for this RPC's
-// connection. Failures are ErrUnattestable.
-func Attest(ctx context.Context, attestor workloadidentity.Attestor) (*workloadidentity.Workload, error) {
+// connection, and returns ctx with the caller's pod on its logger, so every
+// later log line for the RPC, the refusal included, names the workload it is
+// about. A failure returns ctx unchanged and is ErrUnattestable.
+func Attest(ctx context.Context, attestor workloadidentity.Attestor) (context.Context, *workloadidentity.Workload, error) {
 	peer, ok := grpcserver.PeerFromContext(ctx)
 	if !ok {
-		return nil, errors.ErrUnattestable.Wrapf(nil, "attestation refused")
+		return ctx, nil, errors.ErrUnattestable.Wrapf(nil, "attestation refused")
 	}
 
 	caller, err := attestor.Attest(ctx, peer)
 	if err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	if caller == nil {
 		// A nil workload would panic a tier rather than refuse the RPC.
-		return nil, errors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
+		return ctx, nil, errors.ErrUnattestable.Wrapf(nil, "attestation named no workload")
 	}
 
-	return caller, nil
-}
-
-// WithCaller returns ctx with the attested caller's pod on its logger, so every
-// later log line for the RPC, the refusal included, names the workload it is
-// about. The transport's own fields name no pod: a Unix socket peer has no
-// address.
-func WithCaller(ctx context.Context, caller *workloadidentity.Workload) context.Context {
-	return logger.ContextWithField(ctx, "pod", caller.Namespace+"/"+caller.PodName, "pod-uid", caller.PodUID)
+	ctx = logger.ContextWithField(ctx, "pod", caller.Namespace+"/"+caller.PodName, "pod-uid", caller.PodUID)
+	return ctx, caller, nil
 }

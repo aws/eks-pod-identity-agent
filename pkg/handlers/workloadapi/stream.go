@@ -30,16 +30,19 @@ type streamSpec[R proto.Message] struct {
 func serve[R proto.Message](h *Handler, ctx context.Context, spec streamSpec[R]) error {
 	s := handlers.NewRPCState(spec.rpc, h.backoff)
 
+	// Attest names the pod on the logger, so the stream's later retries and
+	// failures, and the tiers it calls, log which workload they are about. Its
+	// context is taken only once Await returns, so a failed attempt never
+	// changes the ctx the next attempt starts from.
 	var caller *workloadidentity.Workload
+	var attested context.Context
 	if err := s.Await(ctx, nil, func() (err error) {
-		caller, err = handlers.Attest(ctx, h.opts.Attestor)
+		attested, caller, err = handlers.Attest(ctx, h.opts.Attestor)
 		return err
 	}); err != nil {
 		return err
 	}
-	// Name the attested pod on the logger, so the stream's later retries and
-	// failures, and the tiers it calls, log which workload they are about.
-	ctx = handlers.WithCaller(ctx, caller)
+	ctx = attested
 
 	var signals <-chan struct{}
 	var unsubscribe func()
