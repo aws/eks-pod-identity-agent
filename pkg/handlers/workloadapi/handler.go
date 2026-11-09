@@ -130,7 +130,7 @@ func (h *Handler) FetchJWTBundles(_ *workload.JWTBundlesRequest, stream grpc.Ser
 // one. It takes no lease and subscribes to nothing.
 func (h *Handler) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
 	start := time.Now()
-	resp, err := h.fetchJWTSVID(ctx, req)
+	resp, ctx, err := h.fetchJWTSVID(ctx, req)
 	if err != nil {
 		return nil, failUnary(ctx, workloadidentity.RPCFetchJWTSVID, start, err)
 	}
@@ -138,27 +138,30 @@ func (h *Handler) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 	return resp, nil
 }
 
-func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
+// fetchJWTSVID is FetchJWTSVID without the metrics. The context it returns names
+// the caller once attested, so the failure FetchJWTSVID logs names the pod.
+func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, context.Context, error) {
 	audiences := req.GetAudience()
 	if len(audiences) == 0 || slices.Contains(audiences, "") {
-		return nil, wierrors.ErrInvalidAudience.Wrapf(nil, "at least one audience must be specified, and none may be empty")
+		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "at least one audience must be specified, and none may be empty")
 	}
 	var want spiffeid.ID
 	if raw := req.GetSpiffeId(); raw != "" {
 		id, err := spiffeid.FromString(raw)
 		if err != nil {
-			return nil, wierrors.ErrInvalidRequest.Wrapf(nil, "the requested SPIFFE ID is invalid: %v", err)
+			return nil, ctx, wierrors.ErrInvalidRequest.Wrapf(nil, "the requested SPIFFE ID is invalid: %v", err)
 		}
 		want = id
 	}
 
 	caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
+	ctx = handlers.WithCaller(ctx, caller)
 	svids, err := h.opts.Tokens.JWTSVIDs(ctx, caller, audiences)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 
 	resp := &workload.JWTSVIDResponse{}
@@ -169,9 +172,9 @@ func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 		resp.Svids = append(resp.Svids, &workload.JWTSVID{SpiffeId: svid.ID.String(), Svid: svid.Marshal(), Hint: svid.Hint})
 	}
 	if len(resp.Svids) == 0 {
-		return nil, wierrors.ErrNoIdentity.Wrapf(nil, "no identity issued")
+		return nil, ctx, wierrors.ErrNoIdentity.Wrapf(nil, "no identity issued")
 	}
-	return resp, nil
+	return resp, ctx, nil
 }
 
 // ValidateJWTSVID verifies a token the caller presents against its provider's JWT
@@ -180,7 +183,7 @@ func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 // domains, so a token from another provider fails even on a shared node.
 func (h *Handler) ValidateJWTSVID(ctx context.Context, req *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
 	start := time.Now()
-	resp, err := h.validateJWTSVID(ctx, req)
+	resp, ctx, err := h.validateJWTSVID(ctx, req)
 	if err != nil {
 		return nil, failUnary(ctx, workloadidentity.RPCValidateJWTSVID, start, err)
 	}
@@ -188,37 +191,40 @@ func (h *Handler) ValidateJWTSVID(ctx context.Context, req *workload.ValidateJWT
 	return resp, nil
 }
 
-func (h *Handler) validateJWTSVID(ctx context.Context, req *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, error) {
+// validateJWTSVID is ValidateJWTSVID without the metrics. The context it returns
+// names the caller once attested, so the failure ValidateJWTSVID logs names the pod.
+func (h *Handler) validateJWTSVID(ctx context.Context, req *workload.ValidateJWTSVIDRequest) (*workload.ValidateJWTSVIDResponse, context.Context, error) {
 	if req.GetAudience() == "" {
-		return nil, wierrors.ErrInvalidAudience.Wrapf(nil, "an audience must be specified")
+		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "an audience must be specified")
 	}
 	if req.GetSvid() == "" {
-		return nil, wierrors.ErrInvalidRequest.Wrapf(nil, "a JWT-SVID must be specified")
+		return nil, ctx, wierrors.ErrInvalidRequest.Wrapf(nil, "a JWT-SVID must be specified")
 	}
 
 	caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
+	ctx = handlers.WithCaller(ctx, caller)
 	// Taken first and mapped like any tier error: ParseAndValidate turns a
 	// source error into its own invalid token error, which would report an STS
 	// outage as a bad token. The source is point-in-time and fetches nothing.
 	source, err := h.opts.Bundles.JWTSource(ctx, caller)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 
 	svid, err := jwtsvid.ParseAndValidate(req.GetSvid(), source, []string{req.GetAudience()})
 	if err != nil {
 		// In the message, since a caller sees no cause: go-spiffe's errors describe
 		// the token's header and claims, never the token itself.
-		return nil, wierrors.ErrInvalidToken.Wrapf(nil, "%v", err)
+		return nil, ctx, wierrors.ErrInvalidToken.Wrapf(nil, "%v", err)
 	}
 	claims, err := claimsStruct(svid.Claims)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
-	return &workload.ValidateJWTSVIDResponse{SpiffeId: svid.ID.String(), Claims: claims}, nil
+	return &workload.ValidateJWTSVIDResponse{SpiffeId: svid.ID.String(), Claims: claims}, ctx, nil
 }
 
 // claimsStruct converts the token's claims through JSON, as SPIRE does, so any

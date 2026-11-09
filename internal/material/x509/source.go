@@ -328,6 +328,13 @@ func (s *Source) issueAndStore(ctx context.Context, w *workloadidentity.Workload
 	if err = s.store(w, svid); err != nil {
 		return nil, err
 	}
+	// Once per pod per certificate lifetime, so cheap at Info, and the one line
+	// that says which identity a pod was actually given and until when.
+	logger.FromContext(ctx).
+		WithField("spiffe-id", svid.ID.String()).
+		WithField("not-after", leaf(svid).NotAfter).
+		WithField("renewal", renewal).
+		Info("Issued an X.509-SVID")
 	return svid, nil
 }
 
@@ -436,7 +443,8 @@ func (s *Source) onRefresh(uid string, cached entry) {
 	ctx, cancel := context.WithTimeout(
 		logger.ContextWithField(context.Background(),
 			"from", "x509-svid-renewal",
-			"pod", cached.workload.Namespace+"/"+cached.workload.PodName),
+			"pod", cached.workload.Namespace+"/"+cached.workload.PodName,
+			"pod-uid", uid),
 		s.renewalTimeout)
 	defer cancel()
 

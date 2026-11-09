@@ -37,6 +37,9 @@ func serve[R proto.Message](h *Handler, ctx context.Context, spec streamSpec[R])
 	}); err != nil {
 		return err
 	}
+	// Name the attested pod on the logger, so the stream's later retries and
+	// failures, and the tiers it calls, log which workload they are about.
+	ctx = handlers.WithCaller(ctx, caller)
 
 	var signals <-chan struct{}
 	var unsubscribe func()

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/errors"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
@@ -26,4 +27,12 @@ func Attest(ctx context.Context, attestor workloadidentity.Attestor) (*workloadi
 	}
 
 	return caller, nil
+}
+
+// WithCaller returns ctx with the attested caller's pod on its logger, so every
+// later log line for the RPC, the refusal included, names the workload it is
+// about. The transport's own fields name no pod: a Unix socket peer has no
+// address.
+func WithCaller(ctx context.Context, caller *workloadidentity.Workload) context.Context {
+	return logger.ContextWithField(ctx, "pod", caller.Namespace+"/"+caller.PodName, "pod-uid", caller.PodUID)
 }
