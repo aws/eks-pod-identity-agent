@@ -148,7 +148,7 @@ func newTestSource(
 	t.Helper()
 	source, err := New(Opts{
 		Issuer:                issuer,
-		SessionProvider:       sessions(now.Add(time.Hour)),
+		SessionProvider:       sessions(now.Add(2 * time.Hour)),
 		PodStore:              watcher,
 		MaxCacheSize:          100,
 		MaxAudienceSetsPerPod: maxAudienceSets,

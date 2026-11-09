@@ -85,7 +85,7 @@ func TestSessionProviderSession_CannedFields_ReturnsSessionOrError(t *testing.T)
 			provider: &SessionProvider{
 				Result: session,
 				Err:    sessionErr,
-				Func: func(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error) {
+				Func: func(ctx context.Context, w *workloadidentity.Workload, _ workloadidentity.SessionOptions) (*workloadidentity.WorkloadSession, error) {
 					return funcSession, nil
 				},
 			},
@@ -95,7 +95,7 @@ func TestSessionProviderSession_CannedFields_ReturnsSessionOrError(t *testing.T)
 			name: "func error",
 			provider: &SessionProvider{
 				Result: session,
-				Func: func(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error) {
+				Func: func(ctx context.Context, w *workloadidentity.Workload, _ workloadidentity.SessionOptions) (*workloadidentity.WorkloadSession, error) {
 					return nil, funcErr
 				},
 			},
@@ -176,6 +176,26 @@ func TestSessionProviderSession_ThreeCalls_CountsAndRecordsWorkloadsInCallOrder(
 	// The recorded slice is a copy, so mutating it cannot rewrite the fake.
 	recorded[0] = nil
 	g.Expect(provider.Workloads()[0]).To(BeIdenticalTo(workloads[0]))
+}
+
+func TestSessionProviderSession_Options_RecordedAndPassedToFunc(t *testing.T) {
+	g := NewWithT(t)
+	var seen []workloadidentity.SessionOptions
+	provider := &SessionProvider{Func: func(_ context.Context, _ *workloadidentity.Workload,
+		opts workloadidentity.SessionOptions) (*workloadidentity.WorkloadSession, error) {
+		seen = append(seen, opts)
+		return nil, nil
+	}}
+	w := &workloadidentity.Workload{PodUID: "uid-1"}
+
+	_, err := provider.Session(t.Context(), w)
+	g.Expect(err).To(Not(HaveOccurred()))
+	_, err = provider.Session(t.Context(), w, workloadidentity.MinRemaining(time.Hour))
+	g.Expect(err).To(Not(HaveOccurred()))
+
+	want := []workloadidentity.SessionOptions{{}, {MinRemaining: time.Hour}}
+	g.Expect(seen).To(Equal(want))
+	g.Expect(provider.Options()).To(Equal(want))
 }
 
 func TestSessionProviderSetResult_WhileLive_ChangesLaterCalls(t *testing.T) {

@@ -15,8 +15,8 @@
 //     invalidates its in-flight work. reserveAudienceSet bounds per-pod cache
 //     growth. storeLocked saves an owned audience snapshot and the token's deadlines.
 //  3. issuance.go: issueAndStore reserves an audience set, calls issue, and rechecks
-//     pod presence before storing. issue obtains the workload session, checks
-//     presence again, and calls STS with those credentials. classify translates
+//     pod presence before storing. issue asks for a workload session with the
+//     requested lifetime left and calls STS with that duration. classify translates
 //     STS failures; staleSession identifies rejected credentials to invalidate.
 //  4. token.go: normalizeAudiences validates, copies, sorts, and deduplicates
 //     audiences. parseIssuedToken produces a go-spiffe JWT-SVID, validates its
@@ -73,6 +73,11 @@
 // wait for a permit in the current sweep rather than being skipped. Foreground
 // issuance and background attempts each default to a 10-second timeout. Cache
 // refresh callbacks remain sequential.
+//
+// issue asks the session tier for a session covering the requested JWT lifetime
+// plus the issuance timeout. A shorter cached session is replaced by an exchange
+// rather than dropped, so it keeps serving the other tiers if that exchange fails.
+// STS receives the configured duration unchanged.
 //
 // # STS dependency
 //

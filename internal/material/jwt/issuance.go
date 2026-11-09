@@ -58,7 +58,9 @@ func (s *Source) issue(
 	w *workloadidentity.Workload,
 	audiences []string,
 ) (*jwtsvid.SVID, time.Time, error) {
-	session, err := s.sessionProvider.Session(ctx, w)
+	// STS rejects a JWT that outlives the session asking for it, so ask for one
+	// with the token's lifetime left, plus the issuance budget for latency.
+	session, err := s.sessionProvider.Session(ctx, w, workloadidentity.MinRemaining(s.duration+s.renewalTimeout))
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -85,7 +87,7 @@ func (s *Source) issue(
 	if tokenIssuedAt.IsZero() {
 		tokenIssuedAt = startedAt
 	}
-	if !tokenIssuedAt.Before(svid.Expiry) || !s.now().Before(svid.Expiry) {
+	if !s.now().Before(svid.Expiry) {
 		return nil, time.Time{}, wierrors.ErrIssuanceFailed.Wrapf(nil,
 			"STS returned an expired JWT-SVID for %s/%s and audiences %q", w.Namespace, w.PodName, audiences)
 	}

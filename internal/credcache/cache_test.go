@@ -172,7 +172,7 @@ func TestCache_Ttls(t *testing.T) {
 		wantRefresh  time.Duration
 		wantEviction time.Duration
 	}{
-		{"IMDS always 30min/NoExpiration", credentials.SourceIMDS, 6 * time.Hour, imdsRefreshInterval, expiring.NoExpiration},
+		{"IMDS refreshes at imdsRefreshInterval when below renewalTtl", credentials.SourceIMDS, 6 * time.Hour, imdsRefreshInterval, expiring.NoExpiration},
 		{"Auth Service short creds", credentials.SourceAuthService, 2 * time.Hour, 2 * time.Hour, 2 * time.Hour},
 		{"Auth Service long creds capped by renewalTtl", credentials.SourceAuthService, 6 * time.Hour, 3 * time.Hour, 6 * time.Hour},
 	}
@@ -185,6 +185,17 @@ func TestCache_Ttls(t *testing.T) {
 			g.Expect(eviction).To(Equal(tc.wantEviction))
 		})
 	}
+
+	// When the operator sets --max-credential-retention-before-renewal shorter than
+	// the IMDS delivery cadence, IMDS refreshes are capped to that shorter TTL.
+	t.Run("IMDS capped by shorter renewalTtl", func(t *testing.T) {
+		g := NewWithT(t)
+		shortRenewal := 5 * time.Minute
+		cc := newTestCacheWith(Opts{RenewalTtl: shortRenewal})
+		refresh, eviction := cc.ttls(credentials.SourceIMDS, 6*time.Hour)
+		g.Expect(refresh).To(Equal(shortRenewal))
+		g.Expect(eviction).To(Equal(expiring.NoExpiration))
+	})
 }
 
 // TestCache_Store_SchedulesRefreshAndEviction verifies an Auth Service entry

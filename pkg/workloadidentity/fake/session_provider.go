@@ -10,8 +10,8 @@ import (
 
 // SessionProvider is a fake workloadidentity.SessionProvider. It returns a
 // canned WorkloadSession or a canned error, counts calls to both methods,
-// records the workloads it was asked about and the pod UIDs it was told to
-// invalidate, and parks Session while its Gate is closed.
+// records the workloads and options it was asked with and the pod UIDs it was
+// told to invalidate, and parks Session while its Gate is closed.
 //
 // The canned value is called Result rather than Session because Session is the
 // interface method name.
@@ -29,18 +29,20 @@ type SessionProvider struct {
 	// nil WorkloadSession.
 	Err error
 	// Func, when non-nil, wins over Result and Err: Session returns whatever it
-	// returns.
-	Func func(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error)
+	// returns, given the options the caller passed.
+	Func func(ctx context.Context, w *workloadidentity.Workload,
+		opts workloadidentity.SessionOptions) (*workloadidentity.WorkloadSession, error)
 
 	mu              sync.Mutex
 	calls           int
 	workloads       []*workloadidentity.Workload
+	options         []workloadidentity.SessionOptions
 	invalidateCalls int
 	invalidated     []string
 }
 
-// Session records w and returns the canned WorkloadSession, the canned error, or
-// whatever Func returns.
+// Session records w and opts and returns the canned WorkloadSession, the canned
+// error, or whatever Func returns.
 //
 // It parks at the Gate first and returns the Gate's error unchanged. A call that
 // arrives with a done ctx, or that is woken by ctx rather than by Release, is
@@ -52,19 +54,22 @@ type SessionProvider struct {
 //
 // The returned *WorkloadSession is the canned pointer itself, not a copy, so a
 // caller that mutates it rewrites the answer every later call sees.
-func (p *SessionProvider) Session(ctx context.Context, w *workloadidentity.Workload) (*workloadidentity.WorkloadSession, error) {
+func (p *SessionProvider) Session(ctx context.Context, w *workloadidentity.Workload,
+	opts ...workloadidentity.SessionOption) (*workloadidentity.WorkloadSession, error) {
 	if err := p.enter(ctx); err != nil {
 		return nil, err
 	}
+	options := workloadidentity.NewSessionOptions(opts...)
 
 	p.mu.Lock()
 	p.calls++
 	p.workloads = append(p.workloads, w)
+	p.options = append(p.options, options)
 	fn, result, err := p.Func, p.Result, p.Err
 	p.mu.Unlock()
 
 	if fn != nil {
-		return fn(ctx, w)
+		return fn(ctx, w, options)
 	}
 	if err != nil {
 		return nil, err
@@ -95,6 +100,14 @@ func (p *SessionProvider) Workloads() []*workloadidentity.Workload {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.workloads)
+}
+
+// Options returns a copy of the options each counted Session call carried, in
+// call order.
+func (p *SessionProvider) Options() []workloadidentity.SessionOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.options)
 }
 
 // InvalidateCalls reports how many times Invalidate has been called.

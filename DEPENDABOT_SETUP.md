@@ -83,8 +83,8 @@ Based on the repository analysis:
 - `crazy-max/ghaction-docker-buildx` (currently v3.3.1)
 
 ### Docker Images (from `Dockerfile`)
-- `public.ecr.aws/eks-distro-build-tooling/golang:1.26.1`
-- `public.ecr.aws/eks-distro-build-tooling/go-runner:v0.18.0-go-1.26-latest.al23`
+- `public.ecr.aws/eks-distro-build-tooling/golang:1.27.3`
+- `public.ecr.aws/eks-distro-build-tooling/go-runner:v0.18.0-go-1.27-latest.al23`
 - `public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base:latest-al23`
 
 ## Alignment with Repository Practices

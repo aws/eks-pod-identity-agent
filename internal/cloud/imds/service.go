@@ -19,7 +19,7 @@
 //	└── ...
 //
 // The number of namespaces is dynamic and pods may be reshuffled across namespaces on each renewal. Namespaces are
-// discovered by listing the metadata root and filtering for the iam-eks-* prefix.
+// laid down contiguously from iam-eks-1.
 package imds
 
 import (
@@ -30,7 +30,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -73,6 +73,9 @@ const (
 	defaultRefreshInterval = 60 * time.Second
 	// iamEKSPrefix is the IMDS namespace prefix for EKS pod credentials.
 	iamEKSPrefix = "iam-eks-"
+	// upper bound for how many namespaces the agent scans
+	// nodes can support ~1000 credentials, so at worst there's one cred per ns
+	maxNamespaces = 1000
 	syncOpTimeout = 1 * time.Second
 	refreshOpTimeout = 5 * time.Second
 )
@@ -210,8 +213,10 @@ func (s *service) startBackgroundRefresh(ctx context.Context, interval time.Dura
 	}()
 }
 
-// buildNamespaceMapping reads all IMDS namespace info files and builds the
-// podUID → namespace mapping.
+// buildNamespaceMapping probes namespaces sequentially (iam-eks-1, iam-eks-2,
+// ...) and builds the podUID → namespace mapping, stopping at the first 404.
+// When a pod appears in multiple namespaces, the one with the most recent info
+// LastUpdated wins.
 func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	log := logger.FromContext(ctx)
 
@@ -219,24 +224,39 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, refreshOpTimeout)
 	defer cancel()
 
-	namespaces, err := s.discoverNamespaces(ctx)
-	if err != nil {
-		return fmt.Errorf("building namespace mapping: %w", err)
-	}
-
 	newMap := make(map[string]string)
+	// nsTime holds each namespace's info LastUpdated, used to break ties when a
+	// pod appears in multiple namespaces.
+	nsTime := make(map[string]time.Time)
 	anyFailed := false
-	for _, ns := range namespaces {
+
+	for i := 1; i <= maxNamespaces; i++ {
+		ns := strconv.Itoa(i)
 		info, err := s.readNamespaceInfo(ctx, ns)
 		if err != nil {
+			if isNotFound(err) {
+				break
+			}
+
 			log.WithField("namespace", ns).Warnf("Failed to read namespace info, retaining known pods for it: %v", err)
 			anyFailed = true
 			continue
 		}
+
+		nsTime[ns], err = time.Parse(time.RFC3339, info.LastUpdated)
+		if err != nil {
+			log.WithField("namespace", ns).Warnf("Could not parse namespace LastUpdated %q, treating as zero time: %v", info.LastUpdated, err)
+			nsTime[ns] = time.Time{}
+		}
+
 		for podUID, code := range info.PodCredentials {
 			if code != credentials.PodCredentialSuccessCode {
 				log.WithFields(logrus.Fields{"namespace": ns, "podUID": podUID, "code": code}).
-					Debug("Skipping pod with non-success code")
+					Info("Skipping IMDS mapping for pod with non-success code")
+				continue
+			}
+			// Keep the existing mapping unless this namespace is strictly newer.
+			if prevNS, seen := newMap[podUID]; seen && !nsTime[ns].After(nsTime[prevNS]) {
 				continue
 			}
 			newMap[podUID] = ns
@@ -254,8 +274,6 @@ func (s *service) buildNamespaceMapping(ctx context.Context) error {
 	}
 
 	s.storeMapping(newMap)
-	log.Infof("IMDS namespace mapping refreshed: %d pods across %d namespaces (completeScan=%v)",
-		len(newMap), len(namespaces), !anyFailed)
 	return nil
 }
 
@@ -324,25 +342,6 @@ func (s *service) readCredential(ctx context.Context, namespace, podUID string) 
 		return nil, fmt.Errorf("credential %s/%s: %w", namespace, podUID, ErrInvalidCredential)
 	}
 	return &cred, nil
-}
-
-// discoverNamespaces lists the IMDS metadata root and returns the suffix of
-// each iam-eks-* namespace (e.g. ["1", "2", "10"]). A single IMDS call
-// replaces sequential probing, correctly handling non-sequential namespaces
-// and dynamic namespace counts.
-func (s *service) discoverNamespaces(ctx context.Context) ([]string, error) {
-	data, err := s.getMetadata(ctx, "")
-	if err != nil {
-		return nil, fmt.Errorf("listing IMDS metadata root: %w", err)
-	}
-	var namespaces []string
-	for _, entry := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		entry = strings.TrimRight(entry, "/")
-		if strings.HasPrefix(entry, iamEKSPrefix) {
-			namespaces = append(namespaces, strings.TrimPrefix(entry, iamEKSPrefix))
-		}
-	}
-	return namespaces, nil
 }
 
 // ProbeIMDS checks whether IMDS is available on this node. A 200 means IMDS is

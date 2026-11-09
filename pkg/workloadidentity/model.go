@@ -78,10 +78,39 @@ type ProjectedToken struct {
 
 // SessionProvider exchanges a projected token for a decorated AWS session.
 type SessionProvider interface {
-	// Session returns an AWS session for the workload.
-	Session(ctx context.Context, w *Workload) (*WorkloadSession, error)
+	// Session returns an AWS session for the workload. Options such as
+	// MinRemaining ask for more than a usable session.
+	Session(ctx context.Context, w *Workload, opts ...SessionOption) (*WorkloadSession, error)
 	// Invalidate drops any cached session for the workload.
 	Invalidate(podUID string)
+}
+
+// SessionOptions is what a Session caller asks for. Implementations read it
+// with NewSessionOptions.
+type SessionOptions struct {
+	// MinRemaining is how long the session needs left. Zero accepts any usable
+	// session.
+	MinRemaining time.Duration
+}
+
+// SessionOption sets one field of SessionOptions.
+type SessionOption func(*SessionOptions)
+
+// MinRemaining asks for a session with at least d left. A cached session with
+// less is replaced by a new exchange, not dropped first, so it keeps serving if
+// that exchange fails. The new session can still have less than d when EKS Auth
+// issues none that long.
+func MinRemaining(d time.Duration) SessionOption {
+	return func(o *SessionOptions) { o.MinRemaining = d }
+}
+
+// NewSessionOptions applies opts in order.
+func NewSessionOptions(opts ...SessionOption) SessionOptions {
+	var o SessionOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
 }
 
 // WorkloadSession is an AWS session issued for one attested workload, together
