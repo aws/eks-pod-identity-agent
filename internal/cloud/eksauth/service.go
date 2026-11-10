@@ -37,7 +37,8 @@ func NewService(ctx context.Context, cfg aws.Config, enableIMDS bool) Iface {
 	// Configure HTTP client with custom timeouts
 	httpClient := &http.Client{
 		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
+			Proxy:             http.ProxyFromEnvironment,
+			ForceAttemptHTTP2: true,
 			DialContext: (&net.Dialer{
 				Timeout: 500 * time.Millisecond, // Socket timeout
 			}).DialContext,
