@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,8 @@ func TestInterceptors(t *testing.T) {
 		metadata metadata.MD
 		// limiter replaces the one built from configuration
 		limiter *rate.Limiter
+		// canServeOnUDS is the server's CanServeOnUDS gate, nil for none
+		canServeOnUDS func() bool
 		// expected is the status code the call has to end with
 		expected codes.Code
 	}{
@@ -69,6 +72,24 @@ func TestInterceptors(t *testing.T) {
 			limiter:  rate.NewLimiter(0, 0),
 			expected: codes.ResourceExhausted,
 		},
+		{
+			name:          "a call while the agent cannot serve yet is asked to retry",
+			metadata:      metadata.Pairs(SpiffeSecurityHeader, SpiffeSecurityHeaderValue),
+			canServeOnUDS: func() bool { return false },
+			expected:      codes.Unavailable,
+		},
+		{
+			name:          "a call once the agent can serve is served",
+			metadata:      metadata.Pairs(SpiffeSecurityHeader, SpiffeSecurityHeaderValue),
+			canServeOnUDS: func() bool { return true },
+			expected:      codes.OK,
+		},
+		{
+			name: "a call without the header is rejected even before the agent can serve",
+			// a client that will never be served is told so, not asked to retry
+			canServeOnUDS: func() bool { return false },
+			expected:      codes.InvalidArgument,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -84,6 +105,7 @@ func TestInterceptors(t *testing.T) {
 				srv := newStubServer(t, &stubService{}, Opts{
 					SocketPath:     path,
 					RequestLimiter: tc.limiter,
+					CanServeOnUDS:  tc.canServeOnUDS,
 				})
 				serve(t, srv)
 
@@ -189,6 +211,32 @@ func TestInterceptorOrder_IsLoggerThenGateThenLimiter(t *testing.T) {
 	// the first call past the gate spends the token, and the next is refused
 	g.Expect(callUnary(withHeader(ctx), conn)).To(Succeed())
 	g.Expect(status.Code(callUnary(withHeader(ctx), conn))).To(Equal(codes.ResourceExhausted))
+}
+
+// TestCanServeOnUDS_ARefusedCallSpendsNoAdmissionBudget proves a client retrying
+// through startup cannot spend the budget it needs once the agent can serve: the
+// CanServeOnUDS gate runs before the limiter.
+func TestCanServeOnUDS_ARefusedCallSpendsNoAdmissionBudget(t *testing.T) {
+	g := NewWithT(t)
+	path := tempSocketPath(t)
+	limiter := rate.NewLimiter(rate.Limit(0.001), 1)
+	var canServeOnUDS atomic.Bool
+	srv := newStubServer(t, &stubService{}, Opts{SocketPath: path, RequestLimiter: limiter, CanServeOnUDS: canServeOnUDS.Load})
+	serve(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn := dial(t, path)
+
+	for i := 0; i < 3; i++ {
+		g.Eventually(func() codes.Code { return status.Code(callUnary(withHeader(ctx), conn)) }).
+			WithContext(ctx).Should(Equal(codes.Unavailable))
+		_, err := openStream(withHeader(ctx), conn)
+		g.Expect(status.Code(err)).To(Equal(codes.Unavailable))
+	}
+	g.Expect(limiter.Tokens()).To(BeNumerically("~", 1, 0.1))
+
+	canServeOnUDS.Store(true)
+	g.Expect(callUnary(withHeader(ctx), conn)).To(Succeed())
 }
 
 // TestRateLimit_ChargesAStreamOnceAtEstablishment is the decision the spec asks to

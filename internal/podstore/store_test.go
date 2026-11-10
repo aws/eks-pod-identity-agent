@@ -1,6 +1,8 @@
 package podstore
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -8,6 +10,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
@@ -281,15 +284,69 @@ func TestOnPodDeleted_TombstoneDeliversUID(t *testing.T) {
 	g.Expect(got).To(Equal([]string{testPodUID, testPodUID}))
 }
 
-// TestOnPodDeleted_NoInformerErrors proves a store with no informer behind it
-// refuses a registration it could never honour, rather than accepting a
-// callback that would silently never fire.
-func TestOnPodDeleted_NoInformerErrors(t *testing.T) {
+// TestOnPodDeleted_RegisteredBeforeStart_HearsTheDeletion proves a callback
+// registered while the store is still empty, which is when the tiers register
+// at boot, is called for a deletion once the store has started.
+func TestOnPodDeleted_RegisteredBeforeStart_HearsTheDeletion(t *testing.T) {
 	g := NewWithT(t)
+	ctx := t.Context()
+	clientset := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
+	watching := watchPodsWithSignal(clientset)
+	store := NewStore()
+	deleted := make(chan string, 4)
+	g.Expect(store.OnPodDeleted(func(uid string) { deleted <- uid })).To(Succeed())
 
-	store := newStoreFromIndexer(indexerWithPods(t))
+	g.Expect(store.Start(ctx, clientset, testNode)).To(Succeed())
+	g.Eventually(watching).WithTimeout(5 * time.Second).Should(BeClosed())
+	g.Expect(store.HasPod(testPodUID)).To(BeTrue())
 
-	g.Expect(store.OnPodDeleted(func(string) {})).To(MatchError(ContainSubstring("no informer")))
+	g.Expect(clientset.CoreV1().Pods("team-a").Delete(ctx, "web-0", metav1.DeleteOptions{})).To(Succeed())
+	g.Eventually(deleted).WithTimeout(5 * time.Second).Should(Receive(Equal(testPodUID)))
+	g.Expect(store.HasPod(testPodUID)).To(BeFalse())
+}
+
+// TestNewStore_BeforeStart_HoldsNoPods proves a store that hasn't synced reports
+// so and answers every lookup with a miss, and learns its node only with the sync.
+func TestNewStore_BeforeStart_HoldsNoPods(t *testing.T) {
+	g := NewWithT(t)
+	store := NewStore()
+	g.Expect(store.Synced()).To(BeFalse())
+	g.Expect(store.NodeName()).To(BeEmpty())
+	g.Expect(store.HasPod(testPodUID)).To(BeFalse())
+	_, ok := store.PodByUID(testPodUID)
+	g.Expect(ok).To(BeFalse())
+
+	clientset := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
+	g.Expect(store.Start(t.Context(), clientset, testNode)).To(Succeed())
+	g.Expect(store.Synced()).To(BeTrue())
+	g.Expect(store.NodeName()).To(Equal(testNode))
+	g.Expect(store.HasPod(testPodUID)).To(BeTrue())
+}
+
+// TestStart_ASecondStart_Fails proves a store runs one informer: a second Start
+// is refused rather than opening a second watch.
+func TestStart_ASecondStart_Fails(t *testing.T) {
+	g := NewWithT(t)
+	clientset := fake.NewSimpleClientset()
+	store := NewStore()
+	g.Expect(store.Start(t.Context(), clientset, testNode)).To(Succeed())
+	g.Expect(store.Start(t.Context(), clientset, testNode)).To(MatchError(ContainSubstring("already started")))
+}
+
+// TestStart_ContextEndsBeforeTheSync_LeavesTheStoreEmpty proves a store whose
+// list never completes stays unsynced, so the socket keeps answering Unavailable
+// rather than serving from a partial list.
+func TestStart_ContextEndsBeforeTheSync_LeavesTheStoreEmpty(t *testing.T) {
+	g := NewWithT(t)
+	clientset := fake.NewSimpleClientset()
+	clientset.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("connection refused")
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	store := NewStore()
+	g.Expect(store.Start(ctx, clientset, testNode)).To(MatchError(ContainSubstring("failed to sync")))
+	g.Expect(store.Synced()).To(BeFalse())
 }
 
 // TestOnPodDeleted_RefusesANilCallback proves a store that could register a

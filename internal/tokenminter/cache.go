@@ -146,6 +146,13 @@ func (m *CachedMinter) Mint(ctx context.Context, w *workloadidentity.Workload) (
 	if w == nil || w.PodUID == "" {
 		return nil, wierrors.ErrTokenMintFailed.Wrapf(nil, "cannot mint a token for an empty workload")
 	}
+	// Before the sync every pod is absent, so the presence check below would
+	// refuse it as deleted, which is not retryable. A credential refresh can
+	// reach here that early; it gets a retryable failure and keeps its entry.
+	if m.pods != nil && !m.pods.Synced() {
+		return nil, wierrors.ErrTokenMintFailed.Wrapf(nil,
+			"cannot mint a token for pod %s until this node's pods have been listed", w.PodUID)
+	}
 	if !m.present(w.PodUID) {
 		m.Invalidate(w.PodUID)
 		return nil, podGone(w)

@@ -30,24 +30,26 @@ import (
 )
 
 // workloadIdentityClients is what workload identity reaches the API server with,
-// built once by createServers before the credential manager: the node name the
-// agent authenticates as, the synced node-scoped pod store and the cached token
-// minter. The minter is the one token cache, shared by the session tier's
-// exchanges and the credential cache's refreshes. The attestor resolves callers
-// from the pod store, and the minter and every per-pod tier drop a pod it reports
-// deleted.
+// built once by createServers before the credential manager: the node client,
+// the node-scoped pod store and the cached token minter. The minter is the one
+// token cache, shared by the session tier's exchanges and the credential cache's
+// refreshes. The attestor resolves callers from the pod store, and the minter and
+// every per-pod tier drop a pod it reports deleted.
+//
+// Building them asks nothing of the API server, so the credential endpoint never
+// waits on it. The pod store starts empty and syncWithAPIServer fills it beside the
+// servers; until then the workload identity socket answers Unavailable.
 type workloadIdentityClients struct {
-	nodeName string
-	podStore *podstore.Store
-	minter   workloadidentity.TokenMinter
+	clientset kubernetes.Interface
+	podStore  *podstore.Store
+	minter    workloadidentity.TokenMinter
 }
 
 // newNodeClient builds the node client. Tests replace it.
 var newNodeClient = kube.NewNodeClient
 
-// newWorkloadIdentityClients builds the clients when workload identity is on,
-// blocking until the node name resolves and the pod store syncs. Off, it builds
-// nothing and returns nil, so boot needs no API server.
+// newWorkloadIdentityClients builds the clients when workload identity is on.
+// Off, it builds nothing and returns nil, so boot needs no API server.
 func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
 	if !opts.Enabled {
 		return nil, nil
@@ -64,20 +66,12 @@ func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdent
 }
 
 // buildWorkloadIdentityClients is newWorkloadIdentityClients past the node
-// client, so a test can drive it with a fake clientset. The node name's retry
-// comes first, so the pod store's list and the minter's pre-flight reach an API
-// server that has answered. The store syncs before the minter is built, so the
-// minter drops deleted pods' tokens from its first mint.
+// client, so a test can drive it with a fake clientset. The minter registers for
+// the empty store's deletions now, so it drops deleted pods' tokens from the
+// store's first sync.
 func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clientset kubernetes.Interface) (*workloadIdentityClients, error) {
-	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
-	if err != nil {
-		return nil, err
-	}
-	podStore, err := podstore.New(ctx, clientset, nodeName)
-	if err != nil {
-		return nil, fmt.Errorf("starting the node-scoped pod store: %w", err)
-	}
+	podStore := podstore.NewStore()
 	// It refuses a --max-cache-size of zero, which the credential endpoint's cache
 	// reads as no caching.
 	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{
@@ -87,7 +81,54 @@ func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIde
 	if err != nil {
 		return nil, fmt.Errorf("building the token minter: %w", err)
 	}
-	return &workloadIdentityClients{nodeName: nodeName, podStore: podStore, minter: minter}, nil
+	return &workloadIdentityClients{clientset: clientset, podStore: podStore, minter: minter}, nil
+}
+
+// syncWithAPIServer runs the workload identity startup steps that need the API
+// server, and returns once the pod store has synced:
+//
+//  1. Resolve the node name, retrying until the API server answers.
+//  2. Check the CSIDriver the token minter depends on. A problem is only logged,
+//     since each mint reports it again as ErrTokenMintForbidden.
+//  3. Start the node-scoped pod store and wait for its first sync.
+//
+// A transient failure is retried until ctx ends: on a new node the API server is
+// unreachable until kube-proxy is up, and exiting then would take the credential
+// endpoint down with it. An identity that is not a node is returned at once, since
+// no retry can change it.
+func (c *workloadIdentityClients) syncWithAPIServer(ctx context.Context) error {
+	log := logger.FromContext(ctx)
+	var nodeName string
+	for {
+		var err error
+		nodeName, err = kube.ResolveNodeNameWithRetry(ctx, c.clientset)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, kube.ErrNotANode) || ctx.Err() != nil {
+			return err
+		}
+		log.Warnf("Workload identity is waiting for the API server, retrying: %v", err)
+	}
+	if err := tokenminter.VerifyCSIDriverExists(ctx, c.clientset); err != nil {
+		log.Warnf("Skipping the CSIDriver pre-flight: %v", err)
+	}
+	if err := c.podStore.Start(ctx, c.clientset, nodeName); err != nil {
+		return fmt.Errorf("starting the node-scoped pod store: %w", err)
+	}
+	return nil
+}
+
+// runPodStoreSync is syncWithAPIServer as a background loop. It returns once the store
+// has synced, and the store's informer keeps watching under ctx until shutdown.
+// An identity that is not a node is fatal, as it was when the agent synced before
+// serving: the operator has to fix the agent's credentials. A shutdown before the
+// sync is not an error.
+func (c *workloadIdentityClients) runPodStoreSync(ctx context.Context) {
+	if err := c.syncWithAPIServer(ctx); err != nil && ctx.Err() == nil {
+		logger.FromContext(ctx).Fatalf("Unable to start workload identity (--%s=false turns workload identity off): %v",
+			handlers.FlagEnableWorkloadIdentity, err)
+	}
 }
 
 // credentialTokens is the token source the credential cache refreshes with: the
@@ -100,8 +141,9 @@ func (c *workloadIdentityClients) credentialTokens() credcache.TokenSource {
 }
 
 // workloadIdentityServers is what the workload identity feature runs: the gRPC
-// server on its socket and the trust bundle refresh loop, over the clients
-// createServers built, whose pod store has already synced. Off, it builds nothing.
+// server on its socket, the trust bundle refresh loop, and the pod store sync,
+// over the clients createServers built. The socket is served from the start and
+// answers Unavailable until the sync finishes. Off, it builds nothing.
 func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients) ([]runnable, error) {
 	if !opts.Enabled {
@@ -129,6 +171,9 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 		SocketPath: configuration.WorkloadIdentitySocketPath,
 		Register:   registerWorkloadIdentityServices(tiers.handler, tiers.sdsHandler),
 		PeerPidfd:  opts.PeerPidfd,
+		// Attestation resolves callers from the store, so a call before the sync
+		// would be refused as a pod not on this node rather than asked to retry.
+		CanServeOnUDS: clients.podStore.Synced,
 	})
 	if err != nil {
 		return nil, err
@@ -138,7 +183,11 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	// leave the socket on disk. The gRPC server's own shutdown defers the same.
 	logrus.RegisterExitHandler(server.RemoveSocket)
 
-	return []runnable{server, backgroundLoop{name: "trust-bundle-refresh", run: tiers.bundleSource.Run}}, nil
+	return []runnable{
+		server,
+		backgroundLoop{name: "trust-bundle-refresh", run: tiers.bundleSource.Run},
+		backgroundLoop{name: "pod-store-sync", run: clients.runPodStoreSync},
+	}, nil
 }
 
 // workloadIdentityTiers is what the workload identity socket serves from, built
@@ -173,7 +222,7 @@ func newWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 // per-pod tier share the clients' pod store, so a deleted pod leaves each tier.
 func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients, stsClient sts.Iface) (*workloadIdentityTiers, error) {
-	attestor := attestation.New(clients.nodeName, clients.podStore, attestation.NewCgroupResolver())
+	attestor := attestation.New(clients.podStore, attestation.NewCgroupResolver())
 
 	// Cache is the credential cache every bind host serves from, so one session
 	// per pod serves both the HTTP endpoint and this socket. The tier refuses a

@@ -120,7 +120,7 @@ func TestResolveNodeNameWithRetry_ANonNodeIdentity_FailsWithoutRetrying(t *testi
 
 			_, err := ResolveNodeNameWithRetry(ctx, client)
 
-			g.Expect(err).To(MatchError(errNotANode))
+			g.Expect(err).To(MatchError(ErrNotANode))
 			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the retry waited for the deadline instead of failing")
 			g.Expect(calls.Load()).To(BeEquivalentTo(1))
 		})

@@ -47,9 +47,9 @@ const credentialHint = "the agent must present the node credential. With the IAM
 	"must be the node's role, mapped to the node by an access entry, and its ServiceAccount must carry no IAM " +
 	"role; with a --node-kubeconfig user other than exec, that user must be the node"
 
-// errNotANode marks an authenticated identity that is not a node, which no retry
+// ErrNotANode marks an authenticated identity that is not a node, which no retry
 // can change: a ServiceAccount, anonymous, or system:node: with an empty name.
-var errNotANode = errors.New("not a node identity")
+var ErrNotANode = errors.New("not a node identity")
 
 // ResolveNodeName asks the API server for the node name the client
 // authenticates as. It requires no RBAC: create on selfsubjectreviews is in the
@@ -68,19 +68,20 @@ func ResolveNodeName(ctx context.Context, clientset kubernetes.Interface) (strin
 	username := res.Status.UserInfo.Username
 	if !strings.HasPrefix(username, nodeUsernamePrefix) {
 		return "", fmt.Errorf("authenticated as %q, which is %w (%s...): %s",
-			username, errNotANode, nodeUsernamePrefix, credentialHint)
+			username, ErrNotANode, nodeUsernamePrefix, credentialHint)
 	}
 
 	nodeName := strings.TrimPrefix(username, nodeUsernamePrefix)
 	if nodeName == "" {
-		return "", fmt.Errorf("authenticated as %q, which carries an empty node name, so it is %w", username, errNotANode)
+		return "", fmt.Errorf("authenticated as %q, which carries an empty node name, so it is %w", username, ErrNotANode)
 	}
 	return nodeName, nil
 }
 
-// nodeNameBackoff governs the startup retry. The agent cannot attest anything
-// without its node name, so it stays unready and keeps trying rather than
-// starting with an empty store; the caller wires the failing readiness.
+// nodeNameBackoff governs one round of the startup retry. The agent cannot
+// attest anything without its node name, so the caller starts another round
+// when one gives up, and the workload identity socket refuses with Unavailable
+// until the name resolves and the pod store syncs.
 var nodeNameBackoff = wait.Backoff{
 	Duration: 500 * time.Millisecond,
 	Factor:   2.0,
@@ -103,7 +104,7 @@ func ResolveNodeNameWithRetry(ctx context.Context, clientset kubernetes.Interfac
 		name, err := ResolveNodeName(ctx, clientset)
 		if err != nil {
 			// A non-node identity is a hard configuration error; stop retrying.
-			if errors.Is(err, errNotANode) {
+			if errors.Is(err, ErrNotANode) {
 				return false, err
 			}
 			lastErr = err

@@ -175,6 +175,11 @@ type Opts struct {
 	// PeerPidfd lets callers be pinned by SO_PEERPIDFD where the kernel has it.
 	// Off, every caller is pinned through its /proc handle.
 	PeerPidfd bool
+	// CanServeOnUDS reports whether the services can answer yet. Until it does, every
+	// call is refused with Unavailable, which SPIFFE clients and Envoy retry. In
+	// production it is the pod store having synced, which the agent no longer
+	// waits for before serving. Nil means always.
+	CanServeOnUDS func() bool
 }
 
 // New binds the socket and returns a server ready to be driven.
@@ -228,6 +233,7 @@ func serverOptions(opts Opts, creds credentials.TransportCredentials) []grpc.Ser
 	chain := []interceptorPair{
 		{Unary: UnaryLoggerInterceptor(), Stream: StreamLoggerInterceptor()},
 		{Unary: UnaryMetadataGateInterceptor(), Stream: StreamMetadataGateInterceptor()},
+		{Unary: UnaryCanServeOnUDSInterceptor(opts.CanServeOnUDS), Stream: StreamCanServeOnUDSInterceptor(opts.CanServeOnUDS)},
 		{Unary: UnaryRateLimitInterceptor(limiter), Stream: StreamRateLimitInterceptor(limiter)},
 	}
 

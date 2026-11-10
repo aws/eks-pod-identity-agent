@@ -30,6 +30,8 @@ type togglePods struct {
 	pod *podstore.PodInfo
 }
 
+func (s *togglePods) NodeName() string { return "node-a" }
+
 func (s *togglePods) PodByUID(string) (*podstore.PodInfo, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -52,7 +54,7 @@ var e2ePod = &podstore.PodInfo{UID: "uid-1", Name: "web", Namespace: "a", Servic
 // e2eServer runs grpcserver.New with the real attestor: a stream that attests at
 // open and then stays open, and a unary that attests. Each reports its Peer.
 func e2eServer(t *testing.T, pods *togglePods) (*grpc.ClientConn, chan *Peer, chan *Peer) {
-	att := attestation.New("node-a", pods, oneCgroup{})
+	att := attestation.New(pods, oneCgroup{})
 	streamPeers, unaryPeers := make(chan *Peer, 4), make(chan *Peer, 4)
 	attest := func(ctx context.Context, out chan *Peer) error {
 		p, ok := PeerFromContext(ctx)

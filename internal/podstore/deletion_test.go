@@ -91,11 +91,11 @@ func TestPodReplacementSeenOnlyByARelistIsReported(t *testing.T) {
 	}
 }
 
-func TestPodDeletionRegistrationRequiresInformerAndCallback(t *testing.T) {
+func TestPodDeletionRegistrationRequiresStoreAndCallback(t *testing.T) {
 	var absent *Store
 	require.Error(t, absent.OnPodDeleted(func(string) {}))
-	require.Error(t, (&Store{}).OnPodDeleted(func(string) {}))
-	require.Error(t, (&Store{}).OnPodDeleted(nil))
+	require.Error(t, NewStore().OnPodDeleted(nil))
+	require.NoError(t, NewStore().OnPodDeleted(func(string) {}), "a store that hasn't started takes registrations")
 }
 
 func TestPodDeletionCallbackUsesExistingInformer(t *testing.T) {
