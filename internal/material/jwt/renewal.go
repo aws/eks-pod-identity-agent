@@ -40,7 +40,10 @@ func (s *Source) onRefresh(key cacheKey, cached *entry) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(
-		logger.ContextWithField(context.Background(), "from", "jwt-svid-renewal", "pod-uid", key.podUID),
+		logger.ContextWithField(context.Background(),
+			"from", "jwt-svid-renewal",
+			"pod", cached.workload.Namespace+"/"+cached.workload.PodName,
+			"pod-uid", key.podUID),
 		s.renewalTimeout,
 	)
 	defer cancel()

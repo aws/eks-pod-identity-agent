@@ -101,7 +101,7 @@ func (h *Handler) DeltaSecrets(_ secretv3.SecretDiscoveryService_DeltaSecretsSer
 func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
 	state := handlers.NewRPCState(workloadidentity.RPCFetchSecrets, h.backoff)
 
-	resp, err := h.fetchSecrets(ctx, req)
+	resp, ctx, err := h.fetchSecrets(ctx, req)
 	if err != nil {
 		return nil, state.Failed(ctx, err)
 	}
@@ -112,16 +112,15 @@ func (h *Handler) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 
 // fetchSecrets is FetchSecrets without the metrics, returning the tiers' own
 // errors for the caller above to record and map exactly once. It takes no retry,
-// so nothing here maps on its own.
-func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
-	log := logger.FromContext(ctx)
-
+// so nothing here maps on its own. The context it returns names the caller once
+// attested, so the failure the caller above logs names the pod.
+func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, context.Context, error) {
 	// Nothing here retries, unlike the stream: a unary caller has its own
 	// deadline to spend, so a transient tier failure is answered with a retryable
 	// code and the caller decides.
-	caller, err := handlers.Attest(ctx, h.opts.Attestor)
+	ctx, caller, err := handlers.Attest(ctx, h.opts.Attestor)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 
 	// The lease carries the enrollment refusal, so a workload naming no provider
@@ -130,7 +129,7 @@ func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 	// forever.
 	releaseLease, err := h.opts.Bundles.Lease(ctx, caller)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 	defer releaseLease()
 
@@ -139,25 +138,25 @@ func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 		// NotFound, the same as the stream, rather than the InvalidArgument
 		// SPIRE answers: one bad name has to produce one status on both methods
 		// or the socket has two contracts.
-		return nil, status.Error(codes.NotFound, err.Error())
+		return nil, ctx, status.Error(codes.NotFound, err.Error())
 	}
 
 	resources := make([]*anypb.Any, 0, len(requested))
 	for _, r := range requested {
 		secret, err := h.buildSecret(ctx, caller, r)
 		if err != nil {
-			return nil, err
+			return nil, ctx, err
 		}
 
 		packed, err := anypb.New(secret)
 		if err != nil {
-			return nil, fmt.Errorf("packing the secret %q: %w", secret.GetName(), err)
+			return nil, ctx, fmt.Errorf("packing the secret %q: %w", secret.GetName(), err)
 		}
 
 		resources = append(resources, packed)
 	}
 
-	log.Debugf("FetchSecrets served %d resource(s) to pod %s", len(resources), caller.PodUID)
+	logger.FromContext(ctx).Debugf("FetchSecrets served %d resource(s)", len(resources))
 
 	// Every resource in one response: the stream's one-per-response rule is
 	// Envoy's singleton watch, and a unary fetch has none. VersionInfo and Nonce
@@ -165,7 +164,7 @@ func (h *Handler) fetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRe
 	return &discoveryv3.DiscoveryResponse{
 		TypeUrl:   SecretTypeURL,
 		Resources: resources,
-	}, nil
+	}, ctx, nil
 }
 
 // StreamSecrets serves an Envoy sidecar its certificate and validation context,
@@ -183,18 +182,21 @@ func (h *Handler) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSec
 
 // streamSecrets is StreamSecrets' loop. Await records and maps whatever ends it.
 func (h *Handler) streamSecrets(ctx context.Context, stream secretv3.SecretDiscoveryService_StreamSecretsServer, state *handlers.RPCState) error {
-	log := logger.FromContext(ctx)
-
 	// Each setup step is awaited, so a transient failure before the first
 	// response blocks the stream rather than ending it. nil signals: the
 	// subscription that would provide them is itself one of these steps.
+	// Attest's context is taken only once Await returns, so a failed attempt
+	// never changes the ctx the next attempt starts from.
 	var caller *workloadidentity.Workload
+	var attested context.Context
 	if err := state.Await(ctx, nil, func() (err error) {
-		caller, err = handlers.Attest(ctx, h.opts.Attestor)
+		attested, caller, err = handlers.Attest(ctx, h.opts.Attestor)
 		return err
 	}); err != nil {
 		return err
 	}
+	ctx = attested
+	log := logger.FromContext(ctx)
 
 	// Held for the stream's life, not around each read: this stream reads the
 	// validation context only when signalled, so a provider whose bundles hold

@@ -162,7 +162,7 @@ func (a *attestor) resolve(ctx context.Context, pid int) (*workloadidentity.Work
 	if pod.NodeName != a.nodeName {
 		// Redundant given the field selector, so a selector regression refuses.
 		return nil, workloadidentity.ReasonPodNodeMismatch,
-			errors.New("pod bound to node " + pod.NodeName + ", agent is on " + a.nodeName)
+			errors.New("pod UID " + podUID + " bound to node " + pod.NodeName + ", agent is on " + a.nodeName)
 	}
 
 	return &workloadidentity.Workload{

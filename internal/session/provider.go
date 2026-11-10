@@ -107,7 +107,9 @@ func (p *Provider) Session(ctx context.Context, w *workloadidentity.Workload,
 	if w == nil || w.PodUID == "" {
 		return nil, wierrors.ErrSessionUnavailable.Wrapf(nil, "cannot exchange a session for an empty workload")
 	}
-	log := logger.FromContext(ctx)
+	// The pod's UID is set here rather than left to the caller: the trust bundle
+	// refresh asks on behalf of a provider, and its context names no pod.
+	log := logger.FromContext(ctx).WithField("pod-uid", w.PodUID)
 	minRemaining := workloadidentity.NewSessionOptions(opts...).MinRemaining
 
 	held, ok := p.cache.Get(w.PodUID)
@@ -238,6 +240,12 @@ func (p *Provider) exchangeAndStore(ctx context.Context, w *workloadidentity.Wor
 		}
 		return nil, wierrors.ErrSessionUnavailable.Wrapf(err, "caching the session for pod %s", w.PodUID)
 	}
+	// Once per exchange, not per lookup: the provider ARN is what decides the
+	// pod's trust domain, and nothing else on the node records it.
+	logger.FromContext(storeCtx).
+		WithField("provider-arn", entry.Metadata.ProviderArn()).
+		WithField("expiration", entry.Credentials.Expiration.Time).
+		Info("Exchanged a workload identity session with EKS Auth")
 	return entry, nil
 }
 

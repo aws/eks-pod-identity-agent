@@ -117,6 +117,10 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	if err != nil {
 		return nil, fmt.Errorf("building the workload identity tiers: %w", err)
 	}
+	logger.FromContext(ctx).Infof("Workload identity is on: cluster %s, region %s, X.509-SVID lifetime %s, "+
+		"JWT-SVID lifetime %s, renewal at %v of the issued lifetime (jitter %v), SO_PEERPIDFD pinning %t",
+		opts.ClusterName, opts.Cfg.Region, opts.X509SVIDDuration, opts.JWTSVIDDuration,
+		opts.SVIDRenewalFraction, opts.SVIDRenewalJitter, opts.PeerPidfd)
 
 	// The path is the constant rather than a flag because it is a contract with
 	// the Pod Identity webhook and the CSI driver. The shutdown budget is left to

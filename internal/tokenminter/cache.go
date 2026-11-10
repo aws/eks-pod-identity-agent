@@ -236,7 +236,8 @@ func (m *CachedMinter) onRefresh(uid string, entry cacheEntry) {
 	ctx, cancel := context.WithTimeout(
 		logger.ContextWithField(context.Background(),
 			"from", "psat-renewal",
-			"pod", entry.workload.Namespace+"/"+entry.workload.PodName),
+			"pod", entry.workload.Namespace+"/"+entry.workload.PodName,
+			"pod-uid", uid),
 		m.renewalTimeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
