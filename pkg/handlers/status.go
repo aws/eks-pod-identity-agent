@@ -83,9 +83,6 @@ var statusCodes = map[errors.Kind]codes.Code{
 
 	// Internal: EKS Auth failed the exchange with InternalServer.
 	errors.KindSessionFailed: codes.Internal,
-
-	// Internal: EKS Auth answered ResourceNotFound.
-	errors.KindSessionNotFound: codes.Internal,
 }
 
 // StatusCode returns the code a caller on the workload identity socket sees for

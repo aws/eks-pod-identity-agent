@@ -46,8 +46,6 @@ const (
 	KindSessionInvalid
 	// KindSessionFailed is the kind of ErrSessionFailed.
 	KindSessionFailed
-	// KindSessionNotFound is the kind of ErrSessionNotFound.
-	KindSessionNotFound
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -246,11 +244,6 @@ var (
 	// ErrSessionFailed is produced by the session provider when EKS Auth
 	// fails the exchange with InternalServer. Not retryable.
 	ErrSessionFailed = newWorkloadIdentityError(KindSessionFailed, "session_failed", false)
-
-	// ErrSessionNotFound is produced by the session provider when EKS Auth
-	// answers ResourceNotFound: no pod identity association, or no cluster.
-	// Not retryable.
-	ErrSessionNotFound = newWorkloadIdentityError(KindSessionNotFound, "session_not_found", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -316,6 +309,5 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrNoIdentity,
 		ErrSessionInvalid,
 		ErrSessionFailed,
-		ErrSessionNotFound,
 	}
 }

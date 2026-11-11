@@ -1112,8 +1112,8 @@ func TestSessionProvider_ExchangeErrorMapping(t *testing.T) {
 		{
 			// EKS Auth answers the same for a cluster it can't resolve, so the
 			// message names the cluster.
-			name: "ResourceNotFound is not found", setup: withAPIError(eksauthtest.ResourceNotFound()),
-			wantKind:    wierrors.ErrSessionNotFound,
+			name: "ResourceNotFound is not enrolled", setup: withAPIError(eksauthtest.ResourceNotFound()),
+			wantKind:    wierrors.ErrNotEnrolled,
 			wantAPICode: "ResourceNotFoundException", wantCalls: 1,
 			wantMessage: fmt.Sprintf("in cluster %q", testClusterName),
 		},

@@ -41,7 +41,6 @@ var pinnedStatusCodes = map[errors.Kind]codes.Code{
 	errors.KindNoIdentity:         codes.PermissionDenied,
 	errors.KindSessionInvalid:     codes.FailedPrecondition,
 	errors.KindSessionFailed:      codes.Internal,
-	errors.KindSessionNotFound:    codes.Internal,
 }
 
 // TestStatusCode_IsTotalOverTaxonomy is the tripwire the mapping exists for. A

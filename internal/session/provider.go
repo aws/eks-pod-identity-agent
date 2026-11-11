@@ -357,7 +357,7 @@ func (p *Provider) sessionError(err error, podUID string) error {
 	}
 	var notFound *types.ResourceNotFoundException
 	if errors.As(err, &notFound) {
-		return wierrors.ErrSessionNotFound.Wrapf(err, "EKS Auth found no pod identity association for pod %s in cluster %q",
+		return wierrors.ErrNotEnrolled.Wrapf(err, "EKS Auth found no pod identity association for pod %s in cluster %q",
 			podUID, p.clusterName)
 	}
 	var denied *types.AccessDeniedException

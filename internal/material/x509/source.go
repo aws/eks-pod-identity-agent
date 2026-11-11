@@ -472,7 +472,6 @@ func (s *Source) onRefresh(uid string, cached entry) {
 // about whether the pod exists.
 func workloadGone(err error) bool {
 	return errors.Is(err, wierrors.ErrNotEnrolled) ||
-		errors.Is(err, wierrors.ErrSessionNotFound) ||
 		errors.Is(err, wierrors.ErrTokenMintForbidden) ||
 		errors.Is(err, wierrors.ErrSessionRefused) ||
 		errors.Is(err, wierrors.ErrUnattestable)

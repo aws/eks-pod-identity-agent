@@ -302,11 +302,6 @@ func TestRenewalForAGonePodDropsTheCertificate(t *testing.T) {
 			wantKept: false,
 		},
 		{
-			name:     "EKS Auth finds no association for the pod",
-			renewErr: wierrors.ErrSessionNotFound.Wrapf(nil, "pod is gone"),
-			wantKept: false,
-		},
-		{
 			name:     "EKS Auth rejects the session request, so the pod may still be running",
 			renewErr: wierrors.ErrSessionInvalid.Wrapf(nil, "invalid request"),
 			wantKept: true,
