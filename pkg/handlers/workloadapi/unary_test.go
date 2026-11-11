@@ -119,7 +119,7 @@ func TestFetchJWTSVID_RejectsMoreThanOneAudience(t *testing.T) {
 			g := NewWithT(t)
 			_, err := h.client.FetchJWTSVID(h.ctxFor(podB), &workload.JWTSVIDRequest{Audience: audiences})
 			g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument), "%v", err)
-			g.Expect(status.Convert(err).Message()).To(ContainSubstring("exactly one audience"))
+			g.Expect(status.Convert(err).Message()).To(ContainSubstring("exactly one non-empty audience"))
 		})
 	}
 

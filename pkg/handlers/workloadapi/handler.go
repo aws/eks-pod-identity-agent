@@ -12,7 +12,6 @@ package workloadapi
 import (
 	"context"
 	"encoding/json"
-	"slices"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
@@ -142,16 +141,12 @@ func (h *Handler) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 // fetchJWTSVID is FetchJWTSVID without the metrics. The context it returns names
 // the caller once attested, so the failure FetchJWTSVID logs names the pod.
 func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, context.Context, error) {
-	audiences := req.GetAudience()
-	if len(audiences) == 0 || slices.Contains(audiences, "") {
-		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "at least one audience must be specified, and none may be empty")
-	}
 	// One audience per token, so a token handed to one relying party cannot be
-	// replayed to another. Checked before attesting, like the check above. The
-	// caller gets gRPC InvalidArgument (code 3) with this message, and the
-	// failure is counted under the invalid_audience metric label.
-	if len(audiences) > 1 {
-		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "exactly one audience must be specified, got %d", len(audiences))
+	// replayed to another. Checked before attesting. The caller gets gRPC
+	// InvalidArgument (code 3), counted under the invalid_audience metric label.
+	audiences := req.GetAudience()
+	if len(audiences) != 1 || audiences[0] == "" {
+		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "exactly one non-empty audience must be specified")
 	}
 	var want spiffeid.ID
 	if raw := req.GetSpiffeId(); raw != "" {
