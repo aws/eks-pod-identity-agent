@@ -125,9 +125,10 @@ func (h *Handler) FetchJWTBundles(_ *workload.JWTBundlesRequest, stream grpc.Ser
 	})
 }
 
-// FetchJWTSVID returns the caller's JWT-SVIDs, each carrying every requested
-// audience, keeping only those for the requested SPIFFE ID when the caller names
-// one. It takes no lease and subscribes to nothing.
+// FetchJWTSVID returns the caller's JWT-SVIDs for a single audience. If the
+// request names a SPIFFE ID, only SVIDs for that ID are returned. A request with
+// more than one audience fails with gRPC InvalidArgument.
+// It does not lease a bundle or subscribe to updates.
 func (h *Handler) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest) (*workload.JWTSVIDResponse, error) {
 	start := time.Now()
 	resp, ctx, err := h.fetchJWTSVID(ctx, req)
@@ -144,6 +145,13 @@ func (h *Handler) fetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest
 	audiences := req.GetAudience()
 	if len(audiences) == 0 || slices.Contains(audiences, "") {
 		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "at least one audience must be specified, and none may be empty")
+	}
+	// One audience per token, so a token handed to one relying party cannot be
+	// replayed to another. Checked before attesting, like the check above. The
+	// caller gets gRPC InvalidArgument (code 3) with this message, and the
+	// failure is counted under the invalid_audience metric label.
+	if len(audiences) > 1 {
+		return nil, ctx, wierrors.ErrInvalidAudience.Wrapf(nil, "exactly one audience must be specified, got %d", len(audiences))
 	}
 	var want spiffeid.ID
 	if raw := req.GetSpiffeId(); raw != "" {

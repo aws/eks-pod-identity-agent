@@ -481,6 +481,14 @@ func TestErrorMapping_HandlerRefusalsOfTheRequest(t *testing.T) {
 			code: codes.InvalidArgument, label: wierrors.ErrInvalidAudience.MetricLabel(),
 		},
 		{
+			name: "more than one audience", rpc: workloadidentity.RPCFetchJWTSVID,
+			call: func(ctx context.Context, h *harness) error {
+				_, err := h.client.FetchJWTSVID(ctx, &workload.JWTSVIDRequest{Audience: []string{errsAudience, errsAudience + "-2"}})
+				return err
+			},
+			code: codes.InvalidArgument, label: wierrors.ErrInvalidAudience.MetricLabel(),
+		},
+		{
 			name: "an invalid SPIFFE ID", rpc: workloadidentity.RPCFetchJWTSVID,
 			call: func(ctx context.Context, h *harness) error {
 				_, err := h.client.FetchJWTSVID(ctx, &workload.JWTSVIDRequest{Audience: []string{errsAudience}, SpiffeId: "not a SPIFFE ID"})

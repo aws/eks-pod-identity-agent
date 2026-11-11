@@ -106,23 +106,26 @@ func TestFetchJWTSVID_ReturnsATokenForTheRequestedAudience(t *testing.T) {
 	g.Expect(tokens[unaryAudience1]).ToNot(Equal(tokens[unaryAudience2]), "two audiences get two tokens")
 }
 
-// Two audiences in one request get one SVID carrying both, so a relying party
-// for either accepts the same token.
-func TestFetchJWTSVID_TwoAudiencesYieldOneSVIDCarryingBoth(t *testing.T) {
-	g := NewWithT(t)
+// A request with more than one audience is refused before attestation, so no
+// token is minted that one relying party could replay to another.
+func TestFetchJWTSVID_RejectsMoreThanOneAudience(t *testing.T) {
 	h := newHarness(t, func(h *harness) { unaryMintTokens(h) })
 
-	resp, err := h.client.FetchJWTSVID(h.ctxFor(podB), &workload.JWTSVIDRequest{Audience: []string{unaryAudience1, unaryAudience2}})
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(resp.GetSvids()).To(HaveLen(1))
-
-	svid := resp.GetSvids()[0]
-	g.Expect(svid.GetSpiffeId()).To(Equal(unaryIDFor(podB)))
-	for _, aud := range []string{unaryAudience1, unaryAudience2} {
-		parsed, err := jwtsvid.ParseAndValidate(svid.GetSvid(), h.jwt.bundle, []string{aud})
-		g.Expect(err).ToNot(HaveOccurred(), "the token is valid for %s", aud)
-		g.Expect(parsed.Audience).To(ConsistOf(unaryAudience1, unaryAudience2))
+	for name, audiences := range map[string][]string{
+		"two audiences":           {unaryAudience1, unaryAudience2},
+		"the same audience twice": {unaryAudience1, unaryAudience1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			_, err := h.client.FetchJWTSVID(h.ctxFor(podB), &workload.JWTSVIDRequest{Audience: audiences})
+			g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument), "%v", err)
+			g.Expect(status.Convert(err).Message()).To(ContainSubstring("exactly one audience"))
+		})
 	}
+
+	g := NewWithT(t)
+	g.Expect(h.tokens.Requests()).To(BeEmpty(), "the token source is never asked")
+	g.Expect(h.attestor.Calls()).To(BeZero(), "the caller is not attested")
 }
 
 // The handler hands the token source the workload its attestor returned and the
@@ -133,7 +136,7 @@ func TestFetchJWTSVID_PassesTheAttestedWorkloadAndAudiences(t *testing.T) {
 
 	_, err := h.client.FetchJWTSVID(h.ctxFor(podA), &workload.JWTSVIDRequest{Audience: []string{unaryAudience1}})
 	g.Expect(err).ToNot(HaveOccurred())
-	_, err = h.client.FetchJWTSVID(h.ctxFor(podB), &workload.JWTSVIDRequest{Audience: []string{unaryAudience2, unaryAudience1}})
+	_, err = h.client.FetchJWTSVID(h.ctxFor(podB), &workload.JWTSVIDRequest{Audience: []string{unaryAudience2}})
 	g.Expect(err).ToNot(HaveOccurred())
 
 	requests := h.tokens.Requests()
@@ -141,7 +144,7 @@ func TestFetchJWTSVID_PassesTheAttestedWorkloadAndAudiences(t *testing.T) {
 	g.Expect(requests[0].Workload).To(BeIdenticalTo(podA))
 	g.Expect(requests[0].Audiences).To(Equal([]string{unaryAudience1}))
 	g.Expect(requests[1].Workload).To(BeIdenticalTo(podB))
-	g.Expect(requests[1].Audiences).To(Equal([]string{unaryAudience2, unaryAudience1}))
+	g.Expect(requests[1].Audiences).To(Equal([]string{unaryAudience2}))
 }
 
 func TestFetchJWTSVID_RejectsAMissingOrEmptyAudience(t *testing.T) {
@@ -164,7 +167,7 @@ func TestFetchJWTSVID_RejectsAMissingOrEmptyAudience(t *testing.T) {
 func TestFetchJWTSVID_FiltersByTheRequestedSpiffeID(t *testing.T) {
 	g := NewWithT(t)
 	h := newHarness(t, func(h *harness) { unaryMintTokens(h) })
-	audiences := []string{unaryAudience1, unaryAudience2}
+	audiences := []string{unaryAudience1}
 
 	resp, err := h.client.FetchJWTSVID(h.ctxFor(podA), &workload.JWTSVIDRequest{Audience: audiences, SpiffeId: unaryIDFor(podA)})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -203,7 +206,7 @@ func TestFetchJWTSVID_TakesNoLeaseAndSubscribesToNothing(t *testing.T) {
 	g := NewWithT(t)
 	h := newHarness(t, func(h *harness) { unaryMintTokens(h) })
 
-	_, err := h.client.FetchJWTSVID(h.ctxFor(podA), &workload.JWTSVIDRequest{Audience: []string{unaryAudience1, unaryAudience2}})
+	_, err := h.client.FetchJWTSVID(h.ctxFor(podA), &workload.JWTSVIDRequest{Audience: []string{unaryAudience1}})
 	g.Expect(err).ToNot(HaveOccurred())
 
 	g.Expect(h.bundles.LeaseCalls()).To(BeZero())

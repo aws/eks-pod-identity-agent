@@ -384,7 +384,7 @@ func conformanceJWTHarness(t *testing.T) (*harness, map[string]string) {
 
 // conformanceAudienceSets are the audience sets conformanceJWTHarness mints
 // tokens for, in the order go-spiffe sends them.
-var conformanceAudienceSets = [][]string{{"aud-1"}, {"aud-2"}, {"aud-1", "aud-2"}}
+var conformanceAudienceSets = [][]string{{"aud-1"}, {"aud-2"}}
 
 func TestFetchJWTSVID_GoSpiffeFetchesATokenForItsAudiences(t *testing.T) {
 	g := NewWithT(t)
@@ -409,16 +409,14 @@ func TestFetchJWTSVID_GoSpiffeFetchesATokenForItsAudiences(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(bySubject.Marshal()).To(Equal(tokens["aud-1"]))
 
-	// ExtraAudiences go in the same request, and the one token carries them all,
-	// which is what a relying party for either audience checks.
-	both, err := client.FetchJWTSVID(ctx, jwtsvid.Params{Audience: "aud-1", ExtraAudiences: []string{"aud-2"}})
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(both.Audience).To(ConsistOf("aud-1", "aud-2"))
-	g.Expect(both.Marshal()).To(Equal(tokens["aud-1 aud-2"]))
+	// ExtraAudiences go in the same request, which the agent refuses: a token
+	// carries exactly one audience. The token source is never asked.
+	_, err = client.FetchJWTSVID(ctx, jwtsvid.Params{Audience: "aud-1", ExtraAudiences: []string{"aud-2"}})
+	g.Expect(status.Code(err)).To(Equal(codes.InvalidArgument), "a request with two audiences: %v", err)
 
 	requests := h.tokens.Requests()
-	g.Expect(requests).To(HaveLen(4))
-	for i, want := range [][]string{{"aud-1"}, {"aud-2"}, {"aud-1"}, {"aud-1", "aud-2"}} {
+	g.Expect(requests).To(HaveLen(3))
+	for i, want := range [][]string{{"aud-1"}, {"aud-2"}, {"aud-1"}} {
 		g.Expect(requests[i].Workload).To(BeIdenticalTo(podA))
 		g.Expect(requests[i].Audiences).To(Equal(want))
 	}
