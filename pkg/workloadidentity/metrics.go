@@ -70,6 +70,13 @@ const (
 	MetricRPCTotal = "workload_identity_rpc_total"
 	// MetricRPCDuration observes served RPC latency. Workload API and SDS handlers: {rpc, outcome}.
 	MetricRPCDuration = "workload_identity_rpc_duration_seconds"
+	// MetricRPCRetryTotal counts retries of an RPC step that failed with a
+	// retryable error. Workload API and SDS handlers: {rpc, error}.
+	//
+	// A stream blocked on a retryable error answers nothing and is not counted
+	// on MetricRPCTotal when its client gives up, so this is the only metric on
+	// which a workload stuck waiting for its identity shows up, by cause.
+	MetricRPCRetryTotal = "workload_identity_rpc_retry_total"
 	// MetricVolumeMountTotal counts CSI publishes and unpublishes of the socket
 	// directory. CSI driver: {operation, outcome}.
 	MetricVolumeMountTotal = "workload_identity_volume_mount_total"
@@ -298,6 +305,7 @@ func MetricNames() []string {
 		MetricCredentialSourceTotal,
 		MetricRPCTotal,
 		MetricRPCDuration,
+		MetricRPCRetryTotal,
 		MetricVolumeMountTotal,
 		MetricRegistrationTotal,
 	}

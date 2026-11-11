@@ -29,7 +29,15 @@ type RPCState struct {
 	// stream's failures never slow another's retries.
 	backoff wait.Backoff
 	initial wait.Backoff
+	// retries counts retryable failures since the RPC started, for the log.
+	retries int
 }
+
+// retryWarnAfter is how long an RPC may keep retrying before each retry is
+// logged at Warn rather than Debug. A cold start is multi-hop and can retry
+// for a few seconds, which is normal; past this, the workload is stuck and the
+// retry log line is the only place the agent says why. A var for tests.
+var retryWarnAfter = 10 * time.Second
 
 // NewRPCState starts the clock for one RPC.
 func NewRPCState(rpc string, backoff wait.Backoff) *RPCState {
@@ -54,11 +62,33 @@ func (s *RPCState) Await(ctx context.Context, signals <-chan struct{}, op func()
 		}
 
 		delay := s.backoff.Step()
-		logger.FromContext(ctx).WithField("rpc", s.rpc).Debugf("Retrying the stream in %s: %v", delay, err)
+		s.logRetry(ctx, delay, err)
 		if !s.wait(ctx, signals, delay) {
 			return s.Ended(ctx)
 		}
 	}
+}
+
+// logRetry counts a retryable failure and logs it with its cause. The context's
+// logger already names the pod once the RPC has attested its caller. Early
+// retries are Debug, since a cold start retries briefly; once the RPC has been
+// retrying for retryWarnAfter they are Warn, so a workload stuck waiting for its
+// identity, for example on a session EKS Auth keeps failing, is visible at the
+// default log level with the error that holds it.
+func (s *RPCState) logRetry(ctx context.Context, delay time.Duration, err error) {
+	s.retries++
+	observeRetry(s.rpc, err)
+	elapsed := time.Since(s.start)
+	log := logger.FromContext(ctx).
+		WithField("rpc", s.rpc).
+		WithField("error-label", errors.MetricLabel(err)).
+		WithField("attempt", s.retries).
+		WithField("waiting-for", elapsed.Round(time.Second).String())
+	if elapsed < retryWarnAfter {
+		log.Debugf("Retrying the stream in %s: %v", delay, err)
+		return
+	}
+	log.Warnf("Workload identity RPC still not answered, retrying in %s: %v", delay, err)
 }
 
 // wait blocks for delay, or until a signal arrives, and reports false if ctx
@@ -126,13 +156,20 @@ func (e SendError) Error() string { return e.Err.Error() }
 func (e SendError) Unwrap() error { return e.Err }
 
 // LogFailure logs an error a handler answers with, at the level the error's own
-// mapping decides: one that maps to Internal is unexpected and ours to act on,
-// and the rest are refusals the caller can do something about.
+// mapping decides. One that maps to Internal is unexpected and ours to act on,
+// so it is Error. A refusal of the workload's identity (permission denied,
+// failed precondition, unavailable) is Warn, since the workload is now without
+// an identity and an operator has to act on its cause, such as an attestation
+// policy, a role's permissions or EKS Auth. A refusal of the caller's own input
+// (invalid argument and the like) is Info, since only the caller can fix it.
 func LogFailure(ctx context.Context, rpc string, err error) {
-	log := logger.FromContext(ctx).WithField("rpc", rpc)
-	if StatusCode(err) == codes.Internal {
+	log := logger.FromContext(ctx).WithField("rpc", rpc).WithField("error-label", errors.MetricLabel(err))
+	switch StatusCode(err) {
+	case codes.Internal:
 		log.Errorf("Unexpected error serving a workload identity RPC: %v", err)
-		return
+	case codes.PermissionDenied, codes.FailedPrecondition, codes.Unavailable:
+		log.Warnf("Refusing the call: %v", err)
+	default:
+		log.Infof("Refusing the call: %v", err)
 	}
-	log.Infof("Refusing the call: %v", err)
 }

@@ -31,7 +31,20 @@ var (
 		Help:    "Latency of workload identity RPCs to their answer, by RPC and outcome.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{workloadidentity.LabelRPC, workloadidentity.LabelOutcome})
+
+	// promRPCRetryTotal counts each retry of a step that failed retryably, by the
+	// error that caused it, so a stream blocked waiting for its identity is
+	// visible while it waits and after its client gives up.
+	promRPCRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: workloadidentity.MetricRPCRetryTotal,
+		Help: "Count of retries of a workload identity RPC step after a retryable error, by RPC and error label.",
+	}, []string{workloadidentity.LabelRPC, workloadidentity.LabelError})
 )
+
+// observeRetry records one retry of an RPC step that failed with err.
+func observeRetry(rpc string, err error) {
+	promRPCRetryTotal.WithLabelValues(rpc, rpcErrorLabel(err)).Inc()
+}
 
 // ObserveRPC records one answer on both RPC metrics: a unary call's result, or a
 // stream's first response or the error that ended it before one. err is the

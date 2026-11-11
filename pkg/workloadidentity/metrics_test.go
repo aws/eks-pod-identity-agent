@@ -309,6 +309,7 @@ func TestMetricNames_Declared_MatchesExpectedListExactly(t *testing.T) {
 		"workload_identity_credential_source_total",
 		"workload_identity_rpc_total",
 		"workload_identity_rpc_duration_seconds",
+		"workload_identity_rpc_retry_total",
 		"workload_identity_volume_mount_total",
 		"workload_identity_registration_total",
 	}
@@ -364,6 +365,7 @@ func TestMetricNames_ByInstrumentKind_HasExpectedSuffix(t *testing.T) {
 		{name: "credential source counter", metric: MetricCredentialSourceTotal, wantSuffix: "_total"},
 		{name: "rpc counter", metric: MetricRPCTotal, wantSuffix: "_total"},
 		{name: "rpc histogram", metric: MetricRPCDuration, wantSuffix: "_duration_seconds"},
+		{name: "rpc retry counter", metric: MetricRPCRetryTotal, wantSuffix: "_total"},
 		{name: "volume mount counter", metric: MetricVolumeMountTotal, wantSuffix: "_total"},
 		{name: "registration counter", metric: MetricRegistrationTotal, wantSuffix: "_total"},
 		// The only gauge carries neither suffix, because it is a level rather
