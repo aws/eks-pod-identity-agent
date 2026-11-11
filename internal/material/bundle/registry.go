@@ -250,23 +250,9 @@ func (r *Registry) read(ctx context.Context, w *workloadidentity.Workload) (*pro
 		return nil, nil, err
 	}
 	sign := func(ctx context.Context) (aws.Credentials, error) {
-		creds, err := r.opts.Signer.Credentials(ctx, providerArn, []*workloadidentity.Workload{w})
-		if err != nil {
-			return aws.Credentials{}, readerSessionError(err)
-		}
-		return creds, nil
+		return r.opts.Signer.Credentials(ctx, providerArn, []*workloadidentity.Workload{w})
 	}
 	return entry.source, sign, nil
-}
-
-// readerSessionError returns the reader's own session error from a signer failure, so the
-// reader sees its session's code, or err when the failure holds none.
-func readerSessionError(err error) error {
-	var sessionErr *wierrors.WorkloadIdentityError
-	if errors.As(errors.Unwrap(err), &sessionErr) && sessionErr != nil {
-		return sessionErr
-	}
-	return err
 }
 
 // resolve names the workload's provider and returns its entry and ARN, learning

@@ -939,28 +939,3 @@ func TestRegistry_ConcurrentLeasesReadsRefreshesAndSweeps_AreRaceFree(t *testing
 		g.Expect(leases == -1 || leases == 0).To(BeTrue(), "every lease was released: %s has %d", arn, leases)
 	}
 }
-
-func TestRegistry_FirstRead_WhenTheReadersSessionFailsToSign_ReturnsTheSessionError(t *testing.T) {
-	g := NewWithT(t)
-	sessions := newTestSessions()
-	sessions.fail("own-pod", wierrors.ErrSessionFailed.Wrapf(nil, "EKS Auth failed"))
-	fetcher := &fakeFetcher{respond: fixed(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))})}
-	registry, err := New(Opts{
-		Fetcher:   fetcher,
-		Notifier:  &fake.Subscriber{},
-		Providers: resolverFunc(func(context.Context, *workloadidentity.Workload) (string, error) { return testProviderArn, nil }),
-		Signer:    WorkloadSessionSigner(sessions),
-	})
-	g.Expect(err).ToNot(HaveOccurred())
-
-	_, err = registry.X509Bundles(context.Background(), ownPod)
-
-	g.Expect(err).To(MatchError(wierrors.ErrSessionFailed))
-	g.Expect(wierrors.MetricLabel(err)).To(Equal("session_failed"))
-	g.Expect(fetcher.arns).To(BeEmpty(), "nothing is fetched without a signature")
-
-	sessions.assign("own-pod", otherProviderArn)
-	_, err = registry.X509Bundles(context.Background(), ownPod)
-
-	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable), "a session for another provider is not a session error")
-}
