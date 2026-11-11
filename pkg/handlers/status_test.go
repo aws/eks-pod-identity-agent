@@ -39,7 +39,7 @@ var pinnedStatusCodes = map[errors.Kind]codes.Code{
 	errors.KindInvalidToken:       codes.InvalidArgument,
 	errors.KindInvalidRequest:     codes.InvalidArgument,
 	errors.KindNoIdentity:         codes.PermissionDenied,
-	errors.KindSessionInvalid:     codes.InvalidArgument,
+	errors.KindSessionInvalid:     codes.FailedPrecondition,
 	errors.KindSessionFailed:      codes.Internal,
 	errors.KindSessionNotFound:    codes.Internal,
 }
