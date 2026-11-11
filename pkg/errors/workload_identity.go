@@ -42,6 +42,12 @@ const (
 	KindInvalidRequest
 	// KindNoIdentity is the kind of ErrNoIdentity.
 	KindNoIdentity
+	// KindSessionInvalid is the kind of ErrSessionInvalid.
+	KindSessionInvalid
+	// KindSessionFailed is the kind of ErrSessionFailed.
+	KindSessionFailed
+	// KindSessionNotFound is the kind of ErrSessionNotFound.
+	KindSessionNotFound
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -200,7 +206,7 @@ var (
 
 	// ErrSessionRefused is produced by the session provider when EKS Auth
 	// refuses the exchange with AccessDenied (such as a role missing
-	// sts:SetContext) or InvalidToken. Not retryable: a repeat gets the same
+	// sts:SetContext), InvalidToken or ExpiredToken. Not retryable: a repeat gets the same
 	// answer. It is distinct from ErrSessionUnavailable so a misconfigured role
 	// or node does not read as an EKS Auth outage.
 	ErrSessionRefused = newWorkloadIdentityError(KindSessionRefused, "session_refused", false)
@@ -231,6 +237,20 @@ var (
 	// caller holds no SVID matching its request, which is SPIRE's "no identity
 	// issued". Not retryable: a repeat of the same request matches nothing again.
 	ErrNoIdentity = newWorkloadIdentityError(KindNoIdentity, "no_identity", false)
+
+	// ErrSessionInvalid is produced by the session provider when EKS Auth
+	// rejects the exchange with InvalidRequest. Not retryable: the same
+	// request is rejected the same way.
+	ErrSessionInvalid = newWorkloadIdentityError(KindSessionInvalid, "session_invalid", false)
+
+	// ErrSessionFailed is produced by the session provider when EKS Auth
+	// fails the exchange with InternalServer. Not retryable.
+	ErrSessionFailed = newWorkloadIdentityError(KindSessionFailed, "session_failed", false)
+
+	// ErrSessionNotFound is produced by the session provider when EKS Auth
+	// answers ResourceNotFound: no pod identity association, or no cluster.
+	// Not retryable.
+	ErrSessionNotFound = newWorkloadIdentityError(KindSessionNotFound, "session_not_found", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -294,5 +314,8 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrInvalidToken,
 		ErrInvalidRequest,
 		ErrNoIdentity,
+		ErrSessionInvalid,
+		ErrSessionFailed,
+		ErrSessionNotFound,
 	}
 }

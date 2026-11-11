@@ -357,13 +357,22 @@ func (p *Provider) sessionError(err error, podUID string) error {
 	}
 	var notFound *types.ResourceNotFoundException
 	if errors.As(err, &notFound) {
-		return wierrors.ErrNotEnrolled.Wrapf(err, "EKS Auth found no pod identity association for pod %s in cluster %q",
+		return wierrors.ErrSessionNotFound.Wrapf(err, "EKS Auth found no pod identity association for pod %s in cluster %q",
 			podUID, p.clusterName)
 	}
 	var denied *types.AccessDeniedException
 	var invalidToken *types.InvalidTokenException
-	if errors.As(err, &denied) || errors.As(err, &invalidToken) {
+	var expiredToken *types.ExpiredTokenException
+	if errors.As(err, &denied) || errors.As(err, &invalidToken) || errors.As(err, &expiredToken) {
 		return wierrors.ErrSessionRefused.Wrapf(err, "EKS Auth refused a session for pod %s", podUID)
+	}
+	var invalidRequest *types.InvalidRequestException
+	if errors.As(err, &invalidRequest) {
+		return wierrors.ErrSessionInvalid.Wrapf(err, "EKS Auth rejected the session request for pod %s", podUID)
+	}
+	var internal *types.InternalServerException
+	if errors.As(err, &internal) {
+		return wierrors.ErrSessionFailed.Wrapf(err, "EKS Auth failed the session exchange for pod %s", podUID)
 	}
 	return wierrors.ErrSessionUnavailable.Wrapf(err, "exchanging a token with EKS Auth for pod %s", podUID)
 }

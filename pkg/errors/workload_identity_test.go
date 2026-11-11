@@ -147,6 +147,24 @@ func taxonomyCases() []taxonomyCase {
 			expectedLabel:     "no_identity",
 			expectedRetryable: false,
 		},
+		{
+			name:          "session invalid",
+			err:           ErrSessionInvalid,
+			expectedKind:  KindSessionInvalid,
+			expectedLabel: "session_invalid",
+		},
+		{
+			name:          "session failed",
+			err:           ErrSessionFailed,
+			expectedKind:  KindSessionFailed,
+			expectedLabel: "session_failed",
+		},
+		{
+			name:          "session not found",
+			err:           ErrSessionNotFound,
+			expectedKind:  KindSessionNotFound,
+			expectedLabel: "session_not_found",
+		},
 	}
 }
 
@@ -353,7 +371,7 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 	g := NewWithT(t)
 	taxonomy := WorkloadIdentityTaxonomy()
 
-	g.Expect(taxonomy).To(HaveLen(15))
+	g.Expect(taxonomy).To(HaveLen(18))
 
 	seenKinds := make(map[Kind]bool, len(taxonomy))
 	seenLabels := make(map[string]bool, len(taxonomy))
@@ -375,8 +393,8 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		g.Expect(MetricLabel(member)).ToNot(Equal(MetricLabelUnknown))
 	}
 
-	g.Expect(seenKinds).To(HaveLen(15))
-	g.Expect(seenLabels).To(HaveLen(15))
+	g.Expect(seenKinds).To(HaveLen(18))
+	g.Expect(seenLabels).To(HaveLen(18))
 
 	// every sentinel declared in the package is reachable from the taxonomy
 	g.Expect(taxonomy).To(ConsistOf(
@@ -395,6 +413,9 @@ func TestWorkloadIdentityTaxonomy_AllMembers_AreContiguousDistinctAndLabelled(t 
 		ErrInvalidToken,
 		ErrInvalidRequest,
 		ErrNoIdentity,
+		ErrSessionInvalid,
+		ErrSessionFailed,
+		ErrSessionNotFound,
 	))
 }
 

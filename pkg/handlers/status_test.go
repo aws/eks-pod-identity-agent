@@ -39,6 +39,9 @@ var pinnedStatusCodes = map[errors.Kind]codes.Code{
 	errors.KindInvalidToken:       codes.InvalidArgument,
 	errors.KindInvalidRequest:     codes.InvalidArgument,
 	errors.KindNoIdentity:         codes.PermissionDenied,
+	errors.KindSessionInvalid:     codes.InvalidArgument,
+	errors.KindSessionFailed:      codes.Internal,
+	errors.KindSessionNotFound:    codes.Internal,
 }
 
 // TestStatusCode_IsTotalOverTaxonomy is the tripwire the mapping exists for. A
@@ -54,7 +57,8 @@ func TestStatusCode_IsTotalOverTaxonomy(t *testing.T) {
 	for _, member := range taxonomy {
 		code := StatusCode(member)
 
-		g.Expect(code).ToNot(Equal(codes.Internal),
+		_, mapped := statusCodes[member.Kind()]
+		g.Expect(mapped).To(BeTrue(),
 			"%s has no entry in statusCodes, so it reaches a workload as Internal: add one", member.MetricLabel())
 		g.Expect(code).ToNot(Equal(codes.OK),
 			"%s maps to OK, but OK is only for a nil error", member.MetricLabel())

@@ -42,7 +42,7 @@ var statusCodes = map[errors.Kind]codes.Code{
 	errors.KindSessionUnavailable: codes.Unavailable,
 
 	// PermissionDenied: EKS Auth understood the caller's identity and rejected it
-	// with AccessDenied or InvalidToken, and a repeat gets the same answer.
+	// with AccessDenied, InvalidToken or ExpiredToken, and a repeat gets the same answer.
 	errors.KindSessionRefused: codes.PermissionDenied,
 
 	// Unavailable: STS issuance failed transiently, as SPIRE answers its own SVID
@@ -77,6 +77,15 @@ var statusCodes = map[errors.Kind]codes.Code{
 	// PermissionDenied: SPIRE's "no identity issued", for a caller holding no SVID
 	// that matches what it asked for.
 	errors.KindNoIdentity: codes.PermissionDenied,
+
+	// InvalidArgument: EKS Auth rejected the exchange with InvalidRequest.
+	errors.KindSessionInvalid: codes.InvalidArgument,
+
+	// Internal: EKS Auth failed the exchange with InternalServer.
+	errors.KindSessionFailed: codes.Internal,
+
+	// Internal: EKS Auth answered ResourceNotFound.
+	errors.KindSessionNotFound: codes.Internal,
 }
 
 // StatusCode returns the code a caller on the workload identity socket sees for

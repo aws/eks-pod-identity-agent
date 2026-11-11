@@ -384,7 +384,7 @@ func TestSessionProvider_ARecoverableRefreshFailureKeepsTheOldSessionWhileValid(
 		if n == 1 {
 			return h.sessionLiving(n, lifetime), nil
 		}
-		return nil, eksauthtest.InternalServer()
+		return nil, eksauthtest.ServiceUnavailable()
 	})
 	first, err := h.session(testSessionPodUID)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -575,7 +575,7 @@ func TestSessionProvider_ASessionPastExpiryIsNeverReturned(t *testing.T) {
 	g.Expect(second.Credentials.AccessKeyID).To(Equal(exchangeKey(2)), "at the floor the session must be exchanged again")
 	g.Expect(h.cacheCount(workloadidentity.CacheResultExpired)).To(Equal(1.0))
 
-	h.server.SetError(eksauthtest.InternalServer())
+	h.server.SetError(eksauthtest.ServiceUnavailable())
 	h.clock.Set(second.ExpiresAt.Add(time.Minute))
 	got, err = h.session(testSessionPodUID)
 	g.Expect(got).To(BeNil(), "an expired session must never be returned, even when the exchange fails")
@@ -1090,8 +1090,8 @@ func TestSessionProvider_ExchangeErrorMapping(t *testing.T) {
 			wantAPICode: "AccessDeniedException", wantCalls: 1,
 		},
 		{
-			name: "ExpiredToken", setup: withAPIError(eksauthtest.ExpiredToken()),
-			wantKind: wierrors.ErrSessionUnavailable, wantRetryable: true,
+			name: "ExpiredToken is a refusal", setup: withAPIError(eksauthtest.ExpiredToken()),
+			wantKind:    wierrors.ErrSessionRefused,
 			wantAPICode: "ExpiredTokenException", wantCalls: 1,
 		},
 		{
@@ -1100,8 +1100,8 @@ func TestSessionProvider_ExchangeErrorMapping(t *testing.T) {
 			wantAPICode: "InvalidParameterException", wantCalls: 1,
 		},
 		{
-			name: "InvalidRequest", setup: withAPIError(eksauthtest.InvalidRequest()),
-			wantKind: wierrors.ErrSessionUnavailable, wantRetryable: true,
+			name: "InvalidRequest is invalid", setup: withAPIError(eksauthtest.InvalidRequest()),
+			wantKind:    wierrors.ErrSessionInvalid,
 			wantAPICode: "InvalidRequestException", wantCalls: 1,
 		},
 		{
@@ -1112,8 +1112,8 @@ func TestSessionProvider_ExchangeErrorMapping(t *testing.T) {
 		{
 			// EKS Auth answers the same for a cluster it can't resolve, so the
 			// message names the cluster.
-			name: "ResourceNotFound is not enrolled", setup: withAPIError(eksauthtest.ResourceNotFound()),
-			wantKind:    wierrors.ErrNotEnrolled,
+			name: "ResourceNotFound is not found", setup: withAPIError(eksauthtest.ResourceNotFound()),
+			wantKind:    wierrors.ErrSessionNotFound,
 			wantAPICode: "ResourceNotFoundException", wantCalls: 1,
 			wantMessage: fmt.Sprintf("in cluster %q", testClusterName),
 		},
@@ -1123,9 +1123,9 @@ func TestSessionProvider_ExchangeErrorMapping(t *testing.T) {
 			wantAPICode: "ThrottlingException", wantCalls: 1,
 		},
 		{
-			name:     "InternalServer, which is also how EKS Auth reports STS throttling",
-			setup:    withAPIError(eksauthtest.InternalServer()),
-			wantKind: wierrors.ErrSessionUnavailable, wantRetryable: true,
+			name:        "InternalServer, which is also how EKS Auth reports STS throttling",
+			setup:       withAPIError(eksauthtest.InternalServer()),
+			wantKind:    wierrors.ErrSessionFailed,
 			wantAPICode: "InternalServerException", wantCalls: 1,
 		},
 		{
