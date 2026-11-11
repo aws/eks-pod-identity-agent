@@ -40,8 +40,8 @@ type WorkloadIdentityServerOpts struct {
 	// Off, it builds no workload identity tier, so boot needs no API server.
 	// Validate does not read it.
 	Enabled bool
-	// Cfg is the AWS configuration the STS and EKS Auth clients are built from,
-	// and that signs the node client's IAM token.
+	// Cfg is the AWS configuration the STS and EKS Auth clients are built from.
+	// The node client and GetTrustBundles sign with the node credentials cache.
 	Cfg aws.Config
 	// NodeKubeconfig is the kubeconfig the node client reads. Empty means the
 	// in-cluster server and CA. See kube.NodeClientOpts.

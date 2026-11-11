@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/configuration"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/attestation"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/noderole"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/kube"
@@ -21,6 +24,7 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/notify"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/session"
+	"go.amzn.com/eks/eks-pod-identity-agent/internal/sharedcredsrotater"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/tokenminter"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/grpcserver"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers"
@@ -30,46 +34,85 @@ import (
 )
 
 // workloadIdentityClients is what workload identity reaches the API server with,
-// built once by createServers before the credential manager: the node name the
-// agent authenticates as, the synced node-scoped pod store and the cached token
-// minter. The minter is the one token cache, shared by the session tier's
-// exchanges and the credential cache's refreshes. The attestor resolves callers
-// from the pod store, and the minter and every per-pod tier drop a pod it reports
-// deleted.
+// built once by createServers before the credential manager: the node's AWS
+// credentials, the node name the agent authenticates as, the synced node-scoped
+// pod store and the cached token minter. The node client and GetTrustBundles
+// sign with the node's credentials. The minter is the one token cache, shared by
+// the session tier's exchanges and the credential cache's refreshes. The
+// attestor resolves callers from the pod store, and the minter and every per-pod
+// tier drop a pod it reports deleted.
 type workloadIdentityClients struct {
-	nodeName string
-	podStore *podstore.Store
-	minter   workloadidentity.TokenMinter
+	nodeCredentials *noderole.Cache
+	nodeName        string
+	podStore        *podstore.Store
+	minter          workloadidentity.TokenMinter
 }
 
 // newNodeClient builds the node client. Tests replace it.
 var newNodeClient = kube.NewNodeClient
 
+// loadDefaultConfig is config.LoadDefaultConfig. Tests replace it.
+var loadDefaultConfig = config.LoadDefaultConfig
+
+// newNodeCredentialsSource returns a new source of the node's credentials, so
+// the cache's invalidation doesn't touch the EKS Auth client's. On error it
+// falls back to the agent's own, wrapped so the cache can't invalidate them. It
+// never fails startup. Tests replace it.
+var newNodeCredentialsSource = func(ctx context.Context, fallback aws.CredentialsProvider) aws.CredentialsProvider {
+	if rotateCredentials {
+		return sharedcredsrotater.NewRotatingSharedCredentialsProvider()
+	}
+	cfg, err := loadDefaultConfig(ctx)
+	if err == nil && cfg.Credentials != nil {
+		return cfg.Credentials
+	}
+	logger.FromContext(ctx).WithError(err).Warn("Couldn't resolve a separate source of the node's AWS credentials, " +
+		"so the node credentials cache renews from the agent's own")
+	return aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+		if fallback == nil {
+			return aws.Credentials{}, errors.New("the agent has no AWS credentials")
+		}
+		return fallback.Retrieve(ctx)
+	})
+}
+
 // newWorkloadIdentityClients builds the clients when workload identity is on,
 // blocking until the node name resolves and the pod store syncs. Off, it builds
 // nothing and returns nil, so boot needs no API server.
+//
+// The node client signs with the node credentials cache. Building the cache
+// fetches nothing.
 func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts) (*workloadIdentityClients, error) {
 	if !opts.Enabled {
 		return nil, nil
 	}
+	nodeCredentials, err := noderole.New(newNodeCredentialsSource(ctx, opts.Cfg.Credentials))
+	if err != nil {
+		return nil, fmt.Errorf("building the node credentials cache: %w", err)
+	}
+	nodeCfg := opts.Cfg.Copy()
+	nodeCfg.Credentials = nodeCredentials
 	clientset, err := newNodeClient(kube.NodeClientOpts{
 		KubeconfigPath: opts.NodeKubeconfig,
-		Cfg:            opts.Cfg,
+		Cfg:            nodeCfg,
 		ClusterName:    opts.ClusterName,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return buildWorkloadIdentityClients(ctx, opts, clientset)
+	return buildWorkloadIdentityClients(ctx, opts, clientset, nodeCredentials)
 }
 
 // buildWorkloadIdentityClients is newWorkloadIdentityClients past the node
-// client, so a test can drive it with a fake clientset. The node name's retry
-// comes first, so the pod store's list and the minter's pre-flight reach an API
-// server that has answered. The store syncs before the minter is built, so the
-// minter drops deleted pods' tokens from its first mint.
+// client, so a test can pass fakes. The node name's retry comes first, so the pod
+// store's list and the minter's pre-flight reach an API server that has answered.
+// The store syncs before the minter is built, so the minter drops deleted pods'
+// tokens from its first mint.
 func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
-	clientset kubernetes.Interface) (*workloadIdentityClients, error) {
+	clientset kubernetes.Interface, nodeCredentials *noderole.Cache) (*workloadIdentityClients, error) {
+	if nodeCredentials == nil {
+		return nil, errors.New("workload identity needs the node's AWS credentials")
+	}
 	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, clientset)
 	if err != nil {
 		return nil, err
@@ -87,7 +130,7 @@ func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIde
 	if err != nil {
 		return nil, fmt.Errorf("building the token minter: %w", err)
 	}
-	return &workloadIdentityClients{nodeName: nodeName, podStore: podStore, minter: minter}, nil
+	return &workloadIdentityClients{nodeCredentials: nodeCredentials, nodeName: nodeName, podStore: podStore, minter: minter}, nil
 }
 
 // credentialTokens is the token source the credential cache refreshes with: the
@@ -100,8 +143,8 @@ func (c *workloadIdentityClients) credentialTokens() credcache.TokenSource {
 }
 
 // workloadIdentityServers is what the workload identity feature runs: the gRPC
-// server on its socket and the trust bundle refresh loop, over the clients
-// createServers built, whose pod store has already synced. Off, it builds nothing.
+// server, the trust bundle refresh loop and the node credentials renewal loop.
+// Off, it builds nothing.
 func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients) ([]runnable, error) {
 	if !opts.Enabled {
@@ -138,7 +181,11 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	// leave the socket on disk. The gRPC server's own shutdown defers the same.
 	logrus.RegisterExitHandler(server.RemoveSocket)
 
-	return []runnable{server, backgroundLoop{name: "trust-bundle-refresh", run: tiers.bundleSource.Run}}, nil
+	return []runnable{
+		server,
+		backgroundLoop{name: "trust-bundle-refresh", run: tiers.bundleSource.Run},
+		backgroundLoop{name: "node-credentials-renewal", run: clients.nodeCredentials.Run},
+	}, nil
 }
 
 // workloadIdentityTiers is what the workload identity socket serves from, built
@@ -196,7 +243,7 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		Fetcher:   stsClient,
 		Notifier:  hub,
 		Providers: providers,
-		Signer:    bundle.WorkloadSessionSigner(sessionProvider),
+		Signer:    bundle.NodeRoleSigner(clients.nodeCredentials),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the trust bundle tier: %w", err)

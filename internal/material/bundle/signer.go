@@ -20,9 +20,28 @@ type Signer interface {
 	Credentials(ctx context.Context, providerArn string, workloads []*workloadidentity.Workload) (aws.Credentials, error)
 }
 
-// WorkloadSessionSigner is the launch Signer: it signs with the session of the
-// first workload whose session still names the provider. With none it returns
-// ErrBundleUnavailable joining every workload's reason.
+// NodeRoleSigner signs GetTrustBundles with the node's credentials for every
+// workload, so one pod's role can't break the shared bundle for other pods. The
+// node role needs sts:GetTrustBundles.
+func NodeRoleSigner(creds aws.CredentialsProvider) Signer {
+	return nodeRoleSigner{creds: creds}
+}
+
+type nodeRoleSigner struct {
+	creds aws.CredentialsProvider
+}
+
+func (s nodeRoleSigner) Credentials(ctx context.Context, providerArn string, _ []*workloadidentity.Workload) (aws.Credentials, error) {
+	creds, err := s.creds.Retrieve(ctx)
+	if err != nil {
+		return aws.Credentials{}, wierrors.ErrBundleUnavailable.Wrapf(err, "the node's credentials cannot sign GetTrustBundles for %s", providerArn)
+	}
+	return creds, nil
+}
+
+// WorkloadSessionSigner signs with the session of the first workload whose
+// session still names the provider. With none, it returns ErrBundleUnavailable
+// joining every workload's reason. The agent uses NodeRoleSigner instead.
 func WorkloadSessionSigner(sessions workloadidentity.SessionProvider) Signer {
 	return workloadSessionSigner{sessions: sessions}
 }

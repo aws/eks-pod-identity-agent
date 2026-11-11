@@ -71,3 +71,32 @@ func TestWorkloadSessionSigner_WithNoUsableSession_IsARetryableUnavailable(t *te
 	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
 	g.Expect(err).To(MatchError(ContainSubstring("no workload to sign as")))
 }
+
+func TestNodeRoleSigner_SignsAsTheNodeWhicheverWorkloadAsks(t *testing.T) {
+	g := NewWithT(t)
+	node := aws.Credentials{AccessKeyID: "AKID-node", SecretAccessKey: "secret"}
+	signer := NodeRoleSigner(aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		return node, nil
+	}))
+
+	for _, workloads := range [][]*workloadidentity.Workload{{pod("first")}, {pod("second"), pod("first")}, nil} {
+		creds, err := signer.Credentials(context.Background(), testProviderArn, workloads)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(creds).To(Equal(node))
+	}
+}
+
+func TestNodeRoleSigner_WithNoNodeCredentials_IsARetryableUnavailable(t *testing.T) {
+	g := NewWithT(t)
+	cause := errors.New("IMDS unreachable")
+	signer := NodeRoleSigner(aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		return aws.Credentials{}, cause
+	}))
+
+	_, err := signer.Credentials(context.Background(), testProviderArn, []*workloadidentity.Workload{pod("first")})
+
+	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable))
+	g.Expect(wierrors.IsRetryable(err)).To(BeTrue())
+	g.Expect(errors.Is(err, cause)).To(BeTrue())
+	g.Expect(err).To(MatchError(ContainSubstring(testProviderArn)))
+}
