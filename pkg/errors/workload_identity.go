@@ -206,7 +206,7 @@ var (
 
 	// ErrSessionRefused is produced by the session provider when EKS Auth
 	// refuses the exchange with AccessDenied (such as a role missing
-	// sts:SetContext), InvalidToken or ExpiredToken. Not retryable: a repeat gets the same
+	// sts:SetContext) or InvalidToken. Not retryable: a repeat gets the same
 	// answer. It is distinct from ErrSessionUnavailable so a misconfigured role
 	// or node does not read as an EKS Auth outage.
 	ErrSessionRefused = newWorkloadIdentityError(KindSessionRefused, "session_refused", false)

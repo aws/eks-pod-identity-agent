@@ -42,7 +42,7 @@ var statusCodes = map[errors.Kind]codes.Code{
 	errors.KindSessionUnavailable: codes.Unavailable,
 
 	// PermissionDenied: EKS Auth understood the caller's identity and rejected it
-	// with AccessDenied, InvalidToken or ExpiredToken, and a repeat gets the same answer.
+	// with AccessDenied or InvalidToken, and a repeat gets the same answer.
 	errors.KindSessionRefused: codes.PermissionDenied,
 
 	// Unavailable: STS issuance failed transiently, as SPIRE answers its own SVID

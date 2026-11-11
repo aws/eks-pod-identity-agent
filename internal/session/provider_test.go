@@ -1090,8 +1090,8 @@ func TestSessionProvider_ExchangeErrorMapping(t *testing.T) {
 			wantAPICode: "AccessDeniedException", wantCalls: 1,
 		},
 		{
-			name: "ExpiredToken is a refusal", setup: withAPIError(eksauthtest.ExpiredToken()),
-			wantKind:    wierrors.ErrSessionRefused,
+			name: "ExpiredToken", setup: withAPIError(eksauthtest.ExpiredToken()),
+			wantKind: wierrors.ErrSessionUnavailable, wantRetryable: true,
 			wantAPICode: "ExpiredTokenException", wantCalls: 1,
 		},
 		{

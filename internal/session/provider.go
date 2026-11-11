@@ -362,8 +362,7 @@ func (p *Provider) sessionError(err error, podUID string) error {
 	}
 	var denied *types.AccessDeniedException
 	var invalidToken *types.InvalidTokenException
-	var expiredToken *types.ExpiredTokenException
-	if errors.As(err, &denied) || errors.As(err, &invalidToken) || errors.As(err, &expiredToken) {
+	if errors.As(err, &denied) || errors.As(err, &invalidToken) {
 		return wierrors.ErrSessionRefused.Wrapf(err, "EKS Auth refused a session for pod %s", podUID)
 	}
 	var invalidRequest *types.InvalidRequestException
