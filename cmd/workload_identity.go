@@ -59,10 +59,8 @@ func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdent
 	return buildWorkloadIdentityClients(ctx, opts, clientset)
 }
 
-// buildWorkloadIdentityClients is newWorkloadIdentityClients past the node
-// client, so a test can drive it with a fake clientset. The minter registers for
-// the empty store's deletions now, so it drops deleted pods' tokens from the
-// store's first sync.
+// buildWorkloadIdentityClients builds the pod store and the token minter over
+// clientset. Tests call it with a fake clientset.
 func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clientset kubernetes.Interface) (*workloadIdentityClients, error) {
 	podStore, err := podstore.New(ctx, clientset)
@@ -109,10 +107,8 @@ func (c *workloadIdentityClients) credentialTokens() credcache.TokenSource {
 	return session.MinterTokens(c.minter)
 }
 
-// workloadIdentityServers is what the workload identity feature runs: the gRPC
-// server on its socket, the trust bundle refresh loop, and the pod store sync,
-// over the clients createServers built. The socket is served from the start and
-// answers Unavailable until the sync finishes. Off, it builds nothing.
+// workloadIdentityServers returns the gRPC server, the trust bundle refresh loop
+// and the pod store sync. It returns nothing when workload identity is off.
 func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clients *workloadIdentityClients) ([]runnable, error) {
 	if !opts.Enabled {

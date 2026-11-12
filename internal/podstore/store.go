@@ -192,13 +192,9 @@ func (s *Store) Start(ctx context.Context, nodeName string) error {
 	if nodeName == "" {
 		return fmt.Errorf("node name is required to scope the pod store")
 	}
-	s.mu.Lock()
-	if s.nodeName != "" {
-		s.mu.Unlock()
-		return fmt.Errorf("pod store already started for node %q", s.nodeName)
+	if err := s.setNodeName(nodeName); err != nil {
+		return err
 	}
-	s.nodeName = nodeName
-	s.mu.Unlock()
 
 	s.factory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
@@ -209,6 +205,19 @@ func (s *Store) Start(ctx context.Context, nodeName string) error {
 		"node": nodeName,
 		"pods": len(s.indexer.ListKeys()),
 	}).Info("podstore: node-scoped pod informer synced")
+	return nil
+}
+
+// setNodeName sets the node name once. A second call is an error, so the watch
+// is never rescoped to another node. It must not hold the lock while the
+// informer lists, since the list reads the name through NodeName.
+func (s *Store) setNodeName(nodeName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nodeName != "" {
+		return fmt.Errorf("pod store already started for node %q", s.nodeName)
+	}
+	s.nodeName = nodeName
 	return nil
 }
 

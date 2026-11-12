@@ -165,12 +165,6 @@ func StreamMetadataGateInterceptor() grpc.StreamServerInterceptor {
 	}
 }
 
-// errCannotServeYet is what a call gets while the agent is starting. Unavailable
-// is the code SPIFFE clients and Envoy retry with backoff, and the one gRPC
-// reserves for a condition that clears by itself.
-var errCannotServeYet = status.Error(codes.Unavailable,
-	"the agent's workload identity feature is still initializing; retry shortly")
-
 // UnaryCanServeOnUDSInterceptor refuses unary calls with Unavailable until
 // canServeOnUDS returns true. If canServeOnUDS is nil, every call is let through.
 // It runs after the metadata gate and before the rate limiter, so retries during
@@ -179,7 +173,7 @@ func UnaryCanServeOnUDSInterceptor(canServeOnUDS func() bool) grpc.UnaryServerIn
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if canServeOnUDS != nil && !canServeOnUDS() {
 			logger.FromContext(ctx).Debugf("Refusing call while the agent is starting: %s", info.FullMethod)
-			return nil, errCannotServeYet
+			return nil, status.Error(codes.Unavailable, "workload identity is starting; retry")
 		}
 		return handler(ctx, req)
 	}
@@ -194,7 +188,7 @@ func StreamCanServeOnUDSInterceptor(canServeOnUDS func() bool) grpc.StreamServer
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if canServeOnUDS != nil && !canServeOnUDS() {
 			logger.FromContext(ss.Context()).Debugf("Refusing stream while the agent is starting: %s", info.FullMethod)
-			return errCannotServeYet
+			return status.Error(codes.Unavailable, "workload identity is starting; retry")
 		}
 		return handler(srv, ss)
 	}
