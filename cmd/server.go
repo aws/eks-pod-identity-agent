@@ -189,8 +189,8 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 	servers = append(servers, server.NewMetricsServer(fmt.Sprintf("%s:%d", metricsAddress, metricsPort), bindHosts, serverPort))
 
 	// Last, so a tier that cannot be built, or a socket that cannot be bound,
-	// fails the boot before anything is serving. A node the agent cannot attest
-	// on already failed it, in buildSharedCredentialManager.
+	// fails the boot before anything is serving. Nothing here waits for the API
+	// server: the node name and the pod store's sync run beside the servers.
 	workloadIdentity, err := workloadIdentityServers(ctx, workloadIdentityOpts, wiClients)
 	if err != nil {
 		return nil, fmt.Errorf("building the workload identity servers (--%s=false turns workload identity off): %w",
@@ -327,7 +327,7 @@ func init() {
 		"Enable consuming credentials from IMDS when available on the node")
 
 	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, false,
-		"Serve SPIFFE workload identity on its socket. When on, boot fails if the API server can't be reached as the node")
+		"Enable serving SPIFFE workload identity on a Unix socket")
 	serverCmd.Flags().StringVar(&nodeKubeconfig, handlers.FlagNodeKubeconfig, "",
 		"Kubeconfig workload identity reaches the API server with. Empty uses the in-cluster API server and CA, and the agent authenticates as the node with an IAM token signed from its AWS credentials. A kubeconfig whose user runs an exec plugin gets the same IAM token in place of the plugin; any other user (client certificate, token) is used as is, so it must be the node")
 

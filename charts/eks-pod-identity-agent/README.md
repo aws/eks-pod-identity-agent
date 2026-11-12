@@ -83,11 +83,8 @@ Two consequences:
 
 - The agent's ServiceAccount must carry no IAM role. With IRSA (or a Pod Identity association)
   on it, the agent signs as that role, can't resolve its node, and exits at boot.
-- Boot needs the `kubernetes` Service reachable, which on a new node waits for kube-proxy. The
-  agent retries for about 30 seconds (longer when connections hang, since each attempt can wait
-  up to 30 seconds to connect), then exits. Workload identity failures at boot are fatal: the
-  kubelet restarts the agent with backoff, and the Pod Identity credential endpoint on that node
-  stays down until a boot succeeds.
+- On a new node, the agent can't reach the API server until kube-proxy is running. The agent
+  starts anyway and retries in the background. See [Startup](#startup).
 
 Clusters without IAM authentication, such as kind, point the agent at a kubeconfig with a client
 certificate instead: set `agent.additionalArgs` to `{"--node-kubeconfig": <path>}` (a string flag,
@@ -96,6 +93,18 @@ so the two-argument rendering is fine) and mount the file and its certificate wi
 the `jwk-cache` volume and mount from `values.yaml` into yours (and `aws-credentials` on the
 hybrid DaemonSets). A kubeconfig whose user runs an exec plugin is read for its server and CA
 only; the agent still signs the IAM token.
+
+### Startup
+
+Until the agent has listed its node's pods, which normally takes a few seconds after it starts,
+every call on the workload identity socket is answered with gRPC status `UNAVAILABLE` (code 14).
+The agent can't tell which pod a caller belongs to before then, so it asks the caller to retry
+rather than refusing it. SPIFFE Workload API libraries such as go-spiffe, and Envoy's SDS
+client, retry `UNAVAILABLE` with backoff, so a workload that starts alongside the agent gets its
+identity once the list completes. A client that treats `UNAVAILABLE` as fatal has to retry it.
+
+The agent's readiness probe doesn't wait for the list, and neither does the Pod Identity
+credential endpoint, which serves requests as before.
 
 ### CSI driver
 
@@ -115,7 +124,9 @@ removes the sidecar, so first stop enrolling pods and roll the enrolled ones: a 
 volume names this driver can't unmount it once the driver is gone and stays `Terminating`.
 
 The sidecar registers only once the agent's socket answers, so enrolled pods wait in
-`ContainerCreating` rather than start with an empty socket directory. After registration an
+`ContainerCreating` rather than start with an empty socket directory. The socket answers as
+soon as the agent starts, so a pod can reach it while it still answers `UNAVAILABLE`; see
+[Startup](#startup). After registration an
 agent restart is harmless: pods mount the socket directory, not the socket.
 
 ### Sidecar mounts and privilege

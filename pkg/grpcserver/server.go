@@ -175,6 +175,11 @@ type Opts struct {
 	// PeerPidfd lets callers be pinned by SO_PEERPIDFD where the kernel has it.
 	// Off, every caller is pinned through its /proc handle.
 	PeerPidfd bool
+	// CanServeOnUDS reports whether the services can answer yet. Until it does, every
+	// call is refused with Unavailable, which SPIFFE clients and Envoy retry. In
+	// production it is the pod store having synced, which the agent no longer
+	// waits for before serving. Nil means always.
+	CanServeOnUDS func() bool
 }
 
 // New binds the socket and returns a server ready to be driven.
@@ -228,6 +233,7 @@ func serverOptions(opts Opts, creds credentials.TransportCredentials) []grpc.Ser
 	chain := []interceptorPair{
 		{Unary: UnaryLoggerInterceptor(), Stream: StreamLoggerInterceptor()},
 		{Unary: UnaryMetadataGateInterceptor(), Stream: StreamMetadataGateInterceptor()},
+		{Unary: UnaryCanServeOnUDSInterceptor(opts.CanServeOnUDS), Stream: StreamCanServeOnUDSInterceptor(opts.CanServeOnUDS)},
 		{Unary: UnaryRateLimitInterceptor(limiter), Stream: StreamRateLimitInterceptor(limiter)},
 	}
 
@@ -270,7 +276,7 @@ func (s *Server) ListenUntilContextCancelled(ctx context.Context) {
 	log := logger.FromContext(ctx)
 
 	// Deferred rather than done at the end, so the socket is cleaned up on every way
-	// out of this function: the ordinary shutdown below, the fatal path when Serve
+	// out of this function: the ordinary shutdown below, the early return when Serve
 	// fails, and a panic unwinding this goroutine. RemoveSocket covers what a defer
 	// cannot, which is a call to log.Fatal anywhere else in the process.
 	defer s.RemoveSocket()
@@ -284,11 +290,10 @@ func (s *Server) ListenUntilContextCancelled(ctx context.Context) {
 
 	select {
 	case err := <-served:
-		// Serve returned on its own. After a successful bind that means the accept
-		// loop failed, which is fatal the same way pkg/server treats a failed
-		// ListenAndServe.
+		// Serve returned on its own, so the accept loop failed for good. Log it
+		// rather than exit, so the Pod Identity credential endpoint keeps serving.
 		if err != nil {
-			log.Fatalf("Unable to serve workload identity gRPC: %v", err)
+			log.Errorf("Workload identity gRPC server stopped serving; workload identity is unavailable until the agent restarts: %v", err)
 		}
 		return
 	case <-ctx.Done():

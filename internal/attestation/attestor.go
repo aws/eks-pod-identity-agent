@@ -54,12 +54,14 @@ type PodGetter interface {
 	// PodByUID returns the pod with the given UID and true, or false when no pod
 	// on this node has that UID.
 	PodByUID(uid string) (*podstore.PodInfo, bool)
+	// NodeName is the node the store is scoped to. The agent resolves it after
+	// boot, so the attestor reads it here rather than being built with it.
+	NodeName() string
 }
 
 type attestor struct {
-	nodeName string
-	pods     PodGetter
-	cgroup   CgroupResolver
+	pods   PodGetter
+	cgroup CgroupResolver
 
 	// podRetryAttempts and podRetryInterval bound the cache-lag retry in
 	// resolvePod. They are fields, defaulted by newAttestor, so tests can shrink
@@ -68,15 +70,14 @@ type attestor struct {
 	podRetryInterval time.Duration
 }
 
-// New returns an Attestor for the given node, pod store and cgroup resolver.
-func New(nodeName string, pods PodGetter, cgroup CgroupResolver) workloadidentity.Attestor {
-	return newAttestor(nodeName, pods, cgroup)
+// New returns an Attestor for the given node-scoped pod store and cgroup resolver.
+func New(pods PodGetter, cgroup CgroupResolver) workloadidentity.Attestor {
+	return newAttestor(pods, cgroup)
 }
 
 // newAttestor returns the concrete type, so tests can shrink the retry budget.
-func newAttestor(nodeName string, pods PodGetter, cgroup CgroupResolver) *attestor {
+func newAttestor(pods PodGetter, cgroup CgroupResolver) *attestor {
 	return &attestor{
-		nodeName:         nodeName,
 		pods:             pods,
 		cgroup:           cgroup,
 		podRetryAttempts: podLookupAttempts,
@@ -159,10 +160,12 @@ func (a *attestor) resolve(ctx context.Context, pid int) (*workloadidentity.Work
 		return nil, workloadidentity.ReasonPodNotInStore,
 			errors.New("pod UID " + podUID + " not present in node-scoped store")
 	}
-	if pod.NodeName != a.nodeName {
+	// An empty node name matches no pod, so a store that never learned its node
+	// refuses rather than accepting a pod with no node.
+	if nodeName := a.pods.NodeName(); nodeName == "" || pod.NodeName != nodeName {
 		// Redundant given the field selector, so a selector regression refuses.
 		return nil, workloadidentity.ReasonPodNodeMismatch,
-			errors.New("pod UID " + podUID + " bound to node " + pod.NodeName + ", agent is on " + a.nodeName)
+			errors.New("pod UID " + podUID + " bound to node " + pod.NodeName + ", agent is on " + nodeName)
 	}
 
 	return &workloadidentity.Workload{

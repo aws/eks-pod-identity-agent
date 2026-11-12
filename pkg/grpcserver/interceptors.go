@@ -165,6 +165,35 @@ func StreamMetadataGateInterceptor() grpc.StreamServerInterceptor {
 	}
 }
 
+// UnaryCanServeOnUDSInterceptor refuses unary calls with Unavailable until
+// canServeOnUDS returns true. If canServeOnUDS is nil, every call is let through.
+// It runs after the metadata gate and before the rate limiter, so retries during
+// startup don't spend the rate limit.
+func UnaryCanServeOnUDSInterceptor(canServeOnUDS func() bool) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if canServeOnUDS != nil && !canServeOnUDS() {
+			logger.FromContext(ctx).Debugf("Refusing call while the agent is starting: %s", info.FullMethod)
+			return nil, status.Error(codes.Unavailable, "workload identity is starting; retry")
+		}
+		return handler(ctx, req)
+	}
+}
+
+// StreamCanServeOnUDSInterceptor refuses new streams with Unavailable until
+// canServeOnUDS returns true. If canServeOnUDS is nil, every stream is let
+// through. The check runs only when a stream opens, so an open stream is never
+// cut off by it. It runs after the metadata gate and before the rate limiter, so
+// retries during startup don't spend the rate limit.
+func StreamCanServeOnUDSInterceptor(canServeOnUDS func() bool) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if canServeOnUDS != nil && !canServeOnUDS() {
+			logger.FromContext(ss.Context()).Debugf("Refusing stream while the agent is starting: %s", info.FullMethod)
+			return status.Error(codes.Unavailable, "workload identity is starting; retry")
+		}
+		return handler(srv, ss)
+	}
+}
+
 // UnaryRateLimitInterceptor spends one token per unary call.
 func UnaryRateLimitInterceptor(limiter *rate.Limiter) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {

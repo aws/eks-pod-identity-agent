@@ -7,16 +7,16 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 )
 
-// Store is a fake podstore.Interface that holds every pod until Remove
-// or Delete is called for it. Remove makes HasPod say no without running the
-// callbacks, which is the moment between client-go dropping a pod from its
-// indexer and calling the handlers; Delete does both, in that order.
-//
-// Set RegisterErr before the fake is used.
+// Store is a fake podstore.Interface that holds every pod until Remove or Delete
+// is called for it. Remove makes HasPod say no without running the callbacks, as
+// client-go does between dropping a pod and calling the handlers. Delete does both.
+// Set RegisterErr and NotSynced before the fake is used.
 type Store struct {
 	// RegisterErr, when non-nil, is returned by OnPodDeleted, which then
 	// registers nothing.
 	RegisterErr error
+	// NotSynced makes Synced report false, as a store does before its first list.
+	NotSynced bool
 
 	mu        sync.Mutex
 	callbacks []func(podUID string)
@@ -30,6 +30,11 @@ func (p *Store) HasPod(podUID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return !p.removed[podUID]
+}
+
+// Synced reports true unless NotSynced is set.
+func (p *Store) Synced() bool {
+	return !p.NotSynced
 }
 
 // OnPodDeleted registers fn, or returns RegisterErr when it is set.

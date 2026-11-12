@@ -102,11 +102,10 @@ func fastNodeNameBackoff(t *testing.T) {
 	t.Cleanup(func() { nodeNameBackoff = saved })
 }
 
-// TestResolveNodeNameWithRetry_ANonNodeIdentity_FailsWithoutRetrying proves every
-// identity that is not a node stops the retry at once, the empty node name
-// included, since no retry can turn it into one. The real backoff is kept, so a
-// retry would show as a second call.
-func TestResolveNodeNameWithRetry_ANonNodeIdentity_FailsWithoutRetrying(t *testing.T) {
+// TestResolveNodeNameWithRetry_ANonNodeIdentity_KeepsRetrying proves an identity
+// that isn't a node is retried until ctx is cancelled, the empty node name
+// included, and that the error then still names the cause.
+func TestResolveNodeNameWithRetry_ANonNodeIdentity_KeepsRetrying(t *testing.T) {
 	for _, username := range []string{
 		"system:serviceaccount:kube-system:pod-identity-agent",
 		"system:node:",
@@ -114,15 +113,16 @@ func TestResolveNodeNameWithRetry_ANonNodeIdentity_FailsWithoutRetrying(t *testi
 	} {
 		t.Run(username, func(t *testing.T) {
 			g := NewWithT(t)
+			fastNodeNameBackoff(t)
 			client, calls := countingClient(username, 0)
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 			defer cancel()
 
 			_, err := ResolveNodeNameWithRetry(ctx, client)
 
+			g.Expect(err).To(MatchError(context.DeadlineExceeded))
 			g.Expect(err).To(MatchError(errNotANode))
-			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the retry waited for the deadline instead of failing")
-			g.Expect(calls.Load()).To(BeEquivalentTo(1))
+			g.Expect(calls.Load()).To(BeNumerically(">", 8), "the retry stopped where the old 8-step backoff gave up")
 		})
 	}
 }
@@ -141,10 +141,10 @@ func TestResolveNodeNameWithRetry_ATransientFailure_IsRetried(t *testing.T) {
 	g.Expect(calls.Load()).To(BeEquivalentTo(3))
 }
 
-// TestResolveNodeNameWithRetry_ARefusedCredential_GivesUpNamingTheCause proves a
-// boot that gives up reports the last failure and what a 401 usually means,
-// rather than only that the retry timed out.
-func TestResolveNodeNameWithRetry_ARefusedCredential_GivesUpNamingTheCause(t *testing.T) {
+// TestResolveNodeNameWithRetry_ARefusedCredential_RetriesNamingTheCause proves a
+// 401 is retried until ctx is cancelled, and the error then reports the 401 and
+// what it usually means, not only that ctx ended.
+func TestResolveNodeNameWithRetry_ARefusedCredential_RetriesNamingTheCause(t *testing.T) {
 	g := NewWithT(t)
 	fastNodeNameBackoff(t)
 	client := fake.NewSimpleClientset()
@@ -152,10 +152,12 @@ func TestResolveNodeNameWithRetry_ARefusedCredential_GivesUpNamingTheCause(t *te
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewUnauthorized("Unauthorized")
 		})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
 
-	_, err := ResolveNodeNameWithRetry(context.Background(), client)
+	_, err := ResolveNodeNameWithRetry(ctx, client)
 
-	g.Expect(err).To(MatchError(ContainSubstring("gave up retrying")))
+	g.Expect(err).To(MatchError(context.DeadlineExceeded))
 	g.Expect(apierrors.IsUnauthorized(err)).To(BeTrue(), "the cause has to stay inspectable")
 	g.Expect(err).To(MatchError(ContainSubstring("access entry")))
 }

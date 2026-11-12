@@ -47,8 +47,8 @@ const credentialHint = "the agent must present the node credential. With the IAM
 	"must be the node's role, mapped to the node by an access entry, and its ServiceAccount must carry no IAM " +
 	"role; with a --node-kubeconfig user other than exec, that user must be the node"
 
-// errNotANode marks an authenticated identity that is not a node, which no retry
-// can change: a ServiceAccount, anonymous, or system:node: with an empty name.
+// errNotANode marks an authenticated identity that is not a node: a
+// ServiceAccount, anonymous, or system:node: with an empty name.
 var errNotANode = errors.New("not a node identity")
 
 // ResolveNodeName asks the API server for the node name the client
@@ -78,9 +78,7 @@ func ResolveNodeName(ctx context.Context, clientset kubernetes.Interface) (strin
 	return nodeName, nil
 }
 
-// nodeNameBackoff governs the startup retry. The agent cannot attest anything
-// without its node name, so it stays unready and keeps trying rather than
-// starting with an empty store; the caller wires the failing readiness.
+// nodeNameBackoff paces the retry: 0.5s doubling to the 30s cap, then every 30s.
 var nodeNameBackoff = wait.Backoff{
 	Duration: 500 * time.Millisecond,
 	Factor:   2.0,
@@ -89,35 +87,28 @@ var nodeNameBackoff = wait.Backoff{
 	Cap:      30 * time.Second,
 }
 
-// ResolveNodeNameWithRetry resolves the node name, retrying transient failures
-// with backoff until it succeeds or ctx is done. An identity that is not a node,
-// an empty node name included, stops the retry immediately: retrying cannot turn
-// a ServiceAccount into a node.
+// ResolveNodeNameWithRetry resolves the node name, retrying every failure until
+// it succeeds or ctx is cancelled. An identity that isn't a node is retried too,
+// since fixing the access entry changes it, but it is logged as an error.
 func ResolveNodeNameWithRetry(ctx context.Context, clientset kubernetes.Interface) (string, error) {
 	log := logger.FromContext(ctx)
-
-	var nodeName string
-	// lastErr is the cause a give-up reports: the backoff's own error says only that it timed out.
-	var lastErr error
-	err := wait.ExponentialBackoffWithContext(ctx, nodeNameBackoff, func(ctx context.Context) (bool, error) {
+	nextDelay := nodeNameBackoff.DelayFunc()
+	for {
 		name, err := ResolveNodeName(ctx, clientset)
-		if err != nil {
-			// A non-node identity is a hard configuration error; stop retrying.
-			if errors.Is(err, errNotANode) {
-				return false, err
-			}
-			lastErr = err
-			log.Warnf("resolving node name, will retry: %v", err)
-			return false, nil
+		if err == nil {
+			return name, nil
 		}
-		nodeName = name
-		return true, nil
-	})
-	if wait.Interrupted(err) && lastErr != nil {
-		return "", fmt.Errorf("resolving node name: gave up retrying: %w", lastErr)
+		if errors.Is(err, errNotANode) {
+			log.Errorf("Resolving node name, will retry: %v", err)
+		} else {
+			log.Warnf("Resolving node name, will retry: %v", err)
+		}
+		timer := time.NewTimer(nextDelay())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", fmt.Errorf("resolving node name: %w; last error: %w", ctx.Err(), err)
+		case <-timer.C:
+		}
 	}
-	if err != nil {
-		return "", fmt.Errorf("resolving node name: %w", err)
-	}
-	return nodeName, nil
 }

@@ -71,14 +71,14 @@ func TestPodReplacementSeenOnlyByARelistIsReported(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	store, err := New(t.Context(), client, testNode)
-	require.NoError(t, err)
+	store := newTestStore(t, client)
+	require.NoError(t, store.Start(t.Context(), testNode))
 	replaced := make(chan string, 1)
 	require.NoError(t, store.OnPodDeleted(func(uid string) { replaced <- uid }))
 
 	pods := client.CoreV1().Pods("team-a")
 	require.NoError(t, pods.Delete(t.Context(), "web-0", metav1.DeleteOptions{}))
-	_, err = pods.Create(t.Context(), pod("replacement-uid", "web-0", "team-a", "web", testNode), metav1.CreateOptions{})
+	_, err := pods.Create(t.Context(), pod("replacement-uid", "web-0", "team-a", "web", testNode), metav1.CreateOptions{})
 	require.NoError(t, err)
 	missed.Error(&metav1.Status{Status: metav1.StatusFailure, Code: http.StatusGone, Reason: metav1.StatusReasonExpired})
 	select {
@@ -95,13 +95,15 @@ func TestPodDeletionRegistrationRequiresInformerAndCallback(t *testing.T) {
 	var absent *Store
 	require.Error(t, absent.OnPodDeleted(func(string) {}))
 	require.Error(t, (&Store{}).OnPodDeleted(func(string) {}))
-	require.Error(t, (&Store{}).OnPodDeleted(nil))
+	store := newTestStore(t, fake.NewSimpleClientset())
+	require.Error(t, store.OnPodDeleted(nil))
+	require.NoError(t, store.OnPodDeleted(func(string) {}), "a store that hasn't started takes registrations")
 }
 
 func TestPodDeletionCallbackUsesExistingInformer(t *testing.T) {
 	client := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
-	store, err := New(t.Context(), client, testNode)
-	require.NoError(t, err)
+	store := newTestStore(t, client)
+	require.NoError(t, store.Start(t.Context(), testNode))
 	require.True(t, store.HasPod(testPodUID))
 	deleted := make(chan string, 1)
 	require.NoError(t, store.OnPodDeleted(func(uid string) { deleted <- uid }))

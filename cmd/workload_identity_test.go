@@ -263,8 +263,8 @@ func wiBuildTiersAndClients(t *testing.T, workloads ...*workloadidentity.Workloa
 }
 
 // wiBuildTiersWith builds the clients and the tiers as createServers does, from
-// opts over client and stsClient. The pod store's informer runs under a context
-// cancelled at cleanup.
+// opts over client and stsClient, and syncs the pod store. The pod store's
+// informer runs under a context cancelled at cleanup.
 func wiBuildTiersWith(t *testing.T, opts handlers.WorkloadIdentityServerOpts, client kubernetes.Interface,
 	stsClient sts.Iface) (*workloadIdentityTiers, *workloadIdentityClients) {
 	t.Helper()
@@ -278,6 +278,10 @@ func wiBuildTiersWith(t *testing.T, opts handlers.WorkloadIdentityServerOpts, cl
 	tiers, err := buildWorkloadIdentityTiers(opts, clients, stsClient)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(tiers).ToNot(BeNil())
+	// What the pod-store-sync loop does beside the servers, done here before the
+	// test calls the tiers, which read the store.
+	clients.syncPodStore(ctx)
+	g.Expect(clients.podStore.Synced()).To(BeTrue())
 	return tiers, clients
 }
 
@@ -293,7 +297,7 @@ func TestBuildWorkloadIdentityTiers_ANodeIdentity_BuildsEveryTier(t *testing.T) 
 	g.Expect(tiers.handler).ToNot(BeNil())
 	g.Expect(tiers.bundleSource).ToNot(BeNil())
 
-	// The store synced before the build returned, so its list has happened.
+	// The helper synced the store, so its list has happened.
 	lists, selectors := client.podLists()
 	g.Expect(lists).To(BeNumerically(">=", 1))
 	g.Expect(selectors).To(ContainElement("spec.nodeName="+wiTestNode),
@@ -301,11 +305,10 @@ func TestBuildWorkloadIdentityTiers_ANodeIdentity_BuildsEveryTier(t *testing.T) 
 	g.Expect(fetcher.calls.Load()).To(BeZero())
 }
 
-// TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails proves a client that
-// is not the node fails the boot before the minter's pre-flight and before any
-// pod store starts, since nothing it listed would be scoped by what the Node
-// authorizer enforces.
-func TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails(t *testing.T) {
+// TestSyncPodStore_ANonNodeIdentity_KeepsRetrying proves a client that isn't the
+// node is retried until ctx is cancelled rather than exiting the agent, and that
+// neither the CSIDriver pre-flight nor the pod store runs for it.
+func TestSyncPodStore_ANonNodeIdentity_KeepsRetrying(t *testing.T) {
 	testCases := []struct {
 		name     string
 		username string
@@ -314,20 +317,20 @@ func TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails(t *testing.T) {
 		{name: "anonymous", username: "system:anonymous"},
 		{name: "empty node name", username: "system:node:"},
 	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
-
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
 			client := newWINodeClientset(tc.username)
+			clients, err := buildWorkloadIdentityClients(t.Context(), wiOpts, client)
+			g.Expect(err).ToNot(HaveOccurred())
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
 
-			clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
+			clients.syncPodStore(ctx)
 
-			g.Expect(err).To(MatchError(ContainSubstring("not a node identity")))
-			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the boot waited instead of failing at once")
-			g.Expect(clients).To(BeNil())
+			g.Expect(ctx.Err()).To(HaveOccurred(), "the sync returned before its context ended")
+			g.Expect(selfSubjectReviews(client)).To(BeNumerically(">", 1))
+			g.Expect(clients.podStore.Synced()).To(BeFalse())
 			g.Expect(csiDriverReads(client)).To(BeZero(), "the pre-flight must not run for a client that is not the node")
 			lists, _ := client.podLists()
 			g.Expect(lists).To(BeZero(), "no pod store is started for a client that is not the node")
@@ -335,11 +338,11 @@ func TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails(t *testing.T) {
 	}
 }
 
-// TestBuildWorkloadIdentityClients_ThePreflightWaitsForTheNodeName proves a
-// transient API server failure at boot is absorbed by the node name's retry, not
-// failed by the minter's CSIDriver pre-flight: the API server refuses everything
-// until the first SelfSubjectReview it answers.
-func TestBuildWorkloadIdentityClients_ThePreflightWaitsForTheNodeName(t *testing.T) {
+// TestSyncPodStore_ThePreflightWaitsForTheNodeName proves a transient API server
+// failure is absorbed by the node name's retry, not failed by the minter's
+// CSIDriver pre-flight: the API server refuses everything until the first
+// SelfSubjectReview it answers.
+func TestSyncPodStore_ThePreflightWaitsForTheNodeName(t *testing.T) {
 	g := NewWithT(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -359,11 +362,198 @@ func TestBuildWorkloadIdentityClients_ThePreflightWaitsForTheNodeName(t *testing
 	})
 
 	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
-
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(clients.nodeName).To(Equal(wiTestNode))
+	clients.syncPodStore(ctx)
+	g.Expect(clients.podStore.Synced()).To(BeTrue())
+	g.Expect(clients.podStore.NodeName()).To(Equal(wiTestNode))
 	g.Expect(reviews.Load()).To(Equal(int32(2)), "the node name was retried once")
 	g.Expect(csiDriverReads(client)).To(Equal(1))
+}
+
+// TestSyncPodStore_AnUnreachableAPIServer_RetriesUntilShutdown proves the sync
+// never gives up on a transient failure, which on a new node is the API server
+// before kube-proxy is up: exiting would take the credential endpoint down too.
+// It stops only when its context does.
+func TestSyncPodStore_AnUnreachableAPIServer_RetriesUntilShutdown(t *testing.T) {
+	g := NewWithT(t)
+	client := newWINodeClientset("system:node:" + wiTestNode)
+	var reviews atomic.Int32
+	client.PrependReactor("create", "selfsubjectreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+		reviews.Add(1)
+		return true, nil, errors.New("connection refused")
+	})
+	clients, err := buildWorkloadIdentityClients(t.Context(), wiOpts, client)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	clients.syncPodStore(ctx)
+	g.Expect(ctx.Err()).To(HaveOccurred(), "the sync returned before its context ended")
+	g.Expect(reviews.Load()).To(BeNumerically(">", 1))
+	g.Expect(clients.podStore.Synced()).To(BeFalse())
+}
+
+// wiAPIServerOutage makes a wiNodeClientset refuse every call workload identity
+// makes while down is true, as an API server that can't be reached does.
+// stopWatches ends the open pod watches, as a dropped connection does.
+type wiAPIServerOutage struct {
+	down    atomic.Bool
+	mu      sync.Mutex
+	watches []watch.Interface
+}
+
+func newWIAPIServerOutage(client *wiNodeClientset) *wiAPIServerOutage {
+	o := &wiAPIServerOutage{}
+	refuse := func(k8stesting.Action) (bool, runtime.Object, error) {
+		if o.down.Load() {
+			return true, nil, errors.New("connection refused")
+		}
+		return false, nil, nil
+	}
+	client.PrependReactor("create", "selfsubjectreviews", refuse)
+	client.PrependReactor("get", "csidrivers", refuse)
+	client.PrependReactor("list", "pods", refuse)
+	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		if o.down.Load() {
+			return true, nil, errors.New("connection refused")
+		}
+		var opts metav1.ListOptions
+		if watchAction, ok := action.(k8stesting.WatchActionImpl); ok {
+			opts = watchAction.ListOptions
+		}
+		w, err := client.Tracker().Watch(action.GetResource(), action.GetNamespace(), opts)
+		if err != nil {
+			return true, nil, err
+		}
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		o.watches = append(o.watches, w)
+		return true, w, nil
+	})
+	return o
+}
+
+func (o *wiAPIServerOutage) stopWatches() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, w := range o.watches {
+		w.Stop()
+	}
+	o.watches = nil
+}
+
+// TestSyncPodStore_APIServerOutage_SocketWaitsThenServes proves an API server
+// that is down at boot only delays workload identity: the socket answers
+// Unavailable while the sync retries, and opens once the API server is back. A
+// later outage doesn't close it again, since the store keeps the pods it listed.
+func TestSyncPodStore_APIServerOutage_SocketWaitsThenServes(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
+	client := newWINodeClientset("system:node:"+wiTestNode, w)
+	outage := newWIAPIServerOutage(client)
+	outage.down.Store(true)
+
+	clients := wiClients(t, ctx, client)
+	tiers, err := buildWorkloadIdentityTiers(wiOpts, clients, &wiCountingFetcher{})
+	g.Expect(err).ToNot(HaveOccurred())
+	conn := wiServeWith(t, tiers, clients.podStore.Synced)
+	workloadAPI := workload.NewSpiffeWorkloadAPIClient(conn)
+	withHeader := metadata.AppendToOutgoingContext(ctx, grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue)
+	fetch := func() codes.Code {
+		_, err := workloadAPI.FetchJWTSVID(withHeader, &workload.JWTSVIDRequest{Audience: []string{"spiffe://example.org/audience"}})
+		return status.Code(err)
+	}
+
+	synced := make(chan struct{})
+	go func() {
+		clients.syncPodStore(ctx)
+		close(synced)
+	}()
+
+	// Down at boot: the sync keeps retrying, and the socket asks callers to retry.
+	g.Consistently(fetch).WithTimeout(time.Second).Should(Equal(codes.Unavailable))
+	g.Expect(selfSubjectReviews(client)).To(BeNumerically(">", 1), "the node name was retried")
+	g.Expect(clients.podStore.Synced()).To(BeFalse())
+
+	// Back up: the node name resolves, the store syncs, and the socket opens. The
+	// test process isn't a pod, so attestation refuses it past the gate.
+	outage.down.Store(false)
+	g.Eventually(synced).WithTimeout(10 * time.Second).Should(BeClosed())
+	g.Expect(clients.podStore.HasPod(w.PodUID)).To(BeTrue())
+	g.Expect(fetch()).To(Equal(codes.PermissionDenied))
+
+	// Down again, with the watch dropped: the store stays synced and keeps its
+	// pods, so the socket keeps serving.
+	outage.down.Store(true)
+	outage.stopWatches()
+	g.Consistently(func() bool {
+		return clients.podStore.Synced() && clients.podStore.HasPod(w.PodUID)
+	}).WithTimeout(time.Second).Should(BeTrue())
+	g.Expect(fetch()).To(Equal(codes.PermissionDenied))
+}
+
+// TestSyncPodStore_ThePodListFails_WaitsForIt proves a node name that resolves
+// isn't enough to open the socket: while listing the node's pods fails, the sync
+// waits and the store stays unsynced, and the store syncs once the list works.
+func TestSyncPodStore_ThePodListFails_WaitsForIt(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := &workloadidentity.Workload{PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1"}
+	client := newWINodeClientset("system:node:"+wiTestNode, w)
+	var listDown atomic.Bool
+	listDown.Store(true)
+	client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if listDown.Load() {
+			return true, nil, errors.New("connection refused")
+		}
+		return false, nil, nil
+	})
+	clients := wiClients(t, ctx, client)
+
+	synced := make(chan struct{})
+	go func() {
+		clients.syncPodStore(ctx)
+		close(synced)
+	}()
+
+	g.Eventually(clients.podStore.NodeName).WithTimeout(5 * time.Second).Should(Equal(wiTestNode))
+	g.Consistently(synced).WithTimeout(time.Second).ShouldNot(BeClosed())
+	g.Expect(clients.podStore.Synced()).To(BeFalse())
+
+	listDown.Store(false)
+	g.Eventually(synced).WithTimeout(10 * time.Second).Should(BeClosed())
+	g.Expect(clients.podStore.Synced()).To(BeTrue())
+	g.Expect(clients.podStore.HasPod(w.PodUID)).To(BeTrue())
+}
+
+// TestBuildWorkloadIdentityClients_AsksNothingOfTheAPIServer proves the boot
+// path the credential endpoint waits on makes no API call, so an API server that
+// is down, or a node still waiting for kube-proxy, cannot hold it up.
+func TestBuildWorkloadIdentityClients_AsksNothingOfTheAPIServer(t *testing.T) {
+	g := NewWithT(t)
+	client := newWINodeClientset("system:node:" + wiTestNode)
+	client.PrependReactor("*", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("connection refused")
+	})
+
+	clients, err := buildWorkloadIdentityClients(t.Context(), wiOpts, client)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(clients.podStore.Synced()).To(BeFalse())
+	g.Expect(client.Actions()).To(BeEmpty())
+}
+
+// selfSubjectReviews counts the SelfSubjectReviews client has seen.
+func selfSubjectReviews(client *wiNodeClientset) int {
+	reviews := 0
+	for _, action := range client.Actions() {
+		if action.Matches("create", "selfsubjectreviews") {
+			reviews++
+		}
+	}
+	return reviews
 }
 
 // csiDriverReads counts the CSIDriver reads client has seen.
@@ -383,6 +573,12 @@ func csiDriverReads(client *wiNodeClientset) int {
 // test makes are never throttled.
 func wiServe(t *testing.T, tiers *workloadIdentityTiers) *grpc.ClientConn {
 	t.Helper()
+	return wiServeWith(t, tiers, nil)
+}
+
+// wiServeWith is wiServe with the server's CanServeOnUDS gate, nil for none.
+func wiServeWith(t *testing.T, tiers *workloadIdentityTiers, canServeOnUDS func() bool) *grpc.ClientConn {
+	t.Helper()
 	g := NewWithT(t)
 
 	dir, err := os.MkdirTemp("", "pia")
@@ -394,6 +590,7 @@ func wiServe(t *testing.T, tiers *workloadIdentityTiers) *grpc.ClientConn {
 		ShutdownWait:   time.Second,
 		Register:       registerWorkloadIdentityServices(tiers.handler, tiers.sdsHandler),
 		RequestLimiter: rate.NewLimiter(rate.Inf, 0),
+		CanServeOnUDS:  canServeOnUDS,
 	})
 	g.Expect(err).ToNot(HaveOccurred())
 
@@ -413,6 +610,57 @@ func wiServe(t *testing.T, tiers *workloadIdentityTiers) *grpc.ClientConn {
 	// Cleanups run last in, first out, so the client closes before the server stops.
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
+}
+
+// TestWorkloadIdentitySocket_BeforeThePodStoreSyncs_AnswersUnavailable proves the
+// socket is served before the node's pods are listed and asks every caller to
+// retry until they are, on both interfaces and for unary calls and streams alike.
+// Once the store has synced the same calls reach attestation, which refuses the
+// test process because it is not a pod.
+func TestWorkloadIdentitySocket_BeforeThePodStoreSyncs_AnswersUnavailable(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := newWINodeClientset("system:node:" + wiTestNode)
+	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
+	g.Expect(err).ToNot(HaveOccurred())
+	tiers, err := buildWorkloadIdentityTiers(wiOpts, clients, &wiCountingFetcher{})
+	g.Expect(err).ToNot(HaveOccurred())
+	conn := wiServeWith(t, tiers, clients.podStore.Synced)
+	workloadAPI := workload.NewSpiffeWorkloadAPIClient(conn)
+	sds := secretv3.NewSecretDiscoveryServiceClient(conn)
+	withHeader := metadata.AppendToOutgoingContext(ctx, grpcserver.SpiffeSecurityHeader, grpcserver.SpiffeSecurityHeaderValue)
+
+	calls := map[string]func() error{
+		"FetchJWTSVID": func() error {
+			_, err := workloadAPI.FetchJWTSVID(withHeader, &workload.JWTSVIDRequest{Audience: []string{"spiffe://example.org/audience"}})
+			return err
+		},
+		"FetchX509SVID": func() error {
+			return wiFirstRecv(workloadAPI.FetchX509SVID(withHeader, &workload.X509SVIDRequest{}))
+		},
+		"SDS FetchSecrets": func() error {
+			_, err := sds.FetchSecrets(ctx, nil)
+			return err
+		},
+		"SDS StreamSecrets": func() error {
+			return wiFirstRecv(sds.StreamSecrets(ctx))
+		},
+	}
+
+	for name, call := range calls {
+		err := call()
+		g.Expect(status.Code(err)).To(Equal(codes.Unavailable), name+" before the sync")
+	}
+
+	clients.syncPodStore(ctx)
+	g.Expect(clients.podStore.Synced()).To(BeTrue())
+
+	for name, call := range calls {
+		err := call()
+		g.Expect(status.Code(err)).To(Equal(codes.PermissionDenied), name+" after the sync")
+		g.Expect(status.Convert(err).Message()).To(ContainSubstring("attestation refused"), name)
+	}
 }
 
 // wiFirstRecv returns the error a stream ends with before or at its first message.
@@ -717,10 +965,13 @@ func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
 	g.Expect(built).To(Equal(kube.NodeClientOpts{
 		KubeconfigPath: opts.NodeKubeconfig, Cfg: opts.Cfg, ClusterName: opts.ClusterName,
 	}))
-	g.Expect(clients.nodeName).To(Equal(wiTestNode), "the node name resolves over the built client")
-	g.Expect(clients.podStore).ToNot(BeNil(), "the pod store syncs with the clients")
+	g.Expect(clients.podStore).ToNot(BeNil())
+	g.Expect(clients.podStore.Synced()).To(BeFalse(), "the pod store syncs beside the servers, not with the clients")
 	g.Expect(clients.minter).ToNot(BeNil())
 	g.Expect(clients.credentialTokens()).ToNot(BeNil())
+	clients.syncPodStore(t.Context())
+	g.Expect(clients.podStore.Synced()).To(BeTrue())
+	g.Expect(clients.podStore.NodeName()).To(Equal(wiTestNode), "the node name resolves over the built client")
 }
 
 // TestWorkloadIdentityServers_OnWithoutClients_Fails proves the feature on never
