@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	"github.com/golang-jwt/jwt/v5"
 	. "github.com/onsi/gomega"
@@ -32,7 +31,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/noderole"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cloud/sts"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/credcache"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/kube"
@@ -62,32 +60,34 @@ var wiOpts = handlers.WorkloadIdentityServerOpts{
 		Delegate: wiNoExchange{}, RenewalTtl: time.Hour, MaxSize: 100, CleanupInterval: time.Hour,
 	}),
 	EKSAuth: wiNoExchange{},
+	Cfg:     aws.Config{Credentials: wiNodeCredentials{}},
 }
 
-// wiNodeCreds are the node role's credentials.
+// wiNodeCreds are the node role's credentials, the agent's own.
 var wiNodeCreds = aws.Credentials{AccessKeyID: "AKID-node", SecretAccessKey: "secret", SessionToken: "node-session"}
 
-// wiNodeCredentialsSource stands in for IMDS.
-var wiNodeCredentialsSource = aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-	return wiNodeCreds, nil
-})
+// wiNodeCredentials stands in for the agent's credentials chain. It is a struct,
+// not a func, so options that carry it still compare equal.
+type wiNodeCredentials struct{}
 
-// wiNodeCredentials is a cache over wiNodeCredentialsSource.
-func wiNodeCredentials(t *testing.T) *noderole.Cache {
-	t.Helper()
-	cache, err := noderole.New(wiNodeCredentialsSource)
-	NewWithT(t).Expect(err).ToNot(HaveOccurred())
-	return cache
+func (wiNodeCredentials) Retrieve(context.Context) (aws.Credentials, error) {
+	return wiNodeCreds, nil
 }
 
-// stubNodeCredentialsSource keeps the test off the real credential chain.
-func stubNodeCredentialsSource(t *testing.T) {
-	t.Helper()
-	original := newNodeCredentialsSource
-	newNodeCredentialsSource = func(context.Context, aws.CredentialsProvider) aws.CredentialsProvider {
-		return wiNodeCredentialsSource
-	}
-	t.Cleanup(func() { newNodeCredentialsSource = original })
+// TestBuildWorkloadIdentityTiers_NoNodeCredentials_Fails proves the tiers aren't
+// built when nothing can sign GetTrustBundles.
+func TestBuildWorkloadIdentityTiers_NoNodeCredentials_Fails(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	clients := wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode))
+	opts := wiOpts
+	opts.Cfg = aws.Config{}
+
+	tiers, err := buildWorkloadIdentityTiers(opts, clients, &wiCountingFetcher{})
+
+	g.Expect(err).To(MatchError(ContainSubstring("node's AWS credentials")))
+	g.Expect(tiers).To(BeNil())
 }
 
 // wiNoExchange stands in for EKS Auth. Building the tiers exchanges nothing, so
@@ -238,7 +238,7 @@ func (f *wiCountingFetcher) GetWebIdentityToken(context.Context, aws.Credentials
 // client.
 func wiClients(t *testing.T, ctx context.Context, client kubernetes.Interface) *workloadIdentityClients {
 	t.Helper()
-	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client, wiNodeCredentials(t))
+	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
 	NewWithT(t).Expect(err).ToNot(HaveOccurred())
 	return clients
 }
@@ -273,7 +273,7 @@ func wiBuildTiersWith(t *testing.T, opts handlers.WorkloadIdentityServerOpts, cl
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	clients, err := buildWorkloadIdentityClients(ctx, opts, client, wiNodeCredentials(t))
+	clients, err := buildWorkloadIdentityClients(ctx, opts, client)
 	g.Expect(err).ToNot(HaveOccurred())
 	tiers, err := buildWorkloadIdentityTiers(opts, clients, stsClient)
 	g.Expect(err).ToNot(HaveOccurred())
@@ -323,7 +323,7 @@ func TestBuildWorkloadIdentityClients_ANonNodeIdentity_Fails(t *testing.T) {
 			defer cancel()
 			client := newWINodeClientset(tc.username)
 
-			clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client, wiNodeCredentials(t))
+			clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
 
 			g.Expect(err).To(MatchError(ContainSubstring("not a node identity")))
 			g.Expect(ctx.Err()).ToNot(HaveOccurred(), "the boot waited instead of failing at once")
@@ -358,7 +358,7 @@ func TestBuildWorkloadIdentityClients_ThePreflightWaitsForTheNodeName(t *testing
 		return false, nil, nil
 	})
 
-	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client, wiNodeCredentials(t))
+	clients, err := buildWorkloadIdentityClients(ctx, wiOpts, client)
 
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(clients.nodeName).To(Equal(wiTestNode))
@@ -630,7 +630,7 @@ func TestBuildWorkloadIdentityClients_NoCacheBound_FailsBuildingTheMinter(t *tes
 	opts := wiOpts
 	opts.MaxCacheSize = 0
 
-	clients, err := buildWorkloadIdentityClients(ctx, opts, newWINodeClientset("system:node:"+wiTestNode), wiNodeCredentials(t))
+	clients, err := buildWorkloadIdentityClients(ctx, opts, newWINodeClientset("system:node:"+wiTestNode))
 
 	g.Expect(err).To(MatchError(ContainSubstring("building the token minter")))
 	g.Expect(err).To(MatchError(ContainSubstring("--max-cache-size")))
@@ -695,8 +695,8 @@ func TestWorkloadIdentityServers_Off_BuildsNothing(t *testing.T) {
 }
 
 // TestNewWorkloadIdentityClients_On_BuildsOneNodeClient proves the feature on
-// builds the node client once, signing with the node credentials cache, and the
-// minter over it.
+// builds the node client once, from the options' kubeconfig, AWS config and
+// cluster, and the minter over it.
 func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
 	g := NewWithT(t)
 	client := newWINodeClientset("system:node:" + wiTestNode)
@@ -714,14 +714,9 @@ func TestNewWorkloadIdentityClients_On_BuildsOneNodeClient(t *testing.T) {
 
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(builds.Load()).To(Equal(int32(1)))
-	g.Expect(built.KubeconfigPath).To(Equal(opts.NodeKubeconfig))
-	g.Expect(built.ClusterName).To(Equal(opts.ClusterName))
-	g.Expect(built.Cfg.Region).To(Equal(opts.Cfg.Region))
-	g.Expect(built.Cfg.Credentials).To(BeIdenticalTo(clients.nodeCredentials),
-		"the node client signs its IAM token, and so every PSAT mint, with the node credentials cache")
-	creds, err := clients.nodeCredentials.Retrieve(t.Context())
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(creds).To(Equal(wiNodeCreds), "the cache is built over newNodeCredentialsSource")
+	g.Expect(built).To(Equal(kube.NodeClientOpts{
+		KubeconfigPath: opts.NodeKubeconfig, Cfg: opts.Cfg, ClusterName: opts.ClusterName,
+	}))
 	g.Expect(clients.nodeName).To(Equal(wiTestNode), "the node name resolves over the built client")
 	g.Expect(clients.podStore).ToNot(BeNil(), "the pod store syncs with the clients")
 	g.Expect(clients.minter).ToNot(BeNil())
@@ -738,10 +733,9 @@ func TestWorkloadIdentityServers_OnWithoutClients_Fails(t *testing.T) {
 }
 
 // countNodeClientBuilds makes newNodeClient count its calls and answer client,
-// for the rest of the test. It also stubs the node credentials source.
+// for the rest of the test.
 func countNodeClientBuilds(t *testing.T, client kubernetes.Interface) *atomic.Int32 {
 	t.Helper()
-	stubNodeCredentialsSource(t)
 	var builds atomic.Int32
 	original := newNodeClient
 	newNodeClient = func(kube.NodeClientOpts) (kubernetes.Interface, error) {
@@ -773,7 +767,6 @@ func TestServerCmd_EnableWorkloadIdentity_IsOffByDefault(t *testing.T) {
 // flag turns the feature off.
 func TestBuildSharedCredentialManager_OnAndFailing_NamesTheOptOut(t *testing.T) {
 	g := NewWithT(t)
-	stubNodeCredentialsSource(t)
 	original := newNodeClient
 	newNodeClient = func(kube.NodeClientOpts) (kubernetes.Interface, error) {
 		return nil, errors.New("no kubeconfig")
@@ -808,60 +801,4 @@ func TestWorkloadIdentityClients_TheSessionTierAndTheCredentialCacheShareOneMint
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(token).To(Equal(minted[0]), "the cache's source must be served from the token cache the tier filled")
 	g.Expect(client.tokenRequests()).To(HaveLen(1), "no second TokenRequest")
-}
-
-// TestBuildWorkloadIdentityClients_NoNodeCredentials_Fails proves the clients
-// aren't built without the node's credentials.
-func TestBuildWorkloadIdentityClients_NoNodeCredentials_Fails(t *testing.T) {
-	g := NewWithT(t)
-	client := newWINodeClientset("system:node:" + wiTestNode)
-
-	clients, err := buildWorkloadIdentityClients(t.Context(), wiOpts, client, nil)
-
-	g.Expect(err).To(MatchError(ContainSubstring("node's AWS credentials")))
-	g.Expect(clients).To(BeNil())
-	lists, _ := client.podLists()
-	g.Expect(lists).To(BeZero())
-}
-
-// TestNewWorkloadIdentityClients_BuildingTheNodeCredentialsCache_FetchesNothing
-// proves building the cache doesn't block startup.
-func TestNewWorkloadIdentityClients_BuildingTheNodeCredentialsCache_FetchesNothing(t *testing.T) {
-	g := NewWithT(t)
-	countNodeClientBuilds(t, newWINodeClientset("system:node:"+wiTestNode))
-	var fetches atomic.Int32
-	newNodeCredentialsSource = func(context.Context, aws.CredentialsProvider) aws.CredentialsProvider {
-		return aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-			fetches.Add(1)
-			return wiNodeCreds, nil
-		})
-	}
-
-	clients, err := newWorkloadIdentityClients(t.Context(), wiOpts)
-
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(clients.nodeCredentials).ToNot(BeNil())
-	g.Expect(fetches.Load()).To(BeZero())
-}
-
-// TestNewNodeCredentialsSource_AnUnresolvableChain_FallsBackToTheAgentsCredentials
-// proves a chain that won't resolve falls back instead of failing startup.
-func TestNewNodeCredentialsSource_AnUnresolvableChain_FallsBackToTheAgentsCredentials(t *testing.T) {
-	g := NewWithT(t)
-	original := loadDefaultConfig
-	loadDefaultConfig = func(context.Context, ...func(*config.LoadOptions) error) (aws.Config, error) {
-		return aws.Config{}, errors.New("malformed shared config")
-	}
-	t.Cleanup(func() { loadDefaultConfig = original })
-	agents := aws.NewCredentialsCache(wiNodeCredentialsSource)
-
-	source := newNodeCredentialsSource(t.Context(), agents)
-
-	g.Expect(source).ToNot(BeAssignableToTypeOf(agents), "the cache must not be able to invalidate the agent's credentials")
-	creds, err := source.Retrieve(t.Context())
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(creds.AccessKeyID).To(Equal(wiNodeCreds.AccessKeyID))
-
-	_, err = newNodeCredentialsSource(t.Context(), nil).Retrieve(t.Context())
-	g.Expect(err).To(MatchError(ContainSubstring("no AWS credentials")))
 }
