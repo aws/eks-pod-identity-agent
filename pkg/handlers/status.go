@@ -77,6 +77,12 @@ var statusCodes = map[errors.Kind]codes.Code{
 	// PermissionDenied: SPIRE's "no identity issued", for a caller holding no SVID
 	// that matches what it asked for.
 	errors.KindNoIdentity: codes.PermissionDenied,
+
+	// FailedPrecondition: EKS Auth rejected the exchange with InvalidRequest.
+	errors.KindSessionInvalid: codes.FailedPrecondition,
+
+	// Internal: EKS Auth failed the exchange with InternalServer.
+	errors.KindSessionFailed: codes.Internal,
 }
 
 // StatusCode returns the code a caller on the workload identity socket sees for

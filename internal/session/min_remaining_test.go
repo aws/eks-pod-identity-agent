@@ -64,7 +64,7 @@ func TestSessionProvider_MinRemaining_AFailedExchangeKeepsTheCachedSession(t *te
 		if n == 1 {
 			return h.sessionFor(n), nil
 		}
-		return nil, eksauthtest.InternalServer()
+		return nil, eksauthtest.ServiceUnavailable()
 	})
 	_, err := h.session(testSessionPodUID)
 	g.Expect(err).NotTo(HaveOccurred())

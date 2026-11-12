@@ -365,6 +365,14 @@ func (p *Provider) sessionError(err error, podUID string) error {
 	if errors.As(err, &denied) || errors.As(err, &invalidToken) {
 		return wierrors.ErrSessionRefused.Wrapf(err, "EKS Auth refused a session for pod %s", podUID)
 	}
+	var invalidRequest *types.InvalidRequestException
+	if errors.As(err, &invalidRequest) {
+		return wierrors.ErrSessionInvalid.Wrapf(err, "EKS Auth rejected the session request for pod %s", podUID)
+	}
+	var internal *types.InternalServerException
+	if errors.As(err, &internal) {
+		return wierrors.ErrSessionFailed.Wrapf(err, "EKS Auth failed the session exchange for pod %s", podUID)
+	}
 	return wierrors.ErrSessionUnavailable.Wrapf(err, "exchanging a token with EKS Auth for pod %s", podUID)
 }
 

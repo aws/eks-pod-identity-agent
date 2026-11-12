@@ -42,6 +42,10 @@ const (
 	KindInvalidRequest
 	// KindNoIdentity is the kind of ErrNoIdentity.
 	KindNoIdentity
+	// KindSessionInvalid is the kind of ErrSessionInvalid.
+	KindSessionInvalid
+	// KindSessionFailed is the kind of ErrSessionFailed.
+	KindSessionFailed
 )
 
 // MetricLabelUnknown is the metric label reported for a non-nil error that is
@@ -231,6 +235,15 @@ var (
 	// caller holds no SVID matching its request, which is SPIRE's "no identity
 	// issued". Not retryable: a repeat of the same request matches nothing again.
 	ErrNoIdentity = newWorkloadIdentityError(KindNoIdentity, "no_identity", false)
+
+	// ErrSessionInvalid is produced by the session provider when EKS Auth
+	// rejects the exchange with InvalidRequest. Not retryable: the same
+	// request is rejected the same way.
+	ErrSessionInvalid = newWorkloadIdentityError(KindSessionInvalid, "session_invalid", false)
+
+	// ErrSessionFailed is produced by the session provider when EKS Auth
+	// fails the exchange with InternalServer. Not retryable.
+	ErrSessionFailed = newWorkloadIdentityError(KindSessionFailed, "session_failed", false)
 )
 
 // AsWorkloadIdentityError reports whether err is or wraps a taxonomy member, and
@@ -294,5 +307,7 @@ func WorkloadIdentityTaxonomy() []*WorkloadIdentityError {
 		ErrInvalidToken,
 		ErrInvalidRequest,
 		ErrNoIdentity,
+		ErrSessionInvalid,
+		ErrSessionFailed,
 	}
 }
