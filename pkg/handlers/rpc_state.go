@@ -69,15 +69,14 @@ func (s *RPCState) Await(ctx context.Context, signals <-chan struct{}, op func()
 	}
 }
 
-// logRetry counts a retryable failure and logs it with its cause. The context's
-// logger already names the pod once the RPC has attested its caller. Early
+// logRetry logs a retryable failure with its cause. The context's logger
+// already names the pod and its UID once the RPC has attested its caller. Early
 // retries are Debug, since a cold start retries briefly; once the RPC has been
 // retrying for retryWarnAfter they are Warn, so a workload stuck waiting for its
 // identity, for example on a session EKS Auth keeps failing, is visible at the
 // default log level with the error that holds it.
 func (s *RPCState) logRetry(ctx context.Context, delay time.Duration, err error) {
 	s.retries++
-	observeRetry(s.rpc, err)
 	elapsed := time.Since(s.start)
 	log := logger.FromContext(ctx).
 		WithField("rpc", s.rpc).

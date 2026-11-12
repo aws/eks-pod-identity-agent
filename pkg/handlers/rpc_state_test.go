@@ -6,7 +6,6 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -49,32 +48,33 @@ func setRetryWarnAfter(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { retryWarnAfter = old })
 }
 
-// A step that keeps failing retryably is retried until its caller gives up.
-// Every retry is counted on the retry metric by its error, and once the RPC has
-// waited retryWarnAfter each retry is logged at Warn with the error that holds
-// it, so a stuck workload is visible at the default log level.
-func TestAwait_RetryableFailure_IsCountedAndLoggedAtWarnAfterThreshold(t *testing.T) {
+// A step that keeps failing retryably is retried until its caller gives up, and
+// once the RPC has waited retryWarnAfter each retry is logged at Warn with the
+// error that holds it and the attested pod, so a stuck workload is visible at
+// the default log level.
+func TestAwait_RetryableFailure_IsLoggedAtWarnAfterThreshold(t *testing.T) {
 	g := NewWithT(t)
 	hook := captureLogs(t)
 	setRetryWarnAfter(t, 0)
 
 	const rpc = "test_rpc_warn"
 	cause := wierrors.ErrSessionUnavailable.Wrapf(nil, "EKS Auth answered InternalServerException")
-	before := testutil.ToFloat64(promRPCRetryTotal.WithLabelValues(rpc, cause.MetricLabel()))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	// The context Attest returns: the pod and its UID are on its logger.
+	attested := logger.ContextWithField(context.Background(), "pod", "ns-1/pod-1", "pod-uid", "uid-1")
+	ctx, cancel := context.WithTimeout(attested, 50*time.Millisecond)
 	defer cancel()
 	calls := 0
 	err := NewRPCState(rpc, testRetryBackoff).Await(ctx, nil, func() error { calls++; return cause })
 
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(calls).To(BeNumerically(">=", 3))
-	retries := testutil.ToFloat64(promRPCRetryTotal.WithLabelValues(rpc, cause.MetricLabel())) - before
-	g.Expect(retries).To(BeNumerically(">=", 2), "retries were not counted by error")
 
 	warns := entriesFor(hook, rpc, logrus.WarnLevel)
 	g.Expect(warns).ToNot(BeEmpty(), "a stuck RPC was never logged at Warn")
 	g.Expect(warns[0].Message).To(ContainSubstring("EKS Auth answered InternalServerException"))
+	g.Expect(warns[0].Data).To(HaveKeyWithValue("pod", "ns-1/pod-1"))
+	g.Expect(warns[0].Data).To(HaveKeyWithValue("pod-uid", "uid-1"))
 	g.Expect(warns[0].Data).To(HaveKeyWithValue("error-label", cause.MetricLabel()))
 	g.Expect(warns[0].Data).To(HaveKeyWithValue("attempt", 1))
 	g.Expect(warns[0].Data).To(HaveKey("waiting-for"))
@@ -98,7 +98,7 @@ func TestAwait_RetryableFailure_BeforeThreshold_IsDebugOnly(t *testing.T) {
 	g.Expect(entriesFor(hook, rpc, logrus.DebugLevel)).ToNot(BeEmpty())
 }
 
-// A step that succeeds first time is neither counted as a retry nor logged.
+// A step that succeeds first time is not logged as a retry.
 func TestAwait_Success_IsNotARetry(t *testing.T) {
 	g := NewWithT(t)
 	hook := captureLogs(t)
