@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -65,25 +64,18 @@ type Interface interface {
 	OnPodDeleted(fn func(podUID string)) error
 }
 
-// Store is a node-scoped view of pods backed by a shared informer. It is built
-// empty, so the tiers can register for its deletions at boot, and Start fills it
-// once the node name is known. Until Start has synced it holds no pods.
+// Store is a node-scoped view of pods backed by a shared informer. New builds
+// the informer without starting it, so the tiers can register for deletions at
+// boot. Start sets the node name, starts the informer and waits for its sync.
 type Store struct {
-	// synced is set once the informer has listed the node's pods, and nil until
-	// then, which is what makes every lookup miss before the sync.
-	synced atomic.Pointer[syncedStore]
-	// started makes a second Start an error rather than a second informer.
-	started atomic.Bool
-
-	// mu guards callbacks, which OnPodDeleted can append to before or after Start.
-	mu        sync.Mutex
-	callbacks []func(podUID string)
-}
-
-// syncedStore is what Start publishes once the informer has synced.
-type syncedStore struct {
-	nodeName string
+	factory  informers.SharedInformerFactory
+	informer cache.SharedIndexInformer
 	indexer  cache.Indexer
+
+	// mu guards nodeName, which Start sets once and the informer's list and
+	// watch, and the attestor, read.
+	mu       sync.RWMutex
+	nodeName string
 }
 
 var _ Interface = (*Store)(nil)
@@ -146,146 +138,117 @@ func stripDownPod(obj interface{}) (interface{}, error) {
 	}, nil
 }
 
-// NewStore returns a store that holds no pods until Start has synced it.
-// Callbacks registered with OnPodDeleted before then are called once it runs.
-func NewStore() *Store {
-	return &Store{}
-}
-
-// New builds a pod store scoped to nodeName and starts it, blocking until the
-// cache has synced or ctx is done.
-func New(ctx context.Context, clientset kubernetes.Interface, nodeName string) (*Store, error) {
-	s := NewStore()
-	if err := s.Start(ctx, clientset, nodeName); err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-// Start scopes the store to nodeName, starts its informer under ctx, and blocks
-// until the cache has synced or ctx is done. Only then does the store report
-// Synced and answer lookups. The field selector is what scopes the list and
-// watch to this node; it is applied through the informer factory so both the
-// initial list and the ongoing watch carry it. A store starts once.
-func (s *Store) Start(ctx context.Context, clientset kubernetes.Interface, nodeName string) error {
-	if nodeName == "" {
-		return fmt.Errorf("node name is required to scope the pod store")
-	}
-	if !s.started.CompareAndSwap(false, true) {
-		return fmt.Errorf("pod store already started")
-	}
-
-	nodeSelector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
+// New builds a pod store and its informer without starting it, so it makes no
+// API call. It holds no pods until Start has synced it.
+func New(ctx context.Context, clientset kubernetes.Interface) (*Store, error) {
+	s := &Store{}
 	// No resync. A resync never asks the API server: it replays each cached pod
 	// to the handlers as an update from the pod to itself. podReplacedHandler
 	// ignores that, since the UID is the same, and a resync never produces a
 	// delete. Missed events come back through the reflector, which resumes the
 	// watch and relists on 410.
-	factory := informers.NewSharedInformerFactoryWithOptions(
+	s.factory = informers.NewSharedInformerFactoryWithOptions(
 		clientset,
 		0,
+		// Called on every list and watch, which only run once Start has set the
+		// node name, so both the initial list and the ongoing watch are scoped to it.
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-			opts.FieldSelector = nodeSelector
+			opts.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", s.NodeName()).String()
 		}),
 	)
-
-	podInformer := factory.Core().V1().Pods().Informer()
+	s.informer = s.factory.Core().V1().Pods().Informer()
 
 	// Trim each pod to only the fields attestation reads before it is stored.
 	// On a node running many pods the informer cache would otherwise retain every
 	// pod's containers, volumes, status and managedFields; dropping them is a
 	// large memory saving for a store whose only reader is PodByUID.
-	if err := podInformer.SetTransform(stripDownPod); err != nil {
-		return fmt.Errorf("setting pod store transform: %w", err)
+	if err := s.informer.SetTransform(stripDownPod); err != nil {
+		return nil, fmt.Errorf("setting pod store transform: %w", err)
 	}
 
-	if err := podInformer.AddIndexers(cache.Indexers{podByUIDIndex: podUIDIndexFunc}); err != nil {
-		return fmt.Errorf("adding pod UID indexer: %w", err)
+	if err := s.informer.AddIndexers(cache.Indexers{podByUIDIndex: podUIDIndexFunc}); err != nil {
+		return nil, fmt.Errorf("adding pod UID indexer: %w", err)
 	}
 
-	// One handler for every OnPodDeleted callback, registered or not yet, so a
-	// tier built before the node name was known still hears this node's deletions.
-	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		// Not for UID changes, which can't happen: for two pods sharing a name,
-		// whose delete and create a relist folds into one update.
-		UpdateFunc: podReplacedHandler(s.podDeleted),
-		DeleteFunc: podDeletedHandler(s.podDeleted),
-	}); err != nil {
-		return fmt.Errorf("adding pod deletion handler: %w", err)
-	}
-
-	// Observability for the watch itself. The node-scoped list/watch is the
-	// authority attestation reads, so surfacing each add/update/delete (at debug,
-	// to stay quiet in production) makes it possible to confirm on a real node
-	// that the informer is receiving events as pods come and go. The sync summary
-	// below is logged at info because "the cache is ready and holds N pods" is the
-	// one line an operator wants at startup.
+	// Each add, update and delete is logged at debug, so running the agent at
+	// -v debug on a node shows the watch receiving events as pods come and go.
 	log := logger.FromContext(ctx)
-	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if _, err := s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { logPodEvent(log, "add", obj) },
 		UpdateFunc: func(_, obj interface{}) { logPodEvent(log, "update", obj) },
 		DeleteFunc: func(obj interface{}) { logPodEvent(log, "delete", obj) },
 	}); err != nil {
-		return fmt.Errorf("adding pod event handler: %w", err)
+		return nil, fmt.Errorf("adding pod event handler: %w", err)
 	}
 
-	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced) {
+	s.indexer = s.informer.GetIndexer()
+	return s, nil
+}
+
+// Start scopes the store to nodeName, starts its informer under ctx, and blocks
+// until the cache has synced or ctx is done. A store starts once, so its watch
+// is never rescoped to another node.
+func (s *Store) Start(ctx context.Context, nodeName string) error {
+	if nodeName == "" {
+		return fmt.Errorf("node name is required to scope the pod store")
+	}
+	s.mu.Lock()
+	if s.nodeName != "" {
+		s.mu.Unlock()
+		return fmt.Errorf("pod store already started for node %q", s.nodeName)
+	}
+	s.nodeName = nodeName
+	s.mu.Unlock()
+
+	s.factory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
 		return fmt.Errorf("pod informer cache failed to sync for node %q", nodeName)
 	}
 
-	indexer := podInformer.GetIndexer()
-	s.synced.Store(&syncedStore{nodeName: nodeName, indexer: indexer})
-	log.WithFields(logrus.Fields{
+	logger.FromContext(ctx).WithFields(logrus.Fields{
 		"node": nodeName,
-		"pods": len(indexer.ListKeys()),
+		"pods": len(s.indexer.ListKeys()),
 	}).Info("podstore: node-scoped pod informer synced")
-
 	return nil
 }
 
-// Synced reports whether Start has listed this node's pods.
+// Synced reports whether the informer has listed this node's pods. It turns
+// true once and stays true.
 func (s *Store) Synced() bool {
-	return s != nil && s.synced.Load() != nil
+	return s != nil && s.informer != nil && s.informer.HasSynced()
 }
 
-// NodeName is the node the store is scoped to, empty until it has synced.
+// NodeName is the node the store is scoped to, empty until Start sets it.
 func (s *Store) NodeName() string {
 	if s == nil {
 		return ""
 	}
-	if synced := s.synced.Load(); synced != nil {
-		return synced.nodeName
-	}
-	return ""
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nodeName
 }
 
 // OnPodDeleted calls fn with the UID of each pod that leaves this node's store:
 // deleted, or replaced by a same-named pod with a new UID, which a relist
-// delivers as an update with no delete. It can be called before Start, and
-// reuses this node's watch either way. Callbacks must return promptly.
+// delivers as an update with no delete. It reuses this node's watch, and works
+// before Start. Callbacks must return promptly.
 func (s *Store) OnPodDeleted(fn func(podUID string)) error {
 	if fn == nil {
 		return fmt.Errorf("pod deletion callback is required")
 	}
-	if s == nil {
-		return fmt.Errorf("no pod store to report pod deletions from")
+	if s == nil || s.informer == nil {
+		return fmt.Errorf("pod store has no informer to report pod deletions from")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.callbacks = append(s.callbacks, fn)
+	_, err := s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// Not for UID changes, which can't happen: for two pods sharing a name,
+		// whose delete and create a relist folds into one update.
+		UpdateFunc: podReplacedHandler(fn),
+		DeleteFunc: podDeletedHandler(fn),
+	})
+	if err != nil {
+		return fmt.Errorf("adding pod deletion handler: %w", err)
+	}
 	return nil
-}
-
-// podDeleted runs every registered callback for podUID, outside the lock so a
-// callback registered late cannot be blocked by one in progress.
-func (s *Store) podDeleted(podUID string) {
-	s.mu.Lock()
-	callbacks := append([]func(string){}, s.callbacks...)
-	s.mu.Unlock()
-	for _, fn := range callbacks {
-		fn(podUID)
-	}
 }
 
 func podDeletedHandler(fn func(string)) func(interface{}) {
@@ -345,14 +308,12 @@ func logPodEvent(log *logrus.Entry, verb string, obj interface{}) {
 // newStoreFromIndexer wraps a prepopulated indexer. It exists so the lookup
 // and projection logic can be tested without an informer or a cluster.
 func newStoreFromIndexer(indexer cache.Indexer) *Store {
-	s := &Store{}
-	s.synced.Store(&syncedStore{indexer: indexer})
-	return s
+	return &Store{indexer: indexer}
 }
 
 // HasPod checks the node-scoped cache without calling the API server.
 func (s *Store) HasPod(uid string) bool {
-	if uid == "" {
+	if s == nil || s.indexer == nil || uid == "" {
 		return false
 	}
 	_, found := s.PodByUID(uid)
@@ -361,16 +322,12 @@ func (s *Store) HasPod(uid string) bool {
 
 // PodByUID returns the pod with uid from the node-scoped cache. A UID absent
 // from the store is a clean miss, which the attestor treats as an unresolvable
-// caller rather than an error. Every UID misses until the store has synced.
+// caller rather than an error.
 func (s *Store) PodByUID(uid string) (*PodInfo, bool) {
-	if s == nil {
+	if s == nil || s.indexer == nil {
 		return nil, false
 	}
-	synced := s.synced.Load()
-	if synced == nil {
-		return nil, false
-	}
-	objs, err := synced.indexer.ByIndex(podByUIDIndex, uid)
+	objs, err := s.indexer.ByIndex(podByUIDIndex, uid)
 	if err != nil || len(objs) == 0 {
 		return nil, false
 	}

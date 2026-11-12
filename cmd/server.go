@@ -327,7 +327,7 @@ func init() {
 		"Enable consuming credentials from IMDS when available on the node")
 
 	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, false,
-		"Serve SPIFFE workload identity on its socket. Until the agent has listed its node's pods the socket answers Unavailable, and the agent exits if it reaches the API server as anything but the node")
+		"Enable serving SPIFFE workload identity on a Unix socket")
 	serverCmd.Flags().StringVar(&nodeKubeconfig, handlers.FlagNodeKubeconfig, "",
 		"Kubeconfig workload identity reaches the API server with. Empty uses the in-cluster API server and CA, and the agent authenticates as the node with an IAM token signed from its AWS credentials. A kubeconfig whose user runs an exec plugin gets the same IAM token in place of the plugin; any other user (client certificate, token) is used as is, so it must be the node")
 

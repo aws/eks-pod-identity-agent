@@ -29,16 +29,10 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
-// workloadIdentityClients is what workload identity reaches the API server with,
-// built once by createServers before the credential manager: the node client,
-// the node-scoped pod store and the cached token minter. The minter is the one
-// token cache, shared by the session tier's exchanges and the credential cache's
-// refreshes. The attestor resolves callers from the pod store, and the minter and
-// every per-pod tier drop a pod it reports deleted.
-//
-// Building them asks nothing of the API server, so the credential endpoint never
-// waits on it. The pod store starts empty and syncWithAPIServer fills it beside the
-// servers; until then the workload identity socket answers Unavailable.
+// workloadIdentityClients holds the node client, the node-scoped pod store and
+// the token minter that workload identity uses. Building them makes no API call,
+// so the credential endpoint never waits on the API server. The pod store starts
+// empty and fills in the background.
 type workloadIdentityClients struct {
 	clientset kubernetes.Interface
 	podStore  *podstore.Store
@@ -71,7 +65,10 @@ func newWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdent
 // store's first sync.
 func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIdentityServerOpts,
 	clientset kubernetes.Interface) (*workloadIdentityClients, error) {
-	podStore := podstore.NewStore()
+	podStore, err := podstore.New(ctx, clientset)
+	if err != nil {
+		return nil, fmt.Errorf("building the node-scoped pod store: %w", err)
+	}
 	// It refuses a --max-cache-size of zero, which the credential endpoint's cache
 	// reads as no caching.
 	minter, err := tokenminter.NewMinter(ctx, clientset, tokenminter.CachedMinterOpts{
@@ -84,50 +81,22 @@ func buildWorkloadIdentityClients(ctx context.Context, opts handlers.WorkloadIde
 	return &workloadIdentityClients{clientset: clientset, podStore: podStore, minter: minter}, nil
 }
 
-// syncWithAPIServer runs the workload identity startup steps that need the API
-// server, and returns once the pod store has synced:
-//
-//  1. Resolve the node name, retrying until the API server answers.
-//  2. Check the CSIDriver the token minter depends on. A problem is only logged,
-//     since each mint reports it again as ErrTokenMintForbidden.
-//  3. Start the node-scoped pod store and wait for its first sync.
-//
-// A transient failure is retried until ctx ends: on a new node the API server is
-// unreachable until kube-proxy is up, and exiting then would take the credential
-// endpoint down with it. An identity that is not a node is returned at once, since
-// no retry can change it.
-func (c *workloadIdentityClients) syncWithAPIServer(ctx context.Context) error {
+// syncPodStore resolves the node name, checks the CSIDriver, and starts the pod
+// store, retrying until ctx is cancelled. It never exits the agent: until it
+// finishes, the workload identity socket answers Unavailable.
+func (c *workloadIdentityClients) syncPodStore(ctx context.Context) {
 	log := logger.FromContext(ctx)
-	var nodeName string
-	for {
-		var err error
-		nodeName, err = kube.ResolveNodeNameWithRetry(ctx, c.clientset)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, kube.ErrNotANode) || ctx.Err() != nil {
-			return err
-		}
-		log.Warnf("Workload identity is waiting for the API server, retrying: %v", err)
+	nodeName, err := kube.ResolveNodeNameWithRetry(ctx, c.clientset)
+	if err != nil {
+		// Only a cancelled ctx gets here: the retry never gives up on its own.
+		log.Warnf("Stopped resolving the node name, so workload identity stays unavailable: %v", err)
+		return
 	}
 	if err := tokenminter.VerifyCSIDriverExists(ctx, c.clientset); err != nil {
 		log.Warnf("Skipping the CSIDriver pre-flight: %v", err)
 	}
-	if err := c.podStore.Start(ctx, c.clientset, nodeName); err != nil {
-		return fmt.Errorf("starting the node-scoped pod store: %w", err)
-	}
-	return nil
-}
-
-// runPodStoreSync is syncWithAPIServer as a background loop. It returns once the store
-// has synced, and the store's informer keeps watching under ctx until shutdown.
-// An identity that is not a node is fatal, as it was when the agent synced before
-// serving: the operator has to fix the agent's credentials. A shutdown before the
-// sync is not an error.
-func (c *workloadIdentityClients) runPodStoreSync(ctx context.Context) {
-	if err := c.syncWithAPIServer(ctx); err != nil && ctx.Err() == nil {
-		logger.FromContext(ctx).Fatalf("Unable to start workload identity (--%s=false turns workload identity off): %v",
-			handlers.FlagEnableWorkloadIdentity, err)
+	if err := c.podStore.Start(ctx, nodeName); err != nil && ctx.Err() == nil {
+		log.Errorf("Workload identity is unavailable: %v", err)
 	}
 }
 
@@ -186,7 +155,7 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	return []runnable{
 		server,
 		backgroundLoop{name: "trust-bundle-refresh", run: tiers.bundleSource.Run},
-		backgroundLoop{name: "pod-store-sync", run: clients.runPodStoreSync},
+		backgroundLoop{name: "pod-store-sync", run: clients.syncPodStore},
 	}, nil
 }
 

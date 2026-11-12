@@ -277,7 +277,8 @@ func TestBuildSharedCredentialManager_On_RefreshesWithTheTiersMinter(t *testing.
 	g.Expect(*built).To(HaveLen(1))
 	g.Expect(workloadIdentityOpts.CredentialCache).ToNot(BeNil(), "the session tier gets the manager's cache")
 	// The minter mints only once the pod store has listed the node's pods.
-	g.Expect(clients.syncWithAPIServer(t.Context())).To(Succeed())
+	clients.syncPodStore(t.Context())
+	g.Expect(clients.podStore.Synced()).To(BeTrue())
 	tokens := (*built)[0].WorkloadIdentityTokens
 	g.Expect(tokens).ToNot(BeNil())
 

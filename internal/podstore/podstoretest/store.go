@@ -7,11 +7,9 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/podstore"
 )
 
-// Store is a fake podstore.Interface that holds every pod until Remove
-// or Delete is called for it. Remove makes HasPod say no without running the
-// callbacks, which is the moment between client-go dropping a pod from its
-// indexer and calling the handlers; Delete does both, in that order.
-//
+// Store is a fake podstore.Interface that holds every pod until Remove or Delete
+// is called for it. Remove makes HasPod say no without running the callbacks, as
+// client-go does between dropping a pod and calling the handlers. Delete does both.
 // Set RegisterErr and NotSynced before the fake is used.
 type Store struct {
 	// RegisterErr, when non-nil, is returned by OnPodDeleted, which then

@@ -83,12 +83,8 @@ Two consequences:
 
 - The agent's ServiceAccount must carry no IAM role. With IRSA (or a Pod Identity association)
   on it, the agent signs as that role, can't resolve its node, and exits at boot.
-- Workload identity needs the `kubernetes` Service reachable, which on a new node waits for
-  kube-proxy. The agent doesn't wait for it to start: the Pod Identity credential endpoint and
-  the workload identity socket are served at once, and the agent resolves its node and lists its
-  node's pods in the background, retrying until the API server answers. Until that list
-  completes, see [Startup](#startup). Only an identity that isn't a node, such as the IRSA case
-  above, is fatal.
+- On a new node, the agent can't reach the API server until kube-proxy is running. The agent
+  starts anyway and retries in the background. See [Startup](#startup).
 
 Clusters without IAM authentication, such as kind, point the agent at a kubeconfig with a client
 certificate instead: set `agent.additionalArgs` to `{"--node-kubeconfig": <path>}` (a string flag,

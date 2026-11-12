@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -85,14 +86,12 @@ func TestPodByUID_Missing(t *testing.T) {
 	g.Expect(got).To(BeNil())
 }
 
-// TestNew_RequiresNodeName proves the store refuses to build without a
+// TestStart_RequiresNodeName proves the store refuses to start without a
 // node name, since an empty selector would scope the watch to the whole cluster.
-func TestNew_RequiresNodeName(t *testing.T) {
+func TestStart_RequiresNodeName(t *testing.T) {
 	g := NewWithT(t)
 
-	_, err := New(t.Context(), nil, "")
-
-	g.Expect(err).To(HaveOccurred())
+	g.Expect(newTestStore(t, fake.NewSimpleClientset()).Start(t.Context(), "")).To(HaveOccurred())
 }
 
 // TestStripDownPod_KeepsNeededFieldsDropsRest proves the informer transform
@@ -233,11 +232,11 @@ func TestOnPodDeleted_DeliversDeletedPodUID(t *testing.T) {
 
 	clientset := fake.NewSimpleClientset()
 	watching := watchPodsWithSignal(clientset)
-	store, err := New(ctx, clientset, testNode)
-	g.Expect(err).NotTo(HaveOccurred())
+	store := newTestStore(t, clientset)
+	g.Expect(store.Start(ctx, testNode)).To(Succeed())
 	g.Eventually(watching).WithTimeout(5 * time.Second).Should(BeClosed())
 
-	_, err = clientset.CoreV1().Pods("team-a").Create(ctx,
+	_, err := clientset.CoreV1().Pods("team-a").Create(ctx,
 		pod(testPodUID, "web-0", "team-a", "web", testNode), metav1.CreateOptions{})
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Eventually(func() bool {
@@ -292,11 +291,11 @@ func TestOnPodDeleted_RegisteredBeforeStart_HearsTheDeletion(t *testing.T) {
 	ctx := t.Context()
 	clientset := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
 	watching := watchPodsWithSignal(clientset)
-	store := NewStore()
+	store := newTestStore(t, clientset)
 	deleted := make(chan string, 4)
 	g.Expect(store.OnPodDeleted(func(uid string) { deleted <- uid })).To(Succeed())
 
-	g.Expect(store.Start(ctx, clientset, testNode)).To(Succeed())
+	g.Expect(store.Start(ctx, testNode)).To(Succeed())
 	g.Eventually(watching).WithTimeout(5 * time.Second).Should(BeClosed())
 	g.Expect(store.HasPod(testPodUID)).To(BeTrue())
 
@@ -305,19 +304,21 @@ func TestOnPodDeleted_RegisteredBeforeStart_HearsTheDeletion(t *testing.T) {
 	g.Expect(store.HasPod(testPodUID)).To(BeFalse())
 }
 
-// TestNewStore_BeforeStart_HoldsNoPods proves a store that hasn't synced reports
-// so and answers every lookup with a miss, and learns its node only with the sync.
-func TestNewStore_BeforeStart_HoldsNoPods(t *testing.T) {
+// TestNew_BeforeStart_HoldsNoPods proves a store that hasn't synced reports
+// so, answers every lookup with a miss and makes no API call, and learns its
+// node from Start.
+func TestNew_BeforeStart_HoldsNoPods(t *testing.T) {
 	g := NewWithT(t)
-	store := NewStore()
+	clientset := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
+	store := newTestStore(t, clientset)
 	g.Expect(store.Synced()).To(BeFalse())
 	g.Expect(store.NodeName()).To(BeEmpty())
 	g.Expect(store.HasPod(testPodUID)).To(BeFalse())
 	_, ok := store.PodByUID(testPodUID)
 	g.Expect(ok).To(BeFalse())
+	g.Expect(clientset.Actions()).To(BeEmpty(), "New must not call the API server")
 
-	clientset := fake.NewSimpleClientset(pod(testPodUID, "web-0", "team-a", "web", testNode))
-	g.Expect(store.Start(t.Context(), clientset, testNode)).To(Succeed())
+	g.Expect(store.Start(t.Context(), testNode)).To(Succeed())
 	g.Expect(store.Synced()).To(BeTrue())
 	g.Expect(store.NodeName()).To(Equal(testNode))
 	g.Expect(store.HasPod(testPodUID)).To(BeTrue())
@@ -328,9 +329,9 @@ func TestNewStore_BeforeStart_HoldsNoPods(t *testing.T) {
 func TestStart_ASecondStart_Fails(t *testing.T) {
 	g := NewWithT(t)
 	clientset := fake.NewSimpleClientset()
-	store := NewStore()
-	g.Expect(store.Start(t.Context(), clientset, testNode)).To(Succeed())
-	g.Expect(store.Start(t.Context(), clientset, testNode)).To(MatchError(ContainSubstring("already started")))
+	store := newTestStore(t, clientset)
+	g.Expect(store.Start(t.Context(), testNode)).To(Succeed())
+	g.Expect(store.Start(t.Context(), testNode)).To(MatchError(ContainSubstring("already started")))
 }
 
 // TestStart_ContextEndsBeforeTheSync_LeavesTheStoreEmpty proves a store whose
@@ -344,8 +345,8 @@ func TestStart_ContextEndsBeforeTheSync_LeavesTheStoreEmpty(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	store := NewStore()
-	g.Expect(store.Start(ctx, clientset, testNode)).To(MatchError(ContainSubstring("failed to sync")))
+	store := newTestStore(t, clientset)
+	g.Expect(store.Start(ctx, testNode)).To(MatchError(ContainSubstring("failed to sync")))
 	g.Expect(store.Synced()).To(BeFalse())
 }
 
@@ -356,8 +357,18 @@ func TestStart_ContextEndsBeforeTheSync_LeavesTheStoreEmpty(t *testing.T) {
 func TestOnPodDeleted_RefusesANilCallback(t *testing.T) {
 	g := NewWithT(t)
 
-	store, err := New(t.Context(), fake.NewSimpleClientset(), testNode)
-	g.Expect(err).NotTo(HaveOccurred())
+	store := newTestStore(t, fake.NewSimpleClientset())
+	g.Expect(store.Start(t.Context(), testNode)).To(Succeed())
 
 	g.Expect(store.OnPodDeleted(nil)).To(MatchError(ContainSubstring("callback is required")))
+}
+
+// newTestStore builds a store over clientset without starting it.
+func newTestStore(t *testing.T, clientset kubernetes.Interface) *Store {
+	t.Helper()
+	store, err := New(t.Context(), clientset)
+	if err != nil {
+		t.Fatalf("building the pod store: %v", err)
+	}
+	return store
 }
