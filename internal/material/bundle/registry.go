@@ -4,8 +4,8 @@
 //
 // The tier keeps one cache per workload identity provider, not per pod, and
 // learns each provider from the workload that reads it through Opts.Providers.
-// Opts.Signer picks whose credentials sign the call, a workload session at
-// launch. The agent serves exactly what GetTrustBundles returns, with no merge
+// Opts.Signer picks whose credentials sign the call; the agent uses the node
+// role. The agent serves exactly what GetTrustBundles returns, with no merge
 // across trust domains.
 package bundle
 

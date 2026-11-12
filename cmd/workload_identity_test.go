@@ -60,6 +60,34 @@ var wiOpts = handlers.WorkloadIdentityServerOpts{
 		Delegate: wiNoExchange{}, RenewalTtl: time.Hour, MaxSize: 100, CleanupInterval: time.Hour,
 	}),
 	EKSAuth: wiNoExchange{},
+	Cfg:     aws.Config{Credentials: wiNodeCredentials{}},
+}
+
+// wiNodeCreds are the node role's credentials, the agent's own.
+var wiNodeCreds = aws.Credentials{AccessKeyID: "AKID-node", SecretAccessKey: "secret", SessionToken: "node-session"}
+
+// wiNodeCredentials stands in for the agent's credentials chain. It is a struct,
+// not a func, so options that carry it still compare equal.
+type wiNodeCredentials struct{}
+
+func (wiNodeCredentials) Retrieve(context.Context) (aws.Credentials, error) {
+	return wiNodeCreds, nil
+}
+
+// TestBuildWorkloadIdentityTiers_NoNodeCredentials_Fails proves the tiers aren't
+// built when nothing can sign GetTrustBundles.
+func TestBuildWorkloadIdentityTiers_NoNodeCredentials_Fails(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	clients := wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode))
+	opts := wiOpts
+	opts.Cfg = aws.Config{}
+
+	tiers, err := buildWorkloadIdentityTiers(opts, clients, &wiCountingFetcher{})
+
+	g.Expect(err).To(MatchError(ContainSubstring("node's AWS credentials")))
+	g.Expect(tiers).To(BeNil())
 }
 
 // wiNoExchange stands in for EKS Auth. Building the tiers exchanges nothing, so

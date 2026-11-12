@@ -192,11 +192,17 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 	providers := workloadidentity.SessionProviderArns(sessionProvider)
 	hub := notify.NewHub(providers)
 
+	// GetTrustBundles signs with the node's credentials, the agent's own. They come
+	// from the SDK's credentials cache, which refreshes them when they expire and,
+	// for IMDS, keeps serving the old ones if a refresh fails.
+	if opts.Cfg.Credentials == nil {
+		return nil, errors.New("workload identity needs the node's AWS credentials to sign GetTrustBundles")
+	}
 	bundleSource, err := bundle.New(bundle.Opts{
 		Fetcher:   stsClient,
 		Notifier:  hub,
 		Providers: providers,
-		Signer:    bundle.WorkloadSessionSigner(sessionProvider),
+		Signer:    bundle.NodeRoleSigner(opts.Cfg.Credentials),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the trust bundle tier: %w", err)

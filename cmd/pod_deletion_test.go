@@ -11,6 +11,7 @@ import (
 	"errors"
 	"math/big"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -215,4 +216,47 @@ func (s *wiIssuingSTS) GetWebIdentityToken(_ context.Context, _ aws.Credentials,
 		return nil, err
 	}
 	return &sts.IssuedWebIdentityToken{Token: token, Expiration: expires}, nil
+}
+
+// wiRecordingBundleSTS records who signed each GetTrustBundles call, and refuses it.
+type wiRecordingBundleSTS struct {
+	*wiIssuingSTS
+
+	mu     sync.Mutex
+	signed []aws.Credentials
+}
+
+func (s *wiRecordingBundleSTS) GetTrustBundles(_ context.Context, creds aws.Credentials, _ string) ([]sts.TrustBundle, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signed = append(s.signed, creds)
+	return nil, errors.New("wiRecordingBundleSTS serves no trust bundles")
+}
+
+func (s *wiRecordingBundleSTS) signedWith() []aws.Credentials {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]aws.Credentials(nil), s.signed...)
+}
+
+// TestWorkloadIdentityTiers_GetTrustBundlesIsSignedAsTheNode proves the bundle
+// tier signs as the node, not as the reading pod.
+func TestWorkloadIdentityTiers_GetTrustBundlesIsSignedAsTheNode(t *testing.T) {
+	g := NewWithT(t)
+	w := &workloadidentity.Workload{
+		PodUID: "pod-uid-1", PodName: "pod-1", Namespace: "default", ServiceAccount: "sa-1", NodeName: wiTestNode,
+	}
+	client := newWINodeClientset("system:node:"+wiTestNode, w)
+	issuer := &wiRecordingBundleSTS{wiIssuingSTS: newWIIssuingSTS(t)}
+	opts := wiOpts
+	opts.CredentialCache = credcache.New(credcache.Opts{
+		Delegate: wiNoExchange{}, RenewalTtl: time.Hour, MaxSize: 100, CleanupInterval: time.Hour,
+	})
+	opts.EKSAuth = &wiEnrolledExchange{}
+	tiers, _ := wiBuildTiersWith(t, opts, client, issuer)
+
+	_, err := tiers.bundleSource.OwnTrustDomain(t.Context(), w)
+
+	g.Expect(err).To(MatchError(wierrors.ErrBundleUnavailable), "the fake refuses the call")
+	g.Expect(issuer.signedWith()).To(Equal([]aws.Credentials{wiNodeCreds}))
 }
