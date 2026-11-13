@@ -1,9 +1,8 @@
 // Package eksauthtest is a fake EKS Auth endpoint: an httptest server that
 // speaks restJson1 AssumeRoleForPodIdentity well enough for the real SDK
 // client, and the agent's clients built on it, to call it unmodified. Tests go
-// through the real serializer, signer, retryer and deserializer, and the
-// middleware in internal/cloud/eksauth that reads the member the SDK doesn't
-// model, instead of a mock that agrees with the code's assumptions.
+// through the real serializer, signer, retryer and deserializer instead of a
+// mock that agrees with the code's assumptions.
 //
 // A test sets the answer (SetSession, SetFunc, SetError, SetRawResponse) and
 // when it's sent (Block, Release). Every request is recorded, and every method
@@ -43,8 +42,8 @@ const (
 	// maxRequestBytes bounds how much of a request body is read. The SDK sends a
 	// token of a kilobyte or two.
 	maxRequestBytes = 1 << 20
-	// workloadIdentityProviderArnMember is EKS Auth's wire name for the member
-	// the released SDK doesn't model. It's spelled here, not taken from
+	// workloadIdentityProviderArnMember is EKS Auth's wire name for the provider
+	// ARN member. It's spelled here, not taken from
 	// internal/cloud/eksauth, so a wrong name in the client fails the client's
 	// own tests instead of being copied into the fake.
 	workloadIdentityProviderArnMember = "workloadIdentityProviderArn"
@@ -380,7 +379,7 @@ func writeSession(w http.ResponseWriter, session Session) {
 	if audience == "" {
 		audience = DefaultAudience
 	}
-	// A map rather than a struct at the top level, so the unmodelled member is
+	// A map rather than a struct at the top level, so the provider ARN member is
 	// named by workloadIdentityProviderArnMember, which cannot appear in a
 	// struct tag, and so it can be left out.
 	document := map[string]any{

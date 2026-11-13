@@ -73,8 +73,8 @@ func awaitCall(t *testing.T, ctx context.Context, errs <-chan error) error {
 }
 
 // rawPost sends an unsigned request and returns the status and the decoded
-// JSON body. The fake does not verify signatures, and this is the only way to
-// see the member the SDK drops.
+// JSON body. The fake does not verify signatures, so the body is the one sent
+// on the wire, before the SDK decodes it.
 func rawPost(t *testing.T, url string, body string) (int, map[string]any) {
 	t.Helper()
 	resp, err := http.Post(url+"/clusters/"+testClusterName+"/assume-role-for-pod-identity", "application/json",
@@ -112,7 +112,7 @@ func TestServer_AnswersWithAnEnrolledSessionForAnHourByDefault(t *testing.T) {
 	g.Expect(*out.Credentials.Expiration).To(BeTemporally(">=", before.Add(time.Hour)))
 	g.Expect(*out.Credentials.Expiration).To(BeTemporally("<=", after.Add(time.Hour)))
 
-	// The member the SDK drops is there too, read by the agent's client.
+	// The provider ARN member is there too, read by the agent's client.
 	_, metadata, err := eksauth.NewService(context.Background(), fake.Config(), false).GetIamCredentials(context.Background(),
 		&credentials.EksCredentialsRequest{ClusterName: testClusterName, ServiceAccountToken: testToken})
 	g.Expect(err).ToNot(HaveOccurred())
@@ -158,7 +158,7 @@ func TestServer_SetSessionControlsEveryMember(t *testing.T) {
 	g.Expect(metadata.ProviderArn()).To(Equal(session.ProviderArn))
 }
 
-func TestServer_SendsTheUnmodelledMemberOnlyWhenSet(t *testing.T) {
+func TestServer_SendsTheProviderArnMemberOnlyWhenSet(t *testing.T) {
 	g := NewWithT(t)
 	fake := New(t)
 	expiration := time.Unix(1790000000, 250*int64(time.Millisecond))
