@@ -36,6 +36,7 @@ var (
 	refreshQps              int
 	rotateCredentials       bool
 	enableIMDSCredentials   bool
+	enablePodLiveness       bool
 
 	// Workload identity tunables. The values the workload identity path shares
 	// with the Pod Identity webhook, the CSI driver or EKS Auth are constants in
@@ -171,6 +172,7 @@ func createServers(ctx context.Context, cfg aws.Config) ([]runnable, error) {
 		RefreshQPS:         refreshQps,
 		EndpointOverridden: overrideEksAuthEndpoint != "",
 		EnableIMDS:         enableIMDSCredentials,
+		EnablePodLiveness:  enablePodLiveness,
 	}
 	workloadIdentityOpts := newWorkloadIdentityServerOpts(cfg)
 	wiClients, err := buildSharedCredentialManager(ctx, &credentialOpts, &workloadIdentityOpts)
@@ -325,6 +327,9 @@ func init() {
 	serverCmd.Flags().StringVar(&overrideEksAuthEndpoint, "endpoint", "", "Override for EKS auth endpoint")
 	serverCmd.Flags().BoolVar(&enableIMDSCredentials, "enable-imds-credentials", false,
 		"Enable consuming credentials from IMDS when available on the node")
+	serverCmd.Flags().BoolVar(&enablePodLiveness, "enable-pod-liveness", false,
+		"Watch this node's pods and skip renewing (and promptly evict) credentials for pods that no longer exist. "+
+			"Requires the agent to run as the node identity. Off by default.")
 
 	serverCmd.Flags().BoolVar(&enableWorkloadIdentity, handlers.FlagEnableWorkloadIdentity, false,
 		"Enable serving SPIFFE workload identity on a Unix socket")
