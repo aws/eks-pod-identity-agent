@@ -42,10 +42,6 @@ var (
 	// package configuration and deliberately not flags.
 	enableWorkloadIdentity bool
 	nodeKubeconfig         string
-	x509SVIDDuration       time.Duration
-	jwtSVIDDuration        time.Duration
-	svidRenewalFraction    float64
-	svidRenewalJitter      float64
 	peerPidfd              bool
 )
 
@@ -72,16 +68,6 @@ var serverCmd = &cobra.Command{
 		if rotateCredentials {
 			log.Info("Credentials rotation enabled. Creds will be fetched and rotated from shared credentials file")
 			cfg.Credentials = aws.NewCredentialsCache(sharedcredsrotater.NewRotatingSharedCredentialsProvider())
-		}
-
-		// Fail the boot on a bad workload identity value rather than every pod on
-		// the node. An out-of-envelope SVID lifetime is rejected by STS on every
-		// issuance. With the feature off the values are unused, so they are not
-		// checked.
-		if opts := newWorkloadIdentityServerOpts(cfg); opts.Enabled {
-			if err := opts.Validate(); err != nil {
-				log.Fatalf("Invalid workload identity configuration: %v", err)
-			}
 		}
 
 		startServers(ctx, cfg)
@@ -237,16 +223,12 @@ func shareCredentialManager(manager handlers.CredentialManager, credentialOpts *
 // server is given its addr.
 func newWorkloadIdentityServerOpts(cfg aws.Config) handlers.WorkloadIdentityServerOpts {
 	return handlers.WorkloadIdentityServerOpts{
-		Enabled:             enableWorkloadIdentity,
-		Cfg:                 cfg,
-		NodeKubeconfig:      nodeKubeconfig,
-		ClusterName:         clusterName,
-		MaxCacheSize:        maxCacheSize,
-		X509SVIDDuration:    x509SVIDDuration,
-		JWTSVIDDuration:     jwtSVIDDuration,
-		SVIDRenewalFraction: svidRenewalFraction,
-		SVIDRenewalJitter:   svidRenewalJitter,
-		PeerPidfd:           peerPidfd,
+		Enabled:        enableWorkloadIdentity,
+		Cfg:            cfg,
+		NodeKubeconfig: nodeKubeconfig,
+		ClusterName:    clusterName,
+		MaxCacheSize:   maxCacheSize,
+		PeerPidfd:      peerPidfd,
 	}
 }
 
@@ -331,25 +313,6 @@ func init() {
 	serverCmd.Flags().StringVar(&nodeKubeconfig, handlers.FlagNodeKubeconfig, "",
 		"Kubeconfig workload identity reaches the API server with. Empty uses the in-cluster API server and CA, and the agent authenticates as the node with an IAM token signed from its AWS credentials. A kubeconfig whose user runs an exec plugin gets the same IAM token in place of the plugin; any other user (client certificate, token) is used as is, so it must be the node")
 
-	// Workload identity. Each requested SVID lifetime is a ceiling and not a
-	// grant: STS issues the least of what is asked for and what it allows, and
-	// the renewal schedule is derived from what it issued.
-	// the accepted range is read off the envelope rather than written out again,
-	// so --help cannot claim a bound validation does not enforce
-	// Twelve hours is both the top of the envelope and what STS issues when the request
-	// names no lifetime. Asking for less does not make anything
-	// safer, because a shorter certificate is replaced sooner and each replacement is a
-	// signing operation.
-	x509Lower, x509Upper := handlers.X509SVIDDurationBounds()
-	serverCmd.Flags().DurationVar(&x509SVIDDuration, handlers.FlagX509SVIDDuration, 12*time.Hour,
-		fmt.Sprintf("Lifetime requested for each X.509-SVID, between %s and %s", x509Lower, x509Upper))
-	jwtLower, jwtUpper := handlers.JWTSVIDDurationBounds()
-	serverCmd.Flags().DurationVar(&jwtSVIDDuration, handlers.FlagJWTSVIDDuration, time.Hour,
-		fmt.Sprintf("Lifetime requested for each JWT-SVID, between %s and %s", jwtLower, jwtUpper))
-	serverCmd.Flags().Float64Var(&svidRenewalFraction, handlers.FlagSVIDRenewalFraction, 0.5,
-		"Fraction of an SVID's issued lifetime at which renewal starts")
-	serverCmd.Flags().Float64Var(&svidRenewalJitter, handlers.FlagSVIDRenewalJitter, 0.1,
-		"Jitter applied to X.509-SVID and JWT-SVID renewal points, as a fraction of half the issued lifetime, so renewals on a node do not synchronise")
 	serverCmd.Flags().BoolVar(&peerPidfd, handlers.FlagPeerPidfd, true,
 		"Pin workload identity callers by SO_PEERPIDFD on kernels that have it (Linux 6.5+). Off, or on an older kernel, callers are pinned through their /proc handle")
 }

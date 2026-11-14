@@ -42,8 +42,8 @@ import (
 // The timing defaults. Each certificate is a signing operation at the customer's
 // certificate authority, so these favour asking less often over replacing promptly. The
 // janitor interval, the renewal timeout and the rate limit interact; change them together.
-// The lifetime we request and the point we replace at are not here. They come from
-// --x509-svid-duration, --svid-renewal-fraction and --svid-renewal-jitter.
+// The lifetime we request and the point we replace at are not here. The agent passes
+// them in Opts.
 const (
 	// defaultMinRemaining is how much life a certificate needs left before we hand it to
 	// a workload. A minute outlasts a TLS handshake and the requests that follow it, so a
@@ -107,14 +107,12 @@ type Opts struct {
 	// as "no limit", and an unbounded store of private keys should not happen by accident.
 	MaxCacheSize int
 
-	// Duration is the certificate lifetime we ask for, from --x509-svid-duration. Zero
-	// means we do not ask, which STS answers with twelve hours, the same as the flag's
-	// default.
+	// Duration is the certificate lifetime we ask for. Zero means we do not ask, which
+	// STS answers with twelve hours.
 	Duration time.Duration
 
-	// RenewFraction and RenewJitter decide when we replace a certificate, and come
-	// from --svid-renewal-fraction and --svid-renewal-jitter. They are checked at
-	// startup, so by the time we get here the values make sense. See renewal.go.
+	// RenewFraction and RenewJitter decide when we replace a certificate. See
+	// renewal.go.
 	RenewFraction float64
 	RenewJitter   float64
 

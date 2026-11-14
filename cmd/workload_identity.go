@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -27,6 +28,17 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers/sds"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/handlers/workloadapi"
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
+)
+
+// SVID lifetimes and renewal timing. The lifetimes are the most STS issues:
+// sts:GetWorkloadIdentityCertificate accepts up to 12h and sts:GetWebIdentityToken
+// up to 1h. Renewal starts halfway through the issued lifetime, spread by jitter
+// so the pods on a node don't all renew at once.
+const (
+	x509SVIDDuration    = 12 * time.Hour
+	jwtSVIDDuration     = time.Hour
+	svidRenewalFraction = 0.5
+	svidRenewalJitter   = 0.1
 )
 
 // workloadIdentityClients holds the node client, the node-scoped pod store and
@@ -126,8 +138,8 @@ func workloadIdentityServers(ctx context.Context, opts handlers.WorkloadIdentity
 	}
 	logger.FromContext(ctx).Infof("Workload identity is on: cluster %s, region %s, X.509-SVID lifetime %s, "+
 		"JWT-SVID lifetime %s, renewal at %v of the issued lifetime (jitter %v), SO_PEERPIDFD pinning %t",
-		opts.ClusterName, opts.Cfg.Region, opts.X509SVIDDuration, opts.JWTSVIDDuration,
-		opts.SVIDRenewalFraction, opts.SVIDRenewalJitter, opts.PeerPidfd)
+		opts.ClusterName, opts.Cfg.Region, x509SVIDDuration, jwtSVIDDuration,
+		svidRenewalFraction, svidRenewalJitter, opts.PeerPidfd)
 
 	// The path is the constant rather than a flag because it is a contract with
 	// the Pod Identity webhook and the CSI driver. The shutdown budget is left to
@@ -228,9 +240,9 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		Notifier:        hub,
 		PodStore:        clients.podStore,
 		MaxCacheSize:    opts.MaxCacheSize,
-		Duration:        opts.X509SVIDDuration,
-		RenewFraction:   opts.SVIDRenewalFraction,
-		RenewJitter:     opts.SVIDRenewalJitter,
+		Duration:        x509SVIDDuration,
+		RenewFraction:   svidRenewalFraction,
+		RenewJitter:     svidRenewalJitter,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the X.509-SVID tier: %w", err)
@@ -241,9 +253,9 @@ func buildWorkloadIdentityTiers(opts handlers.WorkloadIdentityServerOpts,
 		SessionProvider: sessionProvider,
 		PodStore:        clients.podStore,
 		MaxCacheSize:    opts.MaxCacheSize,
-		Duration:        opts.JWTSVIDDuration,
-		RenewalFraction: opts.SVIDRenewalFraction,
-		RenewalJitter:   opts.SVIDRenewalJitter,
+		Duration:        jwtSVIDDuration,
+		RenewalFraction: svidRenewalFraction,
+		RenewalJitter:   svidRenewalJitter,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("building the JWT-SVID tier: %w", err)
