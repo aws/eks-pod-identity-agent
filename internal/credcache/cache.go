@@ -350,38 +350,39 @@ func (c *Cache) onRefresh(podUID string, e *Entry) {
 		log.Infof("Credentials for pod %s were replaced or removed before their refresh, nothing to refresh", podUID)
 		return
 	}
-	if c.refreshLimiter.Allow() {
-		err := c.refreshLimiter.Wait(ctx)
-		if err != nil {
-			log.Errorf("Problem waiting, will schedule refresh to next sweep")
-			return
-		}
-		failedBy, err := c.renew(ctx, podUID, e)
-		if err == nil {
-			// if we retrieved the credentials successfully, exit we don't need to do anything else
-			promCacheState.WithLabelValues("hit").Inc()
-			return
-		}
-		if errors.Is(err, ErrForgotten) {
-			log.Infof("Pod %s was deleted while its credentials refreshed, not caching them", podUID)
-			return
-		}
-
-		errCode, isIrrecoverableError := noRequestErrCode, false
-		if failedBy != nil {
-			errCode, isIrrecoverableError = failedBy.IsIrrecoverable(err)
-		}
-		if isIrrecoverableError {
-			log.WithField("source", e.source()).Infof("Background refresh failed for pod %s: removing credentials from cache (irrecoverable): %v", podUID, err)
-			promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
-			c.Delete(podUID)
-			return
-		}
-		promCacheError.WithLabelValues("Recoverable", errCode).Inc()
-		log.WithField("source", e.source()).Infof("Background refresh failed for pod %s: keeping existing credentials in cache (recoverable): %v", podUID, err)
-	} else {
-		log.Infof("Background refresh rate limited for pod %s: keeping credentials locally", podUID)
+	// Pace renewals with the rate limiter to avoid overwhelming EKS Auth when a
+	// backlog of credentials needs refreshing. Wait() consumes exactly one token
+	// and blocks until one is available, bounded by the renewal context. This
+	// branch previously called both Allow() and Wait(), consuming two tokens per
+	// renewal (halving the effective --max-service-qps) and coupling a
+	// non-blocking skip path with a blocking one.
+	if err := c.refreshLimiter.Wait(ctx); err != nil {
+		log.Infof("Background refresh rate limited for pod %s, will retry on the next sweep: %v", podUID, err)
+		return
 	}
+	failedBy, err := c.renew(ctx, podUID, e)
+	if err == nil {
+		// if we retrieved the credentials successfully, exit we don't need to do anything else
+		promCacheState.WithLabelValues("hit").Inc()
+		return
+	}
+	if errors.Is(err, ErrForgotten) {
+		log.Infof("Pod %s was deleted while its credentials refreshed, not caching them", podUID)
+		return
+	}
+
+	errCode, isIrrecoverableError := noRequestErrCode, false
+	if failedBy != nil {
+		errCode, isIrrecoverableError = failedBy.IsIrrecoverable(err)
+	}
+	if isIrrecoverableError {
+		log.WithField("source", e.source()).Infof("Background refresh failed for pod %s: removing credentials from cache (irrecoverable): %v", podUID, err)
+		promCacheError.WithLabelValues("NonRecoverable", errCode).Inc()
+		c.Delete(podUID)
+		return
+	}
+	promCacheError.WithLabelValues("Recoverable", errCode).Inc()
+	log.WithField("source", e.source()).Infof("Background refresh failed for pod %s: keeping existing credentials in cache (recoverable): %v", podUID, err)
 	// if there was an error, try to keep the old credentials in the agent if they haven't expired
 	c.keep(ctx, podUID, e)
 }
