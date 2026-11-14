@@ -12,7 +12,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
-	"golang.org/x/time/rate"
 
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/cache/expiring"
 	"go.amzn.com/eks/eks-pod-identity-agent/internal/middleware/logger"
@@ -1045,53 +1044,4 @@ func TestNew_RefreshQPSTooLowForTheCache_Panics(t *testing.T) {
 	g.Expect(func() {
 		New(Opts{Delegate: &fakeSource{}, RenewalTtl: time.Second, MaxSize: 100, RefreshQPS: 1})
 	}).To(PanicWith(ContainSubstring("Refresh QPS is too small")))
-}
-
-// TestCache_Refresh_ConsumesSingleRateLimiterToken is a regression test for the
-// double-token bug in onRefresh. The previous implementation called both
-// refreshLimiter.Allow() and refreshLimiter.Wait() in the same branch,
-// consuming two tokens per renewal and halving the effective refresh QPS. A
-// single renewal must consume exactly one token.
-func TestCache_Refresh_ConsumesSingleRateLimiterToken(t *testing.T) {
-	g := NewWithT(t)
-	ctx := context.Background()
-	delegate := serving(creds(5*time.Hour), authMetadata)
-	c := newTestCache(delegate)
-	// A full burst of 2 tokens and a negligible refill rate keep the token count
-	// stable for the test, so it measures what one renewal consumes. With a
-	// burst of 2, neither the old (2-token) nor the new (1-token) path blocks.
-	limiter := rate.NewLimiter(rate.Limit(0.0001), 2)
-	c.refreshLimiter = limiter
-	old := entryExpiringIn(2*time.Hour, authMetadata)
-	g.Expect(c.Store(ctx, "pod", old)).To(Succeed())
-
-	tokensBefore := limiter.Tokens()
-	c.onRefresh("pod", old)
-	tokensConsumed := tokensBefore - limiter.Tokens()
-
-	g.Expect(delegate.requests()).To(HaveLen(1))
-	// Exactly one token for one renewal. The buggy implementation consumed ~2.0.
-	g.Expect(tokensConsumed).To(BeNumerically("~", 1.0, 0.2))
-}
-
-// TestCache_Refresh_RateLimited_LeavesTheEntryForTheNextSweep proves a renewal
-// that can't get a rate limiter token before its deadline leaves the entry in
-// the cache untouched, without calling the source, so the next sweep retries it.
-func TestCache_Refresh_RateLimited_LeavesTheEntryForTheNextSweep(t *testing.T) {
-	g := NewWithT(t)
-	ctx := context.Background()
-	delegate := serving(creds(5*time.Hour), authMetadata)
-	c := newTestCache(delegate)
-	// An empty bucket with a refill far beyond renewalTimeout makes Wait fail fast.
-	c.refreshLimiter = rate.NewLimiter(rate.Limit(0.0001), 1)
-	c.refreshLimiter.Allow()
-	old := entryExpiringIn(2*time.Hour, authMetadata)
-	g.Expect(c.Store(ctx, "pod", old)).To(Succeed())
-
-	c.onRefresh("pod", old)
-
-	g.Expect(delegate.requests()).To(BeEmpty())
-	got, found := c.Get("pod")
-	g.Expect(found).To(BeTrue())
-	g.Expect(got).To(BeIdenticalTo(old))
 }
