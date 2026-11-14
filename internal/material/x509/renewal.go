@@ -19,9 +19,8 @@ import "time"
 const minRenewalDelay = 10 * time.Second
 
 // renewalPoint picks the moment to replace a certificate valid from notBefore until
-// notAfter. fraction is how far through that window to aim for, from
-// --svid-renewal-fraction, so 0.5 replaces a 6 hour certificate after about 3 hours.
-// jitter, from --svid-renewal-jitter, spreads the moment so a node's pods do not renew
+// notAfter. fraction is how far through that window to aim for, so 0.5 replaces a 6
+// hour certificate after about 3 hours. jitter spreads the moment so a node's pods do not renew
 // together: 0.1 lands it between 45% and 55%. draw supplies the random number.
 func renewalPoint(notBefore, notAfter time.Time, fraction, jitter float64, draw func() float64) time.Time {
 	lifetime := notAfter.Sub(notBefore)

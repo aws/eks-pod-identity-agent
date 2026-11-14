@@ -47,14 +47,10 @@ const wiTestNode = "node-1"
 
 // wiOpts are the workload identity options the wiring tests build the tiers with.
 var wiOpts = handlers.WorkloadIdentityServerOpts{
-	Enabled:             true,
-	ClusterName:         "test-cluster",
-	NodeKubeconfig:      "/etc/kubernetes/kubelet/kubeconfig",
-	MaxCacheSize:        100,
-	X509SVIDDuration:    12 * time.Hour,
-	JWTSVIDDuration:     time.Hour,
-	SVIDRenewalFraction: 0.5,
-	SVIDRenewalJitter:   0.1,
+	Enabled:        true,
+	ClusterName:    "test-cluster",
+	NodeKubeconfig: "/etc/kubernetes/kubelet/kubeconfig",
+	MaxCacheSize:   100,
 	// Sweep an hour away: building the tiers caches nothing, so there's nothing to refresh.
 	CredentialCache: credcache.New(credcache.Opts{
 		Delegate: wiNoExchange{}, RenewalTtl: time.Hour, MaxSize: 100, CleanupInterval: time.Hour,
@@ -902,23 +898,6 @@ func TestBuildWorkloadIdentityTiers_NoCredentialCache_FailsBuildingTheSessionTie
 	g.Expect(err).To(MatchError(ContainSubstring("building the session tier")))
 	g.Expect(err).To(MatchError(ContainSubstring("--max-credential-retention-before-renewal")))
 	g.Expect(err).To(MatchError(ContainSubstring("--max-cache-size")))
-	g.Expect(tiers).To(BeNil())
-}
-
-// TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSource
-// proves the JWT-SVID source is built with the tiers over the clients' pod
-// store: a zero lifetime, which Validate would have refused, fails the build.
-func TestBuildWorkloadIdentityTiers_NoJWTSVIDDuration_FailsBuildingTheTokenSource(t *testing.T) {
-	g := NewWithT(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	opts := wiOpts
-	opts.JWTSVIDDuration = 0
-
-	tiers, err := buildWorkloadIdentityTiers(opts, wiClients(t, ctx, newWINodeClientset("system:node:"+wiTestNode)),
-		&wiCountingFetcher{})
-
-	g.Expect(err).To(MatchError(ContainSubstring("building the JWT-SVID tier")))
 	g.Expect(tiers).To(BeNil())
 }
 
