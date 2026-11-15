@@ -16,8 +16,7 @@ import (
 
 var testRetryBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 1 << 30, Cap: time.Millisecond}
 
-// captureLogs installs a hook on the shared logger and raises its level so
-// Debug lines are captured too, restoring both after the test.
+// captureLogs captures Debug and up on the shared logger for one test.
 func captureLogs(t *testing.T) *logtest.Hook {
 	t.Helper()
 	base := logger.FromContext(context.Background()).Logger
@@ -48,10 +47,7 @@ func setRetryWarnAfter(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { retryWarnAfter = old })
 }
 
-// A step that keeps failing retryably is retried until its caller gives up, and
-// once the RPC has waited retryWarnAfter each retry is logged at Warn with the
-// error that holds it and the attested pod, so a stuck workload is visible at
-// the default log level.
+// After retryWarnAfter, each retry logs at Warn with the error and the pod.
 func TestAwait_RetryableFailure_IsLoggedAtWarnAfterThreshold(t *testing.T) {
 	g := NewWithT(t)
 	hook := captureLogs(t)
@@ -80,8 +76,7 @@ func TestAwait_RetryableFailure_IsLoggedAtWarnAfterThreshold(t *testing.T) {
 	g.Expect(warns[0].Data).To(HaveKey("waiting-for"))
 }
 
-// Before the threshold a retry is Debug, so a cold start that retries briefly
-// adds nothing at the default log level.
+// Before retryWarnAfter, retries log at Debug only.
 func TestAwait_RetryableFailure_BeforeThreshold_IsDebugOnly(t *testing.T) {
 	g := NewWithT(t)
 	hook := captureLogs(t)
