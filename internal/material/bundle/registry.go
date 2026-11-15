@@ -58,7 +58,8 @@ const (
 
 	// retryBaseDelay and retryMaxDelay bound the exponential backoff after a
 	// failed fetch, so a long outage or a refusal that never clears costs each
-	// node one call per provider every 10 minutes.
+	// node one call per provider every 10 minutes. A tombstone refusal skips the
+	// backoff and waits defaultRefreshInterval instead.
 	retryBaseDelay = 10 * time.Second
 	retryMaxDelay  = 10 * time.Minute
 

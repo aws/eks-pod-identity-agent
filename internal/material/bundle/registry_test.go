@@ -1005,8 +1005,8 @@ func TestRegistry_TombstoneCodeOnRefresh_TombstonesAndWakesStreams(t *testing.T)
 			g.Expect(entry).ToNot(BeNil(), "the provider stays cached as a tombstone")
 			g.Expect(entry.source.current.Load()).To(BeNil(), "its snapshot is gone, so nothing can serve it")
 			g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", clock.Now().Add(tombstoneTTL)))
-			g.Expect(certStream).To(Receive(), "X.509 streams read again and find the provider gone")
-			g.Expect(jwtStream).To(Receive(), "JWT streams read again and find the provider gone")
+			g.Expect(certStream).To(Receive(), "X.509 streams read again and find the provider refused")
+			g.Expect(jwtStream).To(Receive(), "JWT streams read again and find the provider refused")
 			for _, w := range []*workloadidentity.Workload{ownPod, pod("new-pod")} {
 				_, err = registry.X509Bundles(ctx, w)
 				g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
@@ -1037,7 +1037,7 @@ func TestRegistry_TombstoneCodeOnFirstRead_TombstonesAndReadsDoNotAskAgain(t *te
 				"OwnTrustDomain": func(w *workloadidentity.Workload) error { _, err := registry.OwnTrustDomain(ctx, w); return err },
 				"Lease":          func(w *workloadidentity.Workload) error { _, err := registry.Lease(ctx, w); return err },
 			}
-			clock.Advance(time.Hour) // well past the backoff, which a read never follows for a tombstone
+			clock.Advance(time.Hour) // past the tombstone's retry time, which only the refresher acts on
 			for name, read := range reads {
 				for _, w := range []*workloadidentity.Workload{ownPod, pod("new-pod")} {
 					err := read(w)
@@ -1051,22 +1051,45 @@ func TestRegistry_TombstoneCodeOnFirstRead_TombstonesAndReadsDoNotAskAgain(t *te
 	}
 }
 
-func TestRegistry_Tombstone_IsRefreshedOnTheBackoffAndKeepsItsFirstExpiry(t *testing.T) {
+func TestRegistry_Tombstone_IsRefreshedEveryFiveMinutesAndKeepsItsFirstExpiry(t *testing.T) {
 	g := NewWithT(t)
-	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(fail(stsError("ResourceNotFoundException"))))
+	// The bundle's hint is shorter than the default, and the tombstone ignores it.
+	const hint = 120 * time.Second
+	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, int(hint.Seconds()), x509Key(t, newAuthority(t, "ca")))}
+	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError("ResourceNotFoundException"))))
+	ctx := context.Background()
+	_, err := registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	clock.Advance(hint)
+	registry.refreshDue(ctx)
+	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).ToNot(BeZero())
+	expiry := clock.Now().Add(tombstoneTTL)
+	for i := range 3 {
+		g.Expect(registry.entryFor(testProviderArn).source.dueAt()).To(BeTemporally("==", clock.Now().Add(defaultRefreshInterval)),
+			"a tombstone is retried every defaultRefreshInterval, not on the backoff or the old hint")
+		clock.Advance(defaultRefreshInterval - time.Second)
+		registry.refreshDue(ctx)
+		g.Expect(fetcher.Calls(testProviderArn)).To(Equal(i+2), "not due early")
+		clock.Advance(time.Second)
+		registry.refreshDue(ctx)
+		g.Expect(fetcher.Calls(testProviderArn)).To(Equal(i + 3))
+		g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", expiry), "another refusal keeps the first expiry")
+	}
+}
+
+func TestRegistry_Tombstone_WithNoSuccessfulFetch_IsRefreshedEveryFiveMinutes(t *testing.T) {
+	g := NewWithT(t)
+	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(fail(stsError("AccessDenied"))))
 	ctx := context.Background()
 	_, err := registry.JWTBundles(ctx, ownPod)
 	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
-	expiry := clock.Now().Add(tombstoneTTL)
-
+	g.Expect(registry.entryFor(testProviderArn).source.dueAt()).To(BeTemporally("==", clock.Now().Add(defaultRefreshInterval)))
+	clock.Advance(defaultRefreshInterval - time.Second)
 	registry.refreshDue(ctx)
-	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(1), "not due until the first backoff passes")
-	for i, delay := range []time.Duration{retryBaseDelay, 2 * retryBaseDelay, 4 * retryBaseDelay} {
-		clock.Advance(delay)
-		registry.refreshDue(ctx)
-		g.Expect(fetcher.Calls(testProviderArn)).To(Equal(i+2), "the refresher keeps checking the tombstone on its backoff")
-		g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", expiry), "another ResourceNotFoundException keeps the first expiry")
-	}
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(1))
+	clock.Advance(time.Second)
+	registry.refreshDue(ctx)
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(2))
 }
 
 func TestRegistry_Tombstone_IsRevivedByASuccessfulRefresh(t *testing.T) {
@@ -1078,7 +1101,7 @@ func TestRegistry_Tombstone_IsRevivedByASuccessfulRefresh(t *testing.T) {
 	_, err := registry.X509Bundles(ctx, ownPod)
 	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
 
-	clock.Advance(retryBaseDelay)
+	clock.Advance(defaultRefreshInterval)
 	registry.refreshDue(ctx)
 
 	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeZero(), "a provider recreated under the same ARN is live again")
@@ -1116,7 +1139,7 @@ func TestRegistry_Tombstone_IsKeptPastTheIdleTTLAndSweptAfterTombstoneTTL(t *tes
 	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", clock.Now().Add(tombstoneTTL)), "and tombstones it afresh")
 }
 
-func TestRegistry_ProviderNotFound_LeavesOtherProvidersAlone(t *testing.T) {
+func TestRegistry_Tombstone_LeavesOtherProvidersAlone(t *testing.T) {
 	g := NewWithT(t)
 	fetcher := newProviderFetcher(map[string]func(int) ([]sts.TrustBundle, error){
 		testProviderArn:  sequence(fail(stsError("ResourceNotFoundException"))),
@@ -1143,7 +1166,7 @@ func TestRegistry_OtherRefusalsOnRefresh_KeepTheProviderAndItsBundle(t *testing.
 			g.Expect(err).ToNot(HaveOccurred())
 			clock.Advance(defaultRefreshInterval)
 			registry.refreshDue(ctx)
-			g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "only a missing provider is dropped")
+			g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "only a tombstone code tombstones the provider")
 			bundles, err := registry.X509Bundles(ctx, ownPod)
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(rawBundles(bundles)).To(Equal(map[string][][]byte{testDomain: {ca.der}}), "the last good bundle is still served")
@@ -1183,4 +1206,91 @@ func TestRegistry_SignerTombstoneCode_DoesNotTombstoneTheProvider(t *testing.T) 
 			g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeZero(), "only GetTrustBundles saying so tombstones the provider")
 		})
 	}
+}
+
+// logsAt returns the messages hook has seen at level that contain substr.
+func logsAt(hook *logtest.Hook, level logrus.Level, substr string) []*logrus.Entry {
+	var out []*logrus.Entry
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == level && strings.Contains(entry.Message, substr) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func TestRegistry_TombstonedLiveProvider_IsRevivedOnTheNormalScheduleWithoutANotification(t *testing.T) {
+	g := NewWithT(t)
+	oldCA, newCA := newAuthority(t, "old"), newAuthority(t, "new")
+	registry, fetcher, notifier, _, clock := newRespondingRegistry(t, sequence(
+		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, oldCA))}),
+		fail(stsError("AccessDenied")),
+		ok(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newCA))}),
+	))
+	hook := logtest.NewLocal(logger.FromContext(context.Background()).Logger)
+	defer hook.Reset()
+	ctx := context.Background()
+	_, err := registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	clock.Advance(defaultRefreshInterval)
+	registry.refreshDue(ctx)
+	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}), "tombstoning a live provider wakes its streams")
+
+	clock.Advance(defaultRefreshInterval)
+	registry.refreshDue(ctx)
+
+	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeZero())
+	bundles, err := registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(rawBundles(bundles)).To(Equal(map[string][][]byte{testDomain: {newCA.der}}), "the revived provider serves what STS returns now")
+	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}), "a revival is not a change: no stream holds the old bundle")
+	g.Expect(registry.entryFor(testProviderArn).source.dueAt()).To(BeTemporally("==", clock.Now().Add(defaultRefreshInterval)),
+		"a revived provider is back on the normal interval, not the backoff")
+	g.Expect(logsAt(hook, logrus.InfoLevel, "exists again")).To(HaveLen(1))
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3))
+}
+
+func TestRegistry_TombstoneRefreshes_LogOneWarningAndNoLastGoodBundleWarning(t *testing.T) {
+	g := NewWithT(t)
+	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}
+	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError("ResourceNotFoundException"))))
+	hook := logtest.NewLocal(logger.FromContext(context.Background()).Logger)
+	defer hook.Reset()
+	ctx := context.Background()
+	_, err := registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	clock.Advance(defaultRefreshInterval)
+	registry.refreshDue(ctx)
+	for range 3 {
+		clock.Advance(defaultRefreshInterval)
+		registry.refreshDue(ctx)
+	}
+
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(5))
+	warnings := logsAt(hook, logrus.WarnLevel, "STS refused the workload identity provider's trust bundles")
+	g.Expect(warnings).To(HaveLen(1), "only the first refusal is logged as a warning")
+	g.Expect(warnings[0].Data).To(HaveKey(logrus.ErrorKey), "the warning carries the STS error")
+	g.Expect(logsAt(hook, logrus.WarnLevel, "serving the last good bundle")).To(BeEmpty(), "a tombstone serves nothing")
+}
+
+func TestRegistry_Tombstone_WithALeaseFromBeforeIt_IsStillSweptAfterTombstoneTTL(t *testing.T) {
+	g := NewWithT(t)
+	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}
+	registry, _, _, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError("ResourceNotFoundException"))))
+	ctx := context.Background()
+	release, err := registry.Lease(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	defer release()
+	_, err = registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	clock.Advance(defaultRefreshInterval)
+	registry.refreshDue(ctx)
+	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).ToNot(BeZero())
+
+	clock.Advance(tombstoneTTL)
+	registry.sweep(ctx)
+	g.Expect(registry.entryFor(testProviderArn)).To(BeNil(), "a lease taken before the tombstone does not keep it")
+	release() // releasing afterwards touches only the evicted entry
+	g.Expect(registry.entryFor(testProviderArn)).To(BeNil())
 }

@@ -248,16 +248,26 @@ func (s *providerSource) load(ctx context.Context, sign signFunc) (*snapshot, er
 }
 
 // recordOutcome remembers a fetch's result for the fetches that follow it and
-// schedules the next refresh: a failure's backoff, or the refresh interval. The
-// caller holds the semaphore, and on success stores the snapshot right after.
+// schedules the next refresh after a failure: the refresh interval for a
+// tombstone, the backoff otherwise. On success store schedules it. The caller
+// holds the semaphore.
 func (s *providerSource) recordOutcome(err error) {
 	if err == nil {
 		s.failures, s.lastErr, s.retryAt = 0, nil, time.Time{}
 		return
 	}
-	s.failures++
 	s.lastErr = err
-	s.retryAt = s.now().Add(s.retryDelay(s.failures))
+	if causesTombstone(err) {
+		// A tombstoned provider is retried every defaultRefreshInterval, not on
+		// the backoff, and does not count toward the backoff.
+		s.failures = 0
+		s.retryAt = s.now().Add(shorten(defaultRefreshInterval, s.jitter()))
+	} else {
+		s.failures++
+		// Other failures retry on an exponential backoff: 10s, doubling with each
+		// consecutive failure, up to 10 min.
+		s.retryAt = s.now().Add(s.retryDelay(s.failures))
+	}
 	s.due.Store(s.retryAt.UnixNano())
 }
 
@@ -367,6 +377,8 @@ func (s *providerSource) store(ctx context.Context, nextSnapshot *snapshot) {
 	} else {
 		s.current.Store(nextSnapshot)
 	}
+	// Next refresh follows the bundle's refresh hint (1 min to 1 h), or 5 min
+	// without one.
 	s.due.Store(s.now().Add(s.refreshDelay()).UnixNano())
 	// Revive after the snapshot is stored.
 	if s.tombstoneExpiresAt.Swap(0) != 0 {

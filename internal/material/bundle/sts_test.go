@@ -76,28 +76,49 @@ func TestRegistry_OverTheSTSClient_FetchesSignedWithTheWorkloadSession(t *testin
 	g.Expect(authorizations[0]).To(ContainSubstring("Credential=AKID-own-pod/"), "signed with the workload's session")
 }
 
-// TestRegistry_OverTheSTSClient_UnknownProvider_IsARefusal carries the one error
-// the API model declares for GetTrustBundles through the real client, so the
-// classification is pinned against the wire error and not only a hand-built one.
-func TestRegistry_OverTheSTSClient_UnknownProvider_IsARefusal(t *testing.T) {
-	g := NewWithT(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(w, `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">`+
-			`<Error><Type>Sender</Type><Code>ResourceNotFoundException</Code><Message>no such provider</Message></Error>`+
-			`<RequestId>req-1</RequestId></ErrorResponse>`)
-	}))
-	defer server.Close()
-	registry, err := New(sessionOpts(
-		sts.NewService(aws.Config{Region: "us-west-2", BaseEndpoint: aws.String(server.URL)}),
-		&fake.Subscriber{},
-		newTestSessions(),
-	))
-	g.Expect(err).ToNot(HaveOccurred())
+// TestRegistry_OverTheSTSClient_TombstoneCodes_TombstoneTheProvider carries each
+// tombstone code through the real client, so the classification is pinned against
+// the wire error and not only a hand-built one.
+func TestRegistry_OverTheSTSClient_TombstoneCodes_TombstoneTheProvider(t *testing.T) {
+	for _, tc := range []struct {
+		code   string
+		status int
+	}{
+		{"ResourceNotFoundException", http.StatusNotFound},
+		{"AccessDenied", http.StatusForbidden},
+		{"AccessDeniedException", http.StatusForbidden},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			g := NewWithT(t)
+			var mu sync.Mutex
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				requests++
+				mu.Unlock()
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">`+
+					`<Error><Type>Sender</Type><Code>`+tc.code+`</Code><Message>refused on the wire</Message></Error>`+
+					`<RequestId>req-1</RequestId></ErrorResponse>`)
+			}))
+			defer server.Close()
+			registry, err := New(sessionOpts(
+				sts.NewService(aws.Config{Region: "us-west-2", BaseEndpoint: aws.String(server.URL)}),
+				&fake.Subscriber{},
+				newTestSessions(),
+			))
+			g.Expect(err).ToNot(HaveOccurred())
+			_, err = registry.X509Bundles(context.Background(), ownPod)
+			g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+			g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
+			g.Expect(err).To(MatchError(ContainSubstring("refused on the wire")))
+			g.Expect(registry.tombstoneExpiresAt(testProviderArn)).ToNot(BeZero(), "the wire error tombstones the provider")
 
-	_, err = registry.X509Bundles(context.Background(), ownPod)
-
-	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
-	g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
-	g.Expect(err).To(MatchError(ContainSubstring("no such provider")))
+			_, err = registry.JWTBundles(context.Background(), ownPod)
+			g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+			mu.Lock()
+			defer mu.Unlock()
+			g.Expect(requests).To(Equal(1), "a read of the tombstone sends nothing to STS")
+		})
+	}
 }
