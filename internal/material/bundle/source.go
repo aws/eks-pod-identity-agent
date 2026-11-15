@@ -29,6 +29,9 @@ type providerSource struct {
 	providerArn string
 	fetcher     Fetcher
 	notifier    workloadidentity.BundleNotifier
+	// onNotFound is called when a fetch finds STS has no such provider, so the
+	// Registry can evict the source. Nil for a source no Registry holds.
+	onNotFound func(context.Context)
 
 	// current is the last good snapshot, nil until the first fetch succeeds. A
 	// failed fetch never replaces it.
@@ -274,6 +277,8 @@ func (s *providerSource) release() {
 // fetch makes one GetTrustBundles call signed with creds and parses the response.
 // An error is ErrBundleRefused when STS refused in a way a repeat cannot change,
 // and ErrBundleUnavailable otherwise, including a response the tier will not serve.
+// A refusal because the provider does not exist also matches errProviderNotFound,
+// and the source forgets the provider before returning it.
 func (s *providerSource) fetch(ctx context.Context, creds aws.Credentials) (*snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
@@ -286,13 +291,35 @@ func (s *providerSource) fetch(ctx context.Context, creds aws.Credentials) (*sna
 		if err != nil {
 			err = wierrors.ErrBundleUnavailable.Wrapf(err, "GetTrustBundles for %s returned trust material the agent will not serve", s.providerArn)
 		}
+	} else if hasCode(err, codeResourceNotFound) {
+		err = wierrors.ErrBundleRefused.Wrapf(fmt.Errorf("%w: %w", errProviderNotFound, err),
+			"GetTrustBundles for %s found no such provider", s.providerArn)
 	} else if refused(err) {
 		err = wierrors.ErrBundleRefused.Wrapf(err, "GetTrustBundles for %s was refused", s.providerArn)
 	} else {
 		err = wierrors.ErrBundleUnavailable.Wrapf(err, "GetTrustBundles for %s failed", s.providerArn)
 	}
 	observeFetch(err, time.Since(start).Seconds())
+	if providerNotFound(err) {
+		s.forget(ctx)
+	}
 	return nextSnapshot, err
+}
+
+// forget handles a provider STS says does not exist: the Registry evicts the
+// source, and the source stops serving its snapshot to any reader still holding
+// it. When there was a snapshot, the provider's streams are woken so they read
+// again and end on the refusal instead of keeping the deleted provider's
+// authorities. The caller holds the semaphore.
+func (s *providerSource) forget(ctx context.Context) {
+	if s.onNotFound != nil {
+		s.onNotFound(ctx)
+	}
+	if s.current.Swap(nil) == nil {
+		return
+	}
+	s.notifier.NotifyCertBundleChange(s.providerArn)
+	s.notifier.NotifyJWTBundleChange(s.providerArn)
 }
 
 // store makes nextSnapshot current, schedules the next refresh, then notifies each
@@ -362,22 +389,43 @@ func shorten(d time.Duration, r float64) time.Duration {
 	return d - time.Duration(float64(d)*refreshJitter*r)
 }
 
+// codeResourceNotFound is the STS error code for a provider that does not exist
+// or is not visible to the caller.
+const codeResourceNotFound = "ResourceNotFoundException"
+
+// errProviderNotFound marks a fetch error as STS reporting the provider does not
+// exist. It is set only where GetTrustBundles fails, because a workload session
+// signer can fail with an EKS Auth ResourceNotFoundException that says nothing
+// about the provider.
+var errProviderNotFound = errors.New("the workload identity provider does not exist")
+
+// providerNotFound reports whether err is a fetch that found no such provider.
+func providerNotFound(err error) bool {
+	return errors.Is(err, errProviderNotFound)
+}
+
 // refusedCodes are the STS error codes a repeat cannot change. ValidationError is
 // what a malformed provider ARN gets. It is a list rather than every client fault
 // because STS reports throttling and an expired or skewed signature as client
-// faults too, and those clear up on their own.
+// faults too, and those clear up on their own. ResourceNotFoundException is
+// refused as well, through errProviderNotFound.
 var refusedCodes = map[string]bool{
-	"ResourceNotFoundException": true,
-	"AccessDenied":              true,
-	"AccessDeniedException":     true,
-	"ValidationError":           true,
-	"InvalidAction":             true,
+	"AccessDenied":          true,
+	"AccessDeniedException": true,
+	"ValidationError":       true,
+	"InvalidAction":         true,
 }
 
 // refused reports whether err is an STS refusal a repeat cannot change.
 func refused(err error) bool {
 	var apiErr smithy.APIError
 	return errors.As(err, &apiErr) && refusedCodes[apiErr.ErrorCode()]
+}
+
+// hasCode reports whether err is an STS error with the given code.
+func hasCode(err error, code string) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == code
 }
 
 // parseResponse turns a GetTrustBundles response into a snapshot, or refuses it.

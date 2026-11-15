@@ -286,6 +286,7 @@ func (r *Registry) entryLocked(providerArn string) *providerEntry {
 		r.configure(source)
 	}
 	entry := &providerEntry{source: source, holders: map[string]*leaseHolder{}}
+	source.onNotFound = func(ctx context.Context) { r.evictNotFound(ctx, entry) }
 	r.entries[providerArn] = entry
 	if len(r.entries) > softProviderCap {
 		logger.FromContext(context.Background()).WithField("provider_arn", providerArn).
@@ -336,10 +337,28 @@ func (r *Registry) refreshDue(ctx context.Context) {
 			log.WithError(err).Warn("No credentials to refresh trust bundles with")
 			continue
 		}
-		if err := item.entry.source.refresh(ctx, creds, item.due); err != nil && ctx.Err() == nil {
+		// A provider that does not exist has already been evicted by its source.
+		if err := item.entry.source.refresh(ctx, creds, item.due); err != nil && ctx.Err() == nil && !providerNotFound(err) {
 			log.WithError(err).Warn("Trust bundle refresh failed, serving the last good bundle")
 		}
 	}
+}
+
+// evictNotFound evicts entry once its source finds STS has no such provider, with
+// its backoff and leases. Nothing retries the provider; a later read or lease
+// learns it again as new. It does nothing when entry is no longer the provider's.
+// The source calls it holding its fetch semaphore, which is safe because nothing
+// waits on a semaphore while holding r.mu.
+func (r *Registry) evictNotFound(ctx context.Context, entry *providerEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	providerArn := entry.source.providerArn
+	if r.entries[providerArn] != entry {
+		return
+	}
+	delete(r.entries, providerArn)
+	logger.FromContext(ctx).WithField("provider_arn", providerArn).
+		Warn("Evicted trust bundles for a workload identity provider that does not exist")
 }
 
 // sweep evicts every provider with no lease whose providerIdleTTL has passed. A

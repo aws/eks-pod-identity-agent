@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	. "github.com/onsi/gomega"
@@ -938,4 +939,128 @@ func TestRegistry_ConcurrentLeasesReadsRefreshesAndSweeps_AreRaceFree(t *testing
 		leases := registry.leasesFor(arn)
 		g.Expect(leases == -1 || leases == 0).To(BeTrue(), "every lease was released: %s has %d", arn, leases)
 	}
+}
+
+// stsError is how a GetTrustBundles failure with an STS error code reaches the tier.
+func stsError(code string) error {
+	return &smithy.OperationError{ServiceID: "STS", OperationName: "GetTrustBundles",
+		Err: &smithy.GenericAPIError{Code: code, Message: "no", Fault: smithy.FaultClient}}
+}
+
+// newRespondingRegistry builds a registry over one canned response for
+// testProviderArn, with the registry and every source on one hand-moved clock and
+// no jitter, and the notifier's streams resolving providers as the tier does.
+func newRespondingRegistry(t *testing.T, respond func(int) ([]sts.TrustBundle, error)) (*Registry, *providerFetcher, *fake.Subscriber, *testSessions, *leaseClock) {
+	t.Helper()
+	fetcher := newProviderFetcher(map[string]func(int) ([]sts.TrustBundle, error){testProviderArn: respond})
+	registry, notifier, sessions := newTestRegistry(t, fetcher)
+	notifier.Providers = workloadidentity.SessionProviderArns(sessions)
+	clock := &leaseClock{now: time.Now()}
+	registry.now = clock.Now
+	registry.configure = func(source *providerSource) {
+		source.now = clock.Now
+		source.jitter = func() float64 { return 0 }
+	}
+	return registry, fetcher, notifier, sessions, clock
+}
+
+func TestRegistry_ProviderNotFoundOnRefresh_IsDroppedAndItsStreamsWoken(t *testing.T) {
+	g := NewWithT(t)
+	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")), jwtECKey(t, "k1", newECKey(t)))}
+	registry, fetcher, notifier, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError("ResourceNotFoundException"))))
+	ctx := context.Background()
+	certStream, releaseCert, err := notifier.SubscribeToCertBundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	defer releaseCert()
+	jwtStream, releaseJWT, err := notifier.SubscribeToJWTBundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	defer releaseJWT()
+	<-certStream
+	<-jwtStream
+	release, err := registry.Lease(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	defer release()
+	_, err = registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	stale := registry.entryFor(testProviderArn).source
+
+	clock.Advance(defaultRefreshInterval)
+	registry.refreshDue(ctx)
+
+	g.Expect(registry.entryFor(testProviderArn)).To(BeNil(), "a lease does not keep a provider STS says does not exist")
+	g.Expect(certStream).To(Receive(), "X.509 streams read again and find the provider gone")
+	g.Expect(jwtStream).To(Receive(), "JWT streams read again and find the provider gone")
+	_, err = stale.X509Bundles(ctx, signTest)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused), "a reader still holding the dropped source is not served its snapshot")
+
+	_, err = registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+	g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3), "the next read learns the provider again as new and asks STS")
+	g.Expect(registry.entryFor(testProviderArn)).To(BeNil(), "and drops it again")
+	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}), "a provider with nothing cached wakes no stream")
+}
+
+func TestRegistry_ProviderNotFoundOnFirstRead_IsNotKept(t *testing.T) {
+	g := NewWithT(t)
+	registry, fetcher, notifier, _, _ := newRespondingRegistry(t, sequence(fail(stsError("ResourceNotFoundException"))))
+	ctx := context.Background()
+	for range 3 {
+		_, err := registry.JWTBundles(ctx, ownPod)
+		g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+		g.Expect(registry.entryFor(testProviderArn)).To(BeNil())
+	}
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3), "no backoff outlives the dropped provider")
+	g.Expect(notified(notifier)).To(Equal(notifications{}))
+	registry.refreshDue(ctx)
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3), "nothing retries a dropped provider")
+}
+
+func TestRegistry_OtherRefusalsOnRefresh_KeepTheProviderAndItsBundle(t *testing.T) {
+	for _, code := range []string{"AccessDenied", "AccessDeniedException", "ValidationError", "InvalidAction"} {
+		t.Run(code, func(t *testing.T) {
+			g := NewWithT(t)
+			ca := newAuthority(t, "ca")
+			good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca))}
+			registry, _, notifier, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError(code))))
+			ctx := context.Background()
+			_, err := registry.X509Bundles(ctx, ownPod)
+			g.Expect(err).ToNot(HaveOccurred())
+			clock.Advance(defaultRefreshInterval)
+			registry.refreshDue(ctx)
+			g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "only a missing provider is dropped")
+			bundles, err := registry.X509Bundles(ctx, ownPod)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(rawBundles(bundles)).To(Equal(map[string][][]byte{testDomain: {ca.der}}), "the last good bundle is still served")
+			g.Expect(notified(notifier)).To(Equal(notifications{}))
+		})
+	}
+}
+
+// signerFunc is a Signer backed by a function.
+type signerFunc func(context.Context, string, []*workloadidentity.Workload) (aws.Credentials, error)
+
+func (f signerFunc) Credentials(ctx context.Context, providerArn string, workloads []*workloadidentity.Workload) (aws.Credentials, error) {
+	return f(ctx, providerArn, workloads)
+}
+
+func TestRegistry_SignerResourceNotFound_DoesNotDropTheProvider(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := newProviderFetcher(map[string]func(int) ([]sts.TrustBundle, error){testProviderArn: fixed()})
+	// EKS Auth answers ResourceNotFoundException for a pod with no association,
+	// which says nothing about the provider.
+	noAssociation := wierrors.ErrBundleUnavailable.Wrapf(&smithy.GenericAPIError{Code: "ResourceNotFoundException", Message: "no association"}, "no session")
+	registry, err := New(Opts{
+		Fetcher:   fetcher,
+		Notifier:  &fake.Subscriber{},
+		Providers: resolverFunc(func(context.Context, *workloadidentity.Workload) (string, error) { return testProviderArn, nil }),
+		Signer: signerFunc(func(context.Context, string, []*workloadidentity.Workload) (aws.Credentials, error) {
+			return aws.Credentials{}, noAssociation
+		}),
+	})
+	g.Expect(err).ToNot(HaveOccurred())
+	_, err = registry.JWTBundles(context.Background(), ownPod)
+	g.Expect(err).To(MatchError(noAssociation))
+	g.Expect(fetcher.Calls(testProviderArn)).To(BeZero())
+	g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "only GetTrustBundles saying so drops the provider")
 }
