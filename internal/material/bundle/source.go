@@ -29,9 +29,9 @@ type providerSource struct {
 	providerArn string
 	fetcher     Fetcher
 	notifier    workloadidentity.BundleNotifier
-	// onNotFound is called when a fetch finds STS has no such provider, so the
-	// Registry can evict the source. Nil for a source no Registry holds.
-	onNotFound func(context.Context)
+	// tombstoneExpiresAt is when the tombstone expires, in Unix nanoseconds; zero
+	// means the provider is not tombstoned.
+	tombstoneExpiresAt atomic.Int64
 
 	// current is the last good snapshot, nil until the first fetch succeeds. A
 	// failed fetch never replaces it.
@@ -206,13 +206,15 @@ func (s *providerSource) recordFailure(ctx context.Context, err error, due time.
 	}
 }
 
-// load returns the current snapshot, fetching one signed by sign if nothing has
-// been fetched yet. Concurrent first reads share one fetch: whoever holds the
-// semaphore fetches, and the rest find its result, a snapshot or a failure still
-// in its backoff, when they get the semaphore in turn.
+// load() returns the cached snapshot. If there is none, it calls GetTrustBundles
+// with the credentials from sign, unless the provider is tombstoned or still in
+// its backoff. Concurrent callers share a single fetch.
 func (s *providerSource) load(ctx context.Context, sign signFunc) (*snapshot, error) {
 	if snap := s.current.Load(); snap != nil {
 		return snap, nil
+	}
+	if s.tombstoned() {
+		return nil, s.tombstoneErr()
 	}
 	if err := s.acquire(ctx); err != nil {
 		return nil, err
@@ -220,6 +222,10 @@ func (s *providerSource) load(ctx context.Context, sign signFunc) (*snapshot, er
 	defer s.release()
 	if snap := s.current.Load(); snap != nil {
 		return snap, nil
+	}
+	// A fetch may have tombstoned it while this reader waited.
+	if s.tombstoned() {
+		return nil, s.tombstoneErr()
 	}
 	if s.lastErr != nil && s.now().Before(s.retryAt) {
 		return nil, s.lastErr
@@ -277,8 +283,7 @@ func (s *providerSource) release() {
 // fetch makes one GetTrustBundles call signed with creds and parses the response.
 // An error is ErrBundleRefused when STS refused in a way a repeat cannot change,
 // and ErrBundleUnavailable otherwise, including a response the tier will not serve.
-// A refusal because the provider does not exist also matches errProviderNotFound,
-// and the source forgets the provider before returning it.
+// An error with a tombstone code also matches errTombstone and tombstones the provider.
 func (s *providerSource) fetch(ctx context.Context, creds aws.Credentials) (*snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
@@ -291,35 +296,60 @@ func (s *providerSource) fetch(ctx context.Context, creds aws.Credentials) (*sna
 		if err != nil {
 			err = wierrors.ErrBundleUnavailable.Wrapf(err, "GetTrustBundles for %s returned trust material the agent will not serve", s.providerArn)
 		}
-	} else if hasCode(err, codeResourceNotFound) {
-		err = wierrors.ErrBundleRefused.Wrapf(fmt.Errorf("%w: %w", errProviderNotFound, err),
-			"GetTrustBundles for %s found no such provider", s.providerArn)
-	} else if refused(err) {
+	} else if hasCodeIn(err, tombstoneCodes) {
+		err = wierrors.ErrBundleRefused.Wrapf(fmt.Errorf("%w: %w", errTombstone, err),
+			"GetTrustBundles for %s was refused", s.providerArn)
+	} else if hasCodeIn(err, refusedCodes) {
 		err = wierrors.ErrBundleRefused.Wrapf(err, "GetTrustBundles for %s was refused", s.providerArn)
 	} else {
 		err = wierrors.ErrBundleUnavailable.Wrapf(err, "GetTrustBundles for %s failed", s.providerArn)
 	}
 	observeFetch(err, time.Since(start).Seconds())
-	if providerNotFound(err) {
-		s.forget(ctx)
+	if causesTombstone(err) {
+		s.tombstone(ctx, err)
 	}
 	return nextSnapshot, err
 }
 
-// forget handles a provider STS says does not exist: the Registry evicts the
-// source, and the source stops serving its snapshot to any reader still holding
-// it. When there was a snapshot, the provider's streams are woken so they read
-// again and end on the refusal instead of keeping the deleted provider's
-// authorities. The caller holds the semaphore.
-func (s *providerSource) forget(ctx context.Context) {
-	if s.onNotFound != nil {
-		s.onNotFound(ctx)
+// tombstone marks the provider refused, keeping any existing expiry, drops its
+// snapshot, and wakes its streams if it had one. cause is the fetch error. The
+// caller holds the semaphore.
+func (s *providerSource) tombstone(ctx context.Context, cause error) {
+	expiresAt := s.now().Add(tombstoneTTL)
+	// Sets the tombstone only if there is none yet, so a repeat keeps the first expiry.
+	firstTombstone := s.tombstoneExpiresAt.CompareAndSwap(0, expiresAt.UnixNano())
+	if !firstTombstone {
+		// Already tombstoned, so the snapshot is already gone.
+		return
 	}
+	logger.FromContext(ctx).WithField("provider_arn", s.providerArn).WithError(cause).
+		Warnf("STS refused the workload identity provider's trust bundles, dropped them and refusing it until %s", expiresAt)
+	// Swap(nil) sets the cached snapshot (the trust bundle) to nil and returns the
+	// value it held before. The == nil check is on that old value: nil means nothing
+	// was cached, so no stream has a bundle to be woken from.
 	if s.current.Swap(nil) == nil {
 		return
 	}
+	// Wake the provider's streams so they read again and end with PermissionDenied.
 	s.notifier.NotifyCertBundleChange(s.providerArn)
 	s.notifier.NotifyJWTBundleChange(s.providerArn)
+}
+
+// tombstoned reports whether the provider is tombstoned.
+func (s *providerSource) tombstoned() bool {
+	return s.tombstoneExpiresAt.Load() != 0
+}
+
+// tombstoneExpired reports whether the tombstone has expired at now.
+func (s *providerSource) tombstoneExpired(now time.Time) bool {
+	expiresAt := s.tombstoneExpiresAt.Load()
+	return expiresAt != 0 && !now.Before(time.Unix(0, expiresAt))
+}
+
+// tombstoneErr is returned to reads and leases of a tombstone.
+func (s *providerSource) tombstoneErr() error {
+	return wierrors.ErrBundleRefused.Wrapf(errTombstone,
+		"STS refused trust bundles for workload identity provider %s", s.providerArn)
 }
 
 // store makes nextSnapshot current, schedules the next refresh, then notifies each
@@ -338,6 +368,11 @@ func (s *providerSource) store(ctx context.Context, nextSnapshot *snapshot) {
 		s.current.Store(nextSnapshot)
 	}
 	s.due.Store(s.now().Add(s.refreshDelay()).UnixNano())
+	// Revive after the snapshot is stored.
+	if s.tombstoneExpiresAt.Swap(0) != 0 {
+		logger.FromContext(ctx).WithField("provider_arn", s.providerArn).
+			Info("Workload identity provider exists again, serving its trust bundles")
+	}
 	if !x509Changed && !jwtChanged {
 		return
 	}
@@ -389,43 +424,36 @@ func shorten(d time.Duration, r float64) time.Duration {
 	return d - time.Duration(float64(d)*refreshJitter*r)
 }
 
-// codeResourceNotFound is the STS error code for a provider that does not exist
-// or is not visible to the caller.
-const codeResourceNotFound = "ResourceNotFoundException"
-
-// errProviderNotFound marks a fetch error as STS reporting the provider does not
-// exist. It is set only where GetTrustBundles fails, because a workload session
-// signer can fail with an EKS Auth ResourceNotFoundException that says nothing
-// about the provider.
-var errProviderNotFound = errors.New("the workload identity provider does not exist")
-
-// providerNotFound reports whether err is a fetch that found no such provider.
-func providerNotFound(err error) bool {
-	return errors.Is(err, errProviderNotFound)
+// tombstoneCodes are the STS error codes that tombstone the provider: it does
+// not exist, or the agent is denied its trust bundles.
+var tombstoneCodes = map[string]bool{
+	"ResourceNotFoundException": true,
+	"AccessDenied":              true,
+	"AccessDeniedException":     true,
 }
 
-// refusedCodes are the STS error codes a repeat cannot change. ValidationError is
-// what a malformed provider ARN gets. It is a list rather than every client fault
+// errTombstone marks a GetTrustBundles error with a tombstone code, so the same
+// code from EKS Auth through the signer isn't mistaken for it.
+var errTombstone = errors.New("STS refused the workload identity provider's trust bundles")
+
+// causesTombstone reports whether err is a fetch error that tombstones the provider.
+func causesTombstone(err error) bool {
+	return errors.Is(err, errTombstone)
+}
+
+// refusedCodes are the other STS error codes a repeat cannot change. ValidationError
+// is what a malformed provider ARN gets. It is a list rather than every client fault
 // because STS reports throttling and an expired or skewed signature as client
-// faults too, and those clear up on their own. ResourceNotFoundException is
-// refused as well, through errProviderNotFound.
+// faults too, and those clear up on their own.
 var refusedCodes = map[string]bool{
-	"AccessDenied":          true,
-	"AccessDeniedException": true,
-	"ValidationError":       true,
-	"InvalidAction":         true,
+	"ValidationError": true,
+	"InvalidAction":   true,
 }
 
-// refused reports whether err is an STS refusal a repeat cannot change.
-func refused(err error) bool {
+// hasCodeIn reports whether err is an STS error with one of codes.
+func hasCodeIn(err error, codes map[string]bool) bool {
 	var apiErr smithy.APIError
-	return errors.As(err, &apiErr) && refusedCodes[apiErr.ErrorCode()]
-}
-
-// hasCode reports whether err is an STS error with the given code.
-func hasCode(err error, code string) bool {
-	var apiErr smithy.APIError
-	return errors.As(err, &apiErr) && apiErr.ErrorCode() == code
+	return errors.As(err, &apiErr) && codes[apiErr.ErrorCode()]
 }
 
 // parseResponse turns a GetTrustBundles response into a snapshot, or refuses it.

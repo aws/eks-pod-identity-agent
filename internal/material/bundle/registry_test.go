@@ -964,60 +964,175 @@ func newRespondingRegistry(t *testing.T, respond func(int) ([]sts.TrustBundle, e
 	return registry, fetcher, notifier, sessions, clock
 }
 
-func TestRegistry_ProviderNotFoundOnRefresh_IsDroppedAndItsStreamsWoken(t *testing.T) {
-	g := NewWithT(t)
-	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")), jwtECKey(t, "k1", newECKey(t)))}
-	registry, fetcher, notifier, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError("ResourceNotFoundException"))))
-	ctx := context.Background()
-	certStream, releaseCert, err := notifier.SubscribeToCertBundles(ctx, ownPod)
-	g.Expect(err).ToNot(HaveOccurred())
-	defer releaseCert()
-	jwtStream, releaseJWT, err := notifier.SubscribeToJWTBundles(ctx, ownPod)
-	g.Expect(err).ToNot(HaveOccurred())
-	defer releaseJWT()
-	<-certStream
-	<-jwtStream
-	release, err := registry.Lease(ctx, ownPod)
-	g.Expect(err).ToNot(HaveOccurred())
-	defer release()
-	_, err = registry.X509Bundles(ctx, ownPod)
-	g.Expect(err).ToNot(HaveOccurred())
-	stale := registry.entryFor(testProviderArn).source
-
-	clock.Advance(defaultRefreshInterval)
-	registry.refreshDue(ctx)
-
-	g.Expect(registry.entryFor(testProviderArn)).To(BeNil(), "a lease does not keep a provider STS says does not exist")
-	g.Expect(certStream).To(Receive(), "X.509 streams read again and find the provider gone")
-	g.Expect(jwtStream).To(Receive(), "JWT streams read again and find the provider gone")
-	_, err = stale.X509Bundles(ctx, signTest)
-	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused), "a reader still holding the dropped source is not served its snapshot")
-
-	_, err = registry.X509Bundles(ctx, ownPod)
-	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
-	g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
-	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3), "the next read learns the provider again as new and asks STS")
-	g.Expect(registry.entryFor(testProviderArn)).To(BeNil(), "and drops it again")
-	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}), "a provider with nothing cached wakes no stream")
+// tombstoneExpiresAt is when the provider's tombstone expires, zero when it has none.
+func (r *Registry) tombstoneExpiresAt(providerArn string) time.Time {
+	entry := r.entryFor(providerArn)
+	if entry == nil || !entry.source.tombstoned() {
+		return time.Time{}
+	}
+	return time.Unix(0, entry.source.tombstoneExpiresAt.Load())
 }
 
-func TestRegistry_ProviderNotFoundOnFirstRead_IsNotKept(t *testing.T) {
-	g := NewWithT(t)
-	registry, fetcher, notifier, _, _ := newRespondingRegistry(t, sequence(fail(stsError("ResourceNotFoundException"))))
-	ctx := context.Background()
-	for range 3 {
-		_, err := registry.JWTBundles(ctx, ownPod)
-		g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
-		g.Expect(registry.entryFor(testProviderArn)).To(BeNil())
+// tombstoningCodes are the STS error codes that tombstone a provider.
+var tombstoningCodes = []string{"ResourceNotFoundException", "AccessDenied", "AccessDeniedException"}
+
+func TestRegistry_TombstoneCodeOnRefresh_TombstonesAndWakesStreams(t *testing.T) {
+	for _, code := range tombstoningCodes {
+		t.Run(code, func(t *testing.T) {
+			g := NewWithT(t)
+			good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")), jwtECKey(t, "k1", newECKey(t)))}
+			registry, fetcher, notifier, sessions, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError(code))))
+			sessions.assign("new-pod", testProviderArn)
+			ctx := context.Background()
+			certStream, releaseCert, err := notifier.SubscribeToCertBundles(ctx, ownPod)
+			g.Expect(err).ToNot(HaveOccurred())
+			defer releaseCert()
+			jwtStream, releaseJWT, err := notifier.SubscribeToJWTBundles(ctx, ownPod)
+			g.Expect(err).ToNot(HaveOccurred())
+			defer releaseJWT()
+			<-certStream
+			<-jwtStream
+			release, err := registry.Lease(ctx, ownPod)
+			g.Expect(err).ToNot(HaveOccurred())
+			defer release()
+			_, err = registry.X509Bundles(ctx, ownPod)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			clock.Advance(defaultRefreshInterval)
+			registry.refreshDue(ctx)
+
+			entry := registry.entryFor(testProviderArn)
+			g.Expect(entry).ToNot(BeNil(), "the provider stays cached as a tombstone")
+			g.Expect(entry.source.current.Load()).To(BeNil(), "its snapshot is gone, so nothing can serve it")
+			g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", clock.Now().Add(tombstoneTTL)))
+			g.Expect(certStream).To(Receive(), "X.509 streams read again and find the provider gone")
+			g.Expect(jwtStream).To(Receive(), "JWT streams read again and find the provider gone")
+			for _, w := range []*workloadidentity.Workload{ownPod, pod("new-pod")} {
+				_, err = registry.X509Bundles(ctx, w)
+				g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+				g.Expect(wierrors.IsRetryable(err)).To(BeFalse())
+				_, err = registry.Lease(ctx, w)
+				g.Expect(err).To(MatchError(wierrors.ErrBundleRefused), "a stream for a tombstoned provider does not open")
+			}
+			g.Expect(fetcher.Calls(testProviderArn)).To(Equal(2), "reads and leases of a tombstone do not call STS")
+			g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}))
+		})
 	}
-	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3), "no backoff outlives the dropped provider")
-	g.Expect(notified(notifier)).To(Equal(notifications{}))
+}
+
+func TestRegistry_TombstoneCodeOnFirstRead_TombstonesAndReadsDoNotAskAgain(t *testing.T) {
+	for _, code := range tombstoningCodes {
+		t.Run(code, func(t *testing.T) {
+			g := NewWithT(t)
+			registry, fetcher, notifier, sessions, clock := newRespondingRegistry(t, sequence(fail(stsError(code))))
+			sessions.assign("new-pod", testProviderArn)
+			ctx := context.Background()
+			_, err := registry.JWTBundles(ctx, ownPod)
+			g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+			g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", clock.Now().Add(tombstoneTTL)))
+			reads := map[string]func(*workloadidentity.Workload) error{
+				"X509Bundles":    func(w *workloadidentity.Workload) error { _, err := registry.X509Bundles(ctx, w); return err },
+				"JWTBundles":     func(w *workloadidentity.Workload) error { _, err := registry.JWTBundles(ctx, w); return err },
+				"JWTSource":      func(w *workloadidentity.Workload) error { _, err := registry.JWTSource(ctx, w); return err },
+				"OwnTrustDomain": func(w *workloadidentity.Workload) error { _, err := registry.OwnTrustDomain(ctx, w); return err },
+				"Lease":          func(w *workloadidentity.Workload) error { _, err := registry.Lease(ctx, w); return err },
+			}
+			clock.Advance(time.Hour) // well past the backoff, which a read never follows for a tombstone
+			for name, read := range reads {
+				for _, w := range []*workloadidentity.Workload{ownPod, pod("new-pod")} {
+					err := read(w)
+					g.Expect(err).To(MatchError(wierrors.ErrBundleRefused), name)
+					g.Expect(wierrors.IsRetryable(err)).To(BeFalse(), name)
+				}
+			}
+			g.Expect(fetcher.Calls(testProviderArn)).To(Equal(1), "only the first read asked STS")
+			g.Expect(notified(notifier)).To(Equal(notifications{}), "nothing was cached, so no stream is woken")
+		})
+	}
+}
+
+func TestRegistry_Tombstone_IsRefreshedOnTheBackoffAndKeepsItsFirstExpiry(t *testing.T) {
+	g := NewWithT(t)
+	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(fail(stsError("ResourceNotFoundException"))))
+	ctx := context.Background()
+	_, err := registry.JWTBundles(ctx, ownPod)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+	expiry := clock.Now().Add(tombstoneTTL)
+
 	registry.refreshDue(ctx)
-	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3), "nothing retries a dropped provider")
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(1), "not due until the first backoff passes")
+	for i, delay := range []time.Duration{retryBaseDelay, 2 * retryBaseDelay, 4 * retryBaseDelay} {
+		clock.Advance(delay)
+		registry.refreshDue(ctx)
+		g.Expect(fetcher.Calls(testProviderArn)).To(Equal(i+2), "the refresher keeps checking the tombstone on its backoff")
+		g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", expiry), "another ResourceNotFoundException keeps the first expiry")
+	}
+}
+
+func TestRegistry_Tombstone_IsRevivedByASuccessfulRefresh(t *testing.T) {
+	g := NewWithT(t)
+	ca := newAuthority(t, "ca")
+	recreated := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, ca))}
+	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(fail(stsError("ResourceNotFoundException")), ok(recreated)))
+	ctx := context.Background()
+	_, err := registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+
+	clock.Advance(retryBaseDelay)
+	registry.refreshDue(ctx)
+
+	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeZero(), "a provider recreated under the same ARN is live again")
+	bundles, err := registry.X509Bundles(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(rawBundles(bundles)).To(Equal(map[string][][]byte{testDomain: {ca.der}}))
+	release, err := registry.Lease(ctx, ownPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	release()
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(2))
+}
+
+func TestRegistry_Tombstone_IsKeptPastTheIdleTTLAndSweptAfterTombstoneTTL(t *testing.T) {
+	g := NewWithT(t)
+	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(fail(stsError("ResourceNotFoundException"))))
+	ctx := context.Background()
+	_, err := registry.JWTBundles(ctx, ownPod)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+
+	clock.Advance(2 * providerIdleTTL)
+	registry.sweep(ctx)
+	g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "a tombstone is not evicted for being idle")
+
+	clock.Advance(tombstoneTTL - 2*providerIdleTTL - time.Second)
+	registry.sweep(ctx)
+	g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "a second before tombstoneTTL")
+
+	clock.Advance(time.Second)
+	registry.sweep(ctx)
+	g.Expect(registry.entryFor(testProviderArn)).To(BeNil(), "evicted once tombstoneTTL has passed")
+
+	_, err = registry.JWTBundles(ctx, ownPod)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(2), "the next read learns the provider again and asks STS once")
+	g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeTemporally("==", clock.Now().Add(tombstoneTTL)), "and tombstones it afresh")
+}
+
+func TestRegistry_ProviderNotFound_LeavesOtherProvidersAlone(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := newProviderFetcher(map[string]func(int) ([]sts.TrustBundle, error){
+		testProviderArn:  sequence(fail(stsError("ResourceNotFoundException"))),
+		otherProviderArn: fixed(sts.TrustBundle{TrustDomain: peerDomain, Bundle: bundleDoc(t, 0, jwtECKey(t, "k1", newECKey(t)))}),
+	})
+	registry, _, _ := newTestRegistry(t, fetcher)
+	ctx := context.Background()
+	_, err := registry.JWTBundles(ctx, ownPod)
+	g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+	_, err = registry.JWTBundles(ctx, otherPod)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(registry.tombstoneExpiresAt(otherProviderArn)).To(BeZero())
 }
 
 func TestRegistry_OtherRefusalsOnRefresh_KeepTheProviderAndItsBundle(t *testing.T) {
-	for _, code := range []string{"AccessDenied", "AccessDeniedException", "ValidationError", "InvalidAction"} {
+	for _, code := range []string{"ValidationError", "InvalidAction"} {
 		t.Run(code, func(t *testing.T) {
 			g := NewWithT(t)
 			ca := newAuthority(t, "ca")
@@ -1044,23 +1159,28 @@ func (f signerFunc) Credentials(ctx context.Context, providerArn string, workloa
 	return f(ctx, providerArn, workloads)
 }
 
-func TestRegistry_SignerResourceNotFound_DoesNotDropTheProvider(t *testing.T) {
-	g := NewWithT(t)
-	fetcher := newProviderFetcher(map[string]func(int) ([]sts.TrustBundle, error){testProviderArn: fixed()})
-	// EKS Auth answers ResourceNotFoundException for a pod with no association,
-	// which says nothing about the provider.
-	noAssociation := wierrors.ErrBundleUnavailable.Wrapf(&smithy.GenericAPIError{Code: "ResourceNotFoundException", Message: "no association"}, "no session")
-	registry, err := New(Opts{
-		Fetcher:   fetcher,
-		Notifier:  &fake.Subscriber{},
-		Providers: resolverFunc(func(context.Context, *workloadidentity.Workload) (string, error) { return testProviderArn, nil }),
-		Signer: signerFunc(func(context.Context, string, []*workloadidentity.Workload) (aws.Credentials, error) {
-			return aws.Credentials{}, noAssociation
-		}),
-	})
-	g.Expect(err).ToNot(HaveOccurred())
-	_, err = registry.JWTBundles(context.Background(), ownPod)
-	g.Expect(err).To(MatchError(noAssociation))
-	g.Expect(fetcher.Calls(testProviderArn)).To(BeZero())
-	g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil(), "only GetTrustBundles saying so drops the provider")
+func TestRegistry_SignerTombstoneCode_DoesNotTombstoneTheProvider(t *testing.T) {
+	for _, code := range tombstoningCodes {
+		t.Run(code, func(t *testing.T) {
+			g := NewWithT(t)
+			fetcher := newProviderFetcher(map[string]func(int) ([]sts.TrustBundle, error){testProviderArn: fixed()})
+			// The same codes from EKS Auth, through a workload session signer, say
+			// nothing about the provider.
+			signerErr := wierrors.ErrBundleUnavailable.Wrapf(&smithy.GenericAPIError{Code: code, Message: "from EKS Auth"}, "no session")
+			registry, err := New(Opts{
+				Fetcher:   fetcher,
+				Notifier:  &fake.Subscriber{},
+				Providers: resolverFunc(func(context.Context, *workloadidentity.Workload) (string, error) { return testProviderArn, nil }),
+				Signer: signerFunc(func(context.Context, string, []*workloadidentity.Workload) (aws.Credentials, error) {
+					return aws.Credentials{}, signerErr
+				}),
+			})
+			g.Expect(err).ToNot(HaveOccurred())
+			_, err = registry.JWTBundles(context.Background(), ownPod)
+			g.Expect(err).To(MatchError(signerErr))
+			g.Expect(fetcher.Calls(testProviderArn)).To(BeZero())
+			g.Expect(registry.entryFor(testProviderArn)).ToNot(BeNil())
+			g.Expect(registry.tombstoneExpiresAt(testProviderArn)).To(BeZero(), "only GetTrustBundles saying so tombstones the provider")
+		})
+	}
 }
