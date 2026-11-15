@@ -29,7 +29,13 @@ type RPCState struct {
 	// stream's failures never slow another's retries.
 	backoff wait.Backoff
 	initial wait.Backoff
+	// retries counts retryable failures, for the log.
+	retries int
 }
+
+// retryWarnAfter is how long an RPC retries before its retries log at Warn.
+// A var for tests.
+var retryWarnAfter = 10 * time.Second
 
 // NewRPCState starts the clock for one RPC.
 func NewRPCState(rpc string, backoff wait.Backoff) *RPCState {
@@ -54,11 +60,28 @@ func (s *RPCState) Await(ctx context.Context, signals <-chan struct{}, op func()
 		}
 
 		delay := s.backoff.Step()
-		logger.FromContext(ctx).WithField("rpc", s.rpc).Debugf("Retrying the stream in %s: %v", delay, err)
+		s.logRetry(ctx, delay, err)
 		if !s.wait(ctx, signals, delay) {
 			return s.Ended(ctx)
 		}
 	}
+}
+
+// logRetry logs a retryable failure at Debug, or at Warn once the RPC has
+// retried for retryWarnAfter.
+func (s *RPCState) logRetry(ctx context.Context, delay time.Duration, err error) {
+	s.retries++
+	elapsed := time.Since(s.start)
+	log := logger.FromContext(ctx).
+		WithField("rpc", s.rpc).
+		WithField("error-label", errors.MetricLabel(err)).
+		WithField("attempt", s.retries).
+		WithField("waiting-for", elapsed.Round(time.Second).String())
+	if elapsed < retryWarnAfter {
+		log.Debugf("Retrying the stream in %s: %v", delay, err)
+		return
+	}
+	log.Warnf("Workload identity RPC still not answered, retrying in %s: %v", delay, err)
 }
 
 // wait blocks for delay, or until a signal arrives, and reports false if ctx
@@ -125,14 +148,17 @@ func (e SendError) Error() string { return e.Err.Error() }
 
 func (e SendError) Unwrap() error { return e.Err }
 
-// LogFailure logs an error a handler answers with, at the level the error's own
-// mapping decides: one that maps to Internal is unexpected and ours to act on,
-// and the rest are refusals the caller can do something about.
+// LogFailure logs an error a handler answers with: Internal at Error, a refused
+// identity (PermissionDenied, FailedPrecondition, Unavailable) at Warn, and
+// anything else at Info.
 func LogFailure(ctx context.Context, rpc string, err error) {
-	log := logger.FromContext(ctx).WithField("rpc", rpc)
-	if StatusCode(err) == codes.Internal {
+	log := logger.FromContext(ctx).WithField("rpc", rpc).WithField("error-label", errors.MetricLabel(err))
+	switch StatusCode(err) {
+	case codes.Internal:
 		log.Errorf("Unexpected error serving a workload identity RPC: %v", err)
-		return
+	case codes.PermissionDenied, codes.FailedPrecondition, codes.Unavailable:
+		log.Warnf("Refusing the call: %v", err)
+	default:
+		log.Infof("Refusing the call: %v", err)
 	}
-	log.Infof("Refusing the call: %v", err)
 }
