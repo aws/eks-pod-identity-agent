@@ -48,7 +48,7 @@ The following table lists the configurable parameters for this chart and their d
 | `priorityClassName`       | Name of the priorityClass                               | `system-node-critical`   |
 | `resources`               | Resources for the agent container                       | `{}`                     |
 | `tolerations`             | Optional deployment tolerations                         | `all`                    |
-| `updateStrategy`          | Optional update strategy                                | `type: RollingUpdate`    |
+| `updateStrategy`          | Optional update strategy; see [Workload identity](#workload-identity) | `type: RollingUpdate`, `maxUnavailable: 10%` |
 | `workloadIdentity.enabled`| Serve workload identity; see below                      | `false`                  |
 
 Specify each parameter using the `--set key=value[,key=value]` argument to `helm install` or provide a YAML file
@@ -62,6 +62,16 @@ the agent and adds everything below: the agent's socket directory, the CSI drive
 Isolated regions never get any of it, whatever the value says. Turn it on only with an image
 built with workload identity, which ships `/eks-pod-identity-csi-driver`. Images without it
 (every release through v0.2.5) reject the flag and crash-loop.
+
+It also changes how the DaemonSets roll: a `RollingUpdate` gets `maxUnavailable: 1`, whatever
+`updateStrategy` says, and each DaemonSet gets `minReadySeconds: 12`, so a new agent pod has to
+stay ready 12 seconds before the next node is updated. An `OnDelete` strategy is kept.
+
+Surge rollouts don't work with workload identity on. A DaemonSet can't have both `maxSurge` and
+`maxUnavailable` above zero, so with `updateStrategy.rollingUpdate.maxSurge` set to anything but
+0, the API server rejects the DaemonSet and `helm install` or `helm upgrade` fails with
+`maxSurge: Invalid value: ...: may not be set when maxUnavailable is non-zero`. Leave `maxSurge`
+unset or 0, or use `OnDelete`.
 
 With it off, the rendered manifest has no workload identity piece at all.
 

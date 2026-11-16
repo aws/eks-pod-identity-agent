@@ -213,6 +213,8 @@ serviceAccount:
 tolerations:
   - operator: Exists
 
+# With workloadIdentity.enabled, a RollingUpdate uses maxUnavailable 1 instead of this value,
+# and the DaemonSets get minReadySeconds 12.
 updateStrategy:
   type: RollingUpdate
   rollingUpdate:

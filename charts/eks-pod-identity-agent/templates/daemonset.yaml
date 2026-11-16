@@ -4,6 +4,16 @@ Whether this install gets workload identity; see the helper and "Workload identi
 the chart README.
 */ -}}
 {{- $enableWorkloadIdentity := eq (include "eks-pod-identity-agent.enableWorkloadIdentity" $top) "true" -}}
+{{- /*
+With workload identity on, a rolling update replaces one node's agent at a time and waits
+for each new pod to stay ready 12 seconds before the next. Only maxUnavailable is
+overridden; an OnDelete strategy and any other rollingUpdate field are kept.
+*/ -}}
+{{- $updateStrategy := deepCopy (default (dict) $top.Values.updateStrategy) -}}
+{{- if and $enableWorkloadIdentity (eq (default "RollingUpdate" $updateStrategy.type) "RollingUpdate") -}}
+{{- $rollingUpdate := mergeOverwrite (default (dict) $updateStrategy.rollingUpdate) (dict "maxUnavailable" 1) -}}
+{{- $_ := set $updateStrategy "rollingUpdate" $rollingUpdate -}}
+{{- end -}}
 {{- range $_, $daemonset := .Values.daemonsets -}}
 {{- if $daemonset.create -}}
 {{- $valuesDict := dict "nameSuffix" $daemonset.nameSuffix "Values" $top.Values "Release" $top.Release "Chart" $top.Chart -}}
@@ -18,8 +28,11 @@ metadata:
   labels:
     {{- include "eks-pod-identity-agent.labels" $valuesDict | nindent 4}}
 spec:
+  {{- if $enableWorkloadIdentity }}
+  minReadySeconds: 12
+  {{- end }}
   updateStrategy:
-    {{- toYaml $top.Values.updateStrategy | nindent 4 }}
+    {{- toYaml $updateStrategy | nindent 4 }}
   selector:
     matchLabels:
       {{- $selectorLabels | nindent 6 }}

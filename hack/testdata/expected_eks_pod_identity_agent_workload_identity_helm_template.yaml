@@ -13,9 +13,10 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app: eks-pod-identity-agent
 spec:
+  minReadySeconds: 12
   updateStrategy:
     rollingUpdate:
-      maxUnavailable: 10%
+      maxUnavailable: 1
     type: RollingUpdate
   selector:
     matchLabels:
@@ -183,9 +184,10 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app: eks-pod-identity-agent
 spec:
+  minReadySeconds: 12
   updateStrategy:
     rollingUpdate:
-      maxUnavailable: 10%
+      maxUnavailable: 1
     type: RollingUpdate
   selector:
     matchLabels:
@@ -360,9 +362,10 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app: eks-pod-identity-agent
 spec:
+  minReadySeconds: 12
   updateStrategy:
     rollingUpdate:
-      maxUnavailable: 10%
+      maxUnavailable: 1
     type: RollingUpdate
   selector:
     matchLabels:
