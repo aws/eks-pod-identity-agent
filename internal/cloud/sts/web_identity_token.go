@@ -57,7 +57,7 @@ func (s *service) GetWebIdentityToken(ctx context.Context, creds aws.Credentials
 	}
 
 	var decoded getWebIdentityTokenResponse
-	err := s.invoke(ctx, creds, operationGetWebIdentityToken, func(input *query.Object) {
+	err := s.invoke(ctx, creds, operationGetWebIdentityToken, reuseConnection, func(input *query.Object) {
 		audiences := input.Key("Audience").Array("member")
 		for _, audience := range req.Audiences {
 			audiences.Value().String(audience)

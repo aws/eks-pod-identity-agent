@@ -65,6 +65,13 @@ const (
 	maxResponseBytes = 1 << 20
 )
 
+// Values for invoke's closeConn. GetWorkloadIdentityCertificate closes its
+// connection after each call; the other operations reuse the transport's pool.
+const (
+	reuseConnection = false
+	closeConnection = true
+)
+
 type service struct {
 	options awssts.Options
 	signer  *v4.Signer
@@ -88,9 +95,11 @@ func NewService(cfg aws.Config) Iface {
 
 // invoke makes one awsQuery call to operation, signed with creds, and decodes a
 // successful response into out. params, which may be nil, writes the input
-// members with the SDK's query encoder; Action and Version are written after it,
-// so it cannot override them. Errors come wrapped in a smithy.OperationError.
-func (s *service) invoke(ctx context.Context, creds aws.Credentials, operation string, params func(*query.Object), out any) error {
+// members; Action and Version are written after it, so it cannot override them.
+// closeConn closes the connection after the response instead of reusing it.
+// Errors come wrapped in a smithy.OperationError.
+func (s *service) invoke(ctx context.Context, creds aws.Credentials, operation string, closeConn bool,
+	params func(*query.Object), out any) error {
 	var body bytes.Buffer
 	encoder := query.NewEncoder(&body)
 	input := encoder.Object()
@@ -103,7 +112,7 @@ func (s *service) invoke(ctx context.Context, creds aws.Credentials, operation s
 	if err != nil {
 		err = &smithy.SerializationError{Err: err}
 	} else {
-		err = s.call(ctx, creds, body.String(), out)
+		err = s.call(ctx, creds, body.String(), closeConn, out)
 	}
 	if err != nil {
 		return &smithy.OperationError{ServiceID: awssts.ServiceID, OperationName: operation, Err: err}
@@ -114,7 +123,7 @@ func (s *service) invoke(ctx context.Context, creds aws.Credentials, operation s
 // call signs one awsQuery request body with creds, sends it, and decodes a
 // successful response into out. It makes one attempt: a retry loop here would
 // multiply the calling tier's own backoff during an STS outage.
-func (s *service) call(ctx context.Context, creds aws.Credentials, body string, out any) error {
+func (s *service) call(ctx context.Context, creds aws.Credentials, body string, closeConn bool, out any) error {
 	endpoint, signingRegion, err := s.resolveEndpoint(ctx)
 	if err != nil {
 		return err
@@ -127,6 +136,8 @@ func (s *service) call(ctx context.Context, creds aws.Credentials, body string, 
 	if err != nil {
 		return fmt.Errorf("building the request: %w", err)
 	}
+	// Sends Connection: close, and the transport drops the connection after the response.
+	req.Close = closeConn
 	// Headers the endpoint rules require, then the awsQuery content type.
 	for name := range endpoint.Headers {
 		req.Header.Set(name, endpoint.Headers.Get(name))

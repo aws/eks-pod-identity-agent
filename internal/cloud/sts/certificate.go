@@ -60,7 +60,7 @@ type IssuedCertificate struct {
 
 func (s *service) GetWorkloadIdentityCertificate(ctx context.Context, creds aws.Credentials, req CertificateRequest) (*IssuedCertificate, error) {
 	var decoded getWorkloadIdentityCertificateResponse
-	err := s.invoke(ctx, creds, operationGetWorkloadIdentityCertificate, func(input *query.Object) {
+	err := s.invoke(ctx, creds, operationGetWorkloadIdentityCertificate, closeConnection, func(input *query.Object) {
 		input.Key("CertificateSigningRequest").String(req.CertificateSigningRequestPEM)
 		// Omitted rather than sent as zero, so the service default applies instead of a
 		// value the model would reject.
