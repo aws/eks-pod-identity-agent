@@ -388,3 +388,24 @@ func TestChartDaemonSetOmitsWorkloadIdentityWhenOff(t *testing.T) {
 		}
 	}
 }
+
+// TestChartDaemonSetRollsOneNodeAtATimeWithWorkloadIdentity pins the rollout with workload
+// identity on: one unavailable agent at a time, each ready 12 seconds before the next.
+// With it off the chart keeps the 10% default and no minReadySeconds.
+func TestChartDaemonSetRollsOneNodeAtATimeWithWorkloadIdentity(t *testing.T) {
+	check := func(path string, wantMinReady int32, wantMaxUnavailable string) {
+		for _, daemonSet := range daemonSetsFromRenderedChart(t, path) {
+			if got := daemonSet.Spec.MinReadySeconds; got != wantMinReady {
+				t.Errorf("%s: DaemonSet %s has minReadySeconds %d, want %d", path, daemonSet.Name, got, wantMinReady)
+			}
+			rollingUpdate := daemonSet.Spec.UpdateStrategy.RollingUpdate
+			if rollingUpdate == nil || rollingUpdate.MaxUnavailable == nil || rollingUpdate.MaxUnavailable.String() != wantMaxUnavailable {
+				t.Errorf("%s: DaemonSet %s has rollingUpdate %+v, want maxUnavailable %s", path, daemonSet.Name, rollingUpdate, wantMaxUnavailable)
+			}
+		}
+	}
+	check(workloadIdentityChartPath, 12, "1")
+	for _, path := range workloadIdentityOffChartPaths {
+		check(path, 0, "10%")
+	}
+}
