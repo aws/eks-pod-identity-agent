@@ -40,8 +40,63 @@ const testOperationOK = `<TestOperationResponse xmlns="https://sts.amazonaws.com
 
 func invokeTest(svc *service, creds aws.Credentials, params func(*query.Object)) (testOperationResponse, error) {
 	var out testOperationResponse
-	err := svc.invoke(context.Background(), creds, testOperation, params, &out)
+	err := svc.invoke(context.Background(), creds, testOperation, reuseConnection, params, &out)
 	return out, err
+}
+
+// TestInvoke_CloseConn_ClosesOrReusesTheConnection: with closeConn each call asks
+// to close and arrives on a new connection; without it calls share one.
+func TestInvoke_CloseConn_ClosesOrReusesTheConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		closeConn bool
+	}{{"close", closeConnection}, {"reuse", reuseConnection}} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			fake := newFakeSTS(t, http.StatusOK, testOperationOK)
+			svc := pinnedService(fake)
+			for range 3 {
+				var out testOperationResponse
+				g.Expect(svc.invoke(context.Background(), sessionCreds, testOperation, tc.closeConn, nil, &out)).To(Succeed())
+			}
+
+			conns := map[string]bool{}
+			for _, req := range fake.all() {
+				g.Expect(req.close).To(Equal(tc.closeConn))
+				conns[req.remoteAddr] = true
+			}
+			if tc.closeConn {
+				g.Expect(conns).To(HaveLen(3), "every call opens its own connection")
+			} else {
+				g.Expect(conns).To(HaveLen(1), "every call reuses the first connection")
+			}
+		})
+	}
+}
+
+// TestOperations_OnlyTheCertificateCallClosesItsConnection pins which operation
+// closes: GetWorkloadIdentityCertificate does, the other two reuse.
+func TestOperations_OnlyTheCertificateCallClosesItsConnection(t *testing.T) {
+	g := NewWithT(t)
+	fake := newFakeSTS(t, http.StatusInternalServerError, "")
+	svc := pinnedService(fake)
+	ctx := context.Background()
+
+	_, _ = svc.GetWorkloadIdentityCertificate(ctx, sessionCreds, CertificateRequest{CertificateSigningRequestPEM: "csr"})
+	_, _ = svc.GetTrustBundles(ctx, sessionCreds, "arn:aws:iam::111122223333:workload-identity-provider/example")
+	_, _ = svc.GetWebIdentityToken(ctx, sessionCreds, WebIdentityTokenRequest{Audiences: []string{"aud"}, TokenType: TokenTypeJWTSVID})
+
+	requests := fake.all()
+	g.Expect(requests).To(HaveLen(3))
+	closed := map[string]bool{}
+	for _, req := range requests {
+		closed[req.form.Get("Action")] = req.close
+	}
+	g.Expect(closed).To(Equal(map[string]bool{
+		"GetWorkloadIdentityCertificate": true,
+		"GetTrustBundles":                false,
+		"GetWebIdentityToken":            false,
+	}))
 }
 
 func TestInvoke_SendsASignedAwsQueryRequestAndDecodesTheResult(t *testing.T) {

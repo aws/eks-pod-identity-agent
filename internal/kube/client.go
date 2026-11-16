@@ -41,8 +41,9 @@ const (
 	// every node-credentialed consumer sharing this client: the attestor's pod
 	// watch (which reads the informer cache, not the API server, once synced)
 	// and the token minter's TokenRequest calls on the pod-startup path. Sized
-	// for the mint traffic, since the watch is nearly free after sync.
-	nodeClientQPS = 15
+	// for the mint traffic, since the watch is nearly free after sync. 25 matches
+	// STS's per-account GetCertificate limit.
+	nodeClientQPS = 25
 	// nodeClientBurst allows a short burst above the QPS ceiling, for the
 	// startup pod list, the node-name lookup, and bursts of pod starts.
 	nodeClientBurst = 30
