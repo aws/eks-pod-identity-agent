@@ -35,6 +35,9 @@ const (
 	// providerIdleTTL is how long a provider with no lease stays cached after its
 	// last read or its last lease ending.
 	providerIdleTTL = time.Hour
+	// tombstoneTTL is how long a provider STS refused (not found or access
+	// denied) stays cached as a tombstone.
+	tombstoneTTL = 12 * time.Hour
 	// tickInterval is how often Run checks for providers due a refresh.
 	tickInterval = 30 * time.Second
 	// sweepInterval is how often Run evicts idle providers, so one leaves between
@@ -55,7 +58,8 @@ const (
 
 	// retryBaseDelay and retryMaxDelay bound the exponential backoff after a
 	// failed fetch, so a long outage or a refusal that never clears costs each
-	// node one call per provider every 10 minutes.
+	// node one call per provider every 10 minutes. A tombstone refusal skips the
+	// backoff and waits defaultRefreshInterval instead.
 	retryBaseDelay = 10 * time.Second
 	retryMaxDelay  = 10 * time.Minute
 
@@ -172,6 +176,9 @@ func (r *Registry) Lease(ctx context.Context, w *workloadidentity.Workload) (fun
 	entry, _, err := r.resolve(ctx, w)
 	if err != nil {
 		return nil, err
+	}
+	if entry.source.tombstoned() {
+		return nil, entry.source.tombstoneErr()
 	}
 	holder := func() *leaseHolder {
 		r.mu.Lock()
@@ -336,19 +343,31 @@ func (r *Registry) refreshDue(ctx context.Context) {
 			log.WithError(err).Warn("No credentials to refresh trust bundles with")
 			continue
 		}
-		if err := item.entry.source.refresh(ctx, creds, item.due); err != nil && ctx.Err() == nil {
+		err = item.entry.source.refresh(ctx, creds, item.due)
+		switch {
+		case err == nil || ctx.Err() != nil:
+		case causesTombstone(err):
+			log.WithError(err).Info("Trust bundle refresh is still refused, keeping the tombstone")
+		default:
 			log.WithError(err).Warn("Trust bundle refresh failed, serving the last good bundle")
 		}
 	}
 }
 
-// sweep evicts every provider with no lease whose providerIdleTTL has passed. A
-// later read or lease learns the provider again.
+// sweep evicts expired tombstones and idle providers with no lease.
 func (r *Registry) sweep(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
 	for providerArn, entry := range r.entries {
+		if entry.source.tombstoned() {
+			if entry.source.tombstoneExpired(now) {
+				delete(r.entries, providerArn)
+				logger.FromContext(ctx).WithField("provider_arn", providerArn).
+					Infof("Evicted the tombstone of a workload identity provider that has not existed for %s", tombstoneTTL)
+			}
+			continue
+		}
 		if len(entry.holders) > 0 || now.Sub(entry.lastUsed) < providerIdleTTL {
 			continue
 		}

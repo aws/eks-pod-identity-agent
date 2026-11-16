@@ -889,3 +889,116 @@ func TestSource_Refresh_ItsOwnCancellation_IsNotServedToALiveReader(t *testing.T
 	g.Expect(rawBundles(bundles)).To(HaveKey(testDomain))
 	g.Expect(fetcher.Calls()).To(Equal(2))
 }
+
+func TestSource_ConcurrentFirstReads_TombstonedByTheSharedFetch_AreAllRefused(t *testing.T) {
+	for _, code := range tombstoningCodes {
+		t.Run(code, func(t *testing.T) {
+			g := NewWithT(t)
+			fetcher := &fakeFetcher{
+				respond: sequence(fail(stsError(code))),
+				gate:    make(chan struct{}),
+				entered: make(chan struct{}, 16),
+			}
+			source, notifier := newTestSource(t, fetcher)
+			const readers = 8
+			var wg sync.WaitGroup
+			errs := make(chan error, readers)
+			for range readers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_, err := source.JWTBundles(context.Background(), signTest)
+					errs <- err
+				}()
+			}
+			<-fetcher.entered
+			close(fetcher.gate)
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				g.Expect(err).To(MatchError(wierrors.ErrBundleRefused))
+			}
+			g.Expect(fetcher.Calls()).To(Equal(1), "readers queued behind the fetch find the tombstone")
+			g.Expect(source.tombstoned()).To(BeTrue())
+			g.Expect(notified(notifier)).To(Equal(notifications{}))
+		})
+	}
+}
+
+func TestSource_ReaderWaitingWhileTheProviderIsTombstoned_IsRefusedWithoutFetching(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := &fakeFetcher{respond: fixed(sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))})}
+	source, _ := newTestSource(t, fetcher)
+	ctx := context.Background()
+	// Hold the fetch lock, as a fetch in flight would.
+	g.Expect(source.acquire(ctx)).To(Succeed())
+	done := make(chan error, 1)
+	go func() {
+		_, err := source.X509Bundles(ctx, signTest)
+		done <- err
+	}()
+	// Give the reader time to pass the unlocked check and queue on the lock.
+	time.Sleep(20 * time.Millisecond)
+	// Tombstone with no backoff recorded, so only the check after the lock stops a fetch.
+	source.tombstone(ctx, stsError("ResourceNotFoundException"))
+	source.release()
+	g.Expect(<-done).To(MatchError(wierrors.ErrBundleRefused))
+	g.Expect(fetcher.Calls()).To(BeZero())
+}
+
+func TestSource_Tombstone_AgainKeepsTheExpiryAndWakesNoStream(t *testing.T) {
+	g := NewWithT(t)
+	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}
+	fetcher := &fakeFetcher{respond: fixed(good)}
+	source, notifier := newTestSource(t, fetcher)
+	clock := time.Now()
+	source.now = func() time.Time { return clock }
+	ctx := context.Background()
+	g.Expect(refreshOnce(source, ctx)).To(Succeed())
+
+	source.tombstone(ctx, stsError("ResourceNotFoundException"))
+	g.Expect(source.current.Load()).To(BeNil())
+	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}))
+	expiresAt := source.tombstoneExpiresAt.Load()
+
+	clock = clock.Add(time.Hour)
+	source.tombstone(ctx, stsError("AccessDenied"))
+	g.Expect(source.tombstoneExpiresAt.Load()).To(Equal(expiresAt), "a repeat keeps the first expiry")
+	g.Expect(notified(notifier)).To(Equal(notifications{x509: 1, jwt: 1}), "a repeat wakes no stream")
+}
+
+func TestSource_TombstoneExpired_IsFalseUntilTheExpiryAndForALiveSource(t *testing.T) {
+	g := NewWithT(t)
+	source, _ := newTestSource(t, &fakeFetcher{respond: fixed()})
+	clock := time.Now()
+	source.now = func() time.Time { return clock }
+	g.Expect(source.tombstoneExpired(clock.Add(100*tombstoneTTL))).To(BeFalse(), "a live source has no tombstone to expire")
+	source.tombstone(context.Background(), stsError("ResourceNotFoundException"))
+	g.Expect(source.tombstoneExpired(clock.Add(tombstoneTTL - time.Nanosecond))).To(BeFalse())
+	g.Expect(source.tombstoneExpired(clock.Add(tombstoneTTL))).To(BeTrue())
+}
+
+func TestSource_TombstoneRefusal_DoesNotCountTowardTheBackoff(t *testing.T) {
+	g := NewWithT(t)
+	fetcher := &fakeFetcher{respond: sequence(
+		fail(errors.New("unavailable")),
+		fail(errors.New("unavailable")),
+		fail(stsError("ResourceNotFoundException")),
+		fail(errors.New("unavailable")),
+	)}
+	source, _ := newTestSource(t, fetcher)
+	clock := time.Now()
+	source.now = func() time.Time { return clock }
+	source.jitter = func() float64 { return 0 }
+	ctx := context.Background()
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	clock = clock.Add(retryBaseDelay)
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(2*retryBaseDelay)))
+	clock = clock.Add(2 * retryBaseDelay)
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(defaultRefreshInterval)), "a tombstone waits defaultRefreshInterval")
+	clock = clock.Add(defaultRefreshInterval)
+	g.Expect(refreshOnce(source, ctx)).ToNot(Succeed())
+	g.Expect(source.dueAt()).To(BeTemporally("==", clock.Add(retryBaseDelay)), "the backoff starts over after a tombstone refusal")
+}
