@@ -22,7 +22,7 @@ type TrustBundle struct {
 
 func (s *service) GetTrustBundles(ctx context.Context, creds aws.Credentials, providerArn string) ([]TrustBundle, error) {
 	var decoded getTrustBundlesResponse
-	err := s.invoke(ctx, creds, operationGetTrustBundles, func(input *query.Object) {
+	err := s.invoke(ctx, creds, operationGetTrustBundles, reuseConnection, func(input *query.Object) {
 		input.Key("ProviderArn").String(providerArn)
 	}, &decoded)
 	if err != nil {

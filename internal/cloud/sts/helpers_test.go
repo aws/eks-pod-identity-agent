@@ -56,6 +56,10 @@ type recordedRequest struct {
 	header http.Header
 	body   []byte
 	form   url.Values
+	// close is whether the client asked to close the connection after this request.
+	close bool
+	// remoteAddr is the client end of the connection, which tells reused connections apart.
+	remoteAddr string
 }
 
 func newFakeSTS(t *testing.T, status int, body string) *fakeSTS {
@@ -67,7 +71,8 @@ func newFakeSTS(t *testing.T, status int, body string) *fakeSTS {
 		func() {
 			f.mu.Lock()
 			defer f.mu.Unlock()
-			f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, host: r.Host, header: r.Header.Clone(), body: raw, form: form})
+			f.requests = append(f.requests, recordedRequest{method: r.Method, path: r.URL.Path, host: r.Host, header: r.Header.Clone(), body: raw, form: form,
+				close: r.Close, remoteAddr: r.RemoteAddr})
 		}()
 		w.Header().Set("Content-Type", "text/xml")
 		w.WriteHeader(f.status)
@@ -85,6 +90,13 @@ func (f *fakeSTS) only(t *testing.T) recordedRequest {
 		t.Fatalf("fake STS received %d requests, expected 1", len(f.requests))
 	}
 	return f.requests[0]
+}
+
+// all returns a copy of every request the fake has received, in order.
+func (f *fakeSTS) all() []recordedRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedRequest(nil), f.requests...)
 }
 
 func (f *fakeSTS) requestCount() int {
