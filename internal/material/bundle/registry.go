@@ -347,7 +347,7 @@ func (r *Registry) refreshDue(ctx context.Context) {
 		switch {
 		case err == nil || ctx.Err() != nil:
 		case causesTombstone(err):
-			log.WithError(err).Debug("Trust bundle refresh is still refused, keeping the tombstone")
+			log.WithError(err).Info("Trust bundle refresh is still refused, keeping the tombstone")
 		default:
 			log.WithError(err).Warn("Trust bundle refresh failed, serving the last good bundle")
 		}

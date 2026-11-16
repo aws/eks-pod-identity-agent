@@ -22,6 +22,29 @@ import (
 	"go.amzn.com/eks/eks-pod-identity-agent/pkg/workloadidentity"
 )
 
+var (
+	// tombstoneCodes are the STS error codes that tombstone the provider: it does
+	// not exist, or the agent is denied its trust bundles.
+	tombstoneCodes = map[string]bool{
+		"ResourceNotFoundException": true,
+		"AccessDenied":              true,
+		"AccessDeniedException":     true,
+	}
+
+	// refusedCodes are the other STS error codes a repeat cannot change.
+	// ValidationError is what a malformed provider ARN gets. It is a list rather
+	// than every client fault because STS reports throttling and an expired or
+	// skewed signature as client faults too, and those clear up on their own.
+	refusedCodes = map[string]bool{
+		"ValidationError": true,
+		"InvalidAction":   true,
+	}
+
+	// errTombstone marks a GetTrustBundles error with a tombstone code, so the same
+	// code from EKS Auth through the signer isn't mistaken for it.
+	errTombstone = errors.New("the provider is tombstoned: the agent refuses it from cache until a refresh succeeds")
+)
+
 // providerSource holds one provider's trust bundles. Every read serves the same
 // immutable snapshot, and only a refresh, or a read with nothing cached, calls
 // STS. The Registry decides when a refresh runs and whose credentials sign it.
@@ -330,6 +353,8 @@ func (s *providerSource) tombstone(ctx context.Context, cause error) {
 	firstTombstone := s.tombstoneExpiresAt.CompareAndSwap(0, expiresAt.UnixNano())
 	if !firstTombstone {
 		// Already tombstoned, so the snapshot is already gone.
+		logger.FromContext(ctx).WithField("provider_arn", s.providerArn).WithError(cause).
+			Info("Trust bundle refresh is still refused, keeping the tombstone")
 		return
 	}
 	logger.FromContext(ctx).WithField("provider_arn", s.providerArn).WithError(cause).
@@ -436,30 +461,9 @@ func shorten(d time.Duration, r float64) time.Duration {
 	return d - time.Duration(float64(d)*refreshJitter*r)
 }
 
-// tombstoneCodes are the STS error codes that tombstone the provider: it does
-// not exist, or the agent is denied its trust bundles.
-var tombstoneCodes = map[string]bool{
-	"ResourceNotFoundException": true,
-	"AccessDenied":              true,
-	"AccessDeniedException":     true,
-}
-
-// errTombstone marks a GetTrustBundles error with a tombstone code, so the same
-// code from EKS Auth through the signer isn't mistaken for it.
-var errTombstone = errors.New("STS refused the workload identity provider's trust bundles")
-
 // causesTombstone reports whether err is a fetch error that tombstones the provider.
 func causesTombstone(err error) bool {
 	return errors.Is(err, errTombstone)
-}
-
-// refusedCodes are the other STS error codes a repeat cannot change. ValidationError
-// is what a malformed provider ARN gets. It is a list rather than every client fault
-// because STS reports throttling and an expired or skewed signature as client
-// faults too, and those clear up on their own.
-var refusedCodes = map[string]bool{
-	"ValidationError": true,
-	"InvalidAction":   true,
 }
 
 // hasCodeIn reports whether err is an STS error with one of codes.

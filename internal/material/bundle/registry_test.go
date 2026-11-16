@@ -1250,7 +1250,7 @@ func TestRegistry_TombstonedLiveProvider_IsRevivedOnTheNormalScheduleWithoutANot
 	g.Expect(fetcher.Calls(testProviderArn)).To(Equal(3))
 }
 
-func TestRegistry_TombstoneRefreshes_LogOneWarningAndNoLastGoodBundleWarning(t *testing.T) {
+func TestRegistry_TombstoneRefreshes_LogOneWarningThenInfoAndNoLastGoodBundleWarning(t *testing.T) {
 	g := NewWithT(t)
 	good := sts.TrustBundle{TrustDomain: testDomain, Bundle: bundleDoc(t, 0, x509Key(t, newAuthority(t, "ca")))}
 	registry, fetcher, _, _, clock := newRespondingRegistry(t, sequence(ok(good), fail(stsError("ResourceNotFoundException"))))
@@ -1271,6 +1271,14 @@ func TestRegistry_TombstoneRefreshes_LogOneWarningAndNoLastGoodBundleWarning(t *
 	warnings := logsAt(hook, logrus.WarnLevel, "STS refused the workload identity provider's trust bundles")
 	g.Expect(warnings).To(HaveLen(1), "only the first refusal is logged as a warning")
 	g.Expect(warnings[0].Data).To(HaveKey(logrus.ErrorKey), "the warning carries the STS error")
+	repeats := logsAt(hook, logrus.InfoLevel, "still refused, keeping the tombstone")
+	// tombstone() logs each of the 3 repeat refusals, and refreshDue logs all 4
+	// tombstone-code refreshes, the first included.
+	g.Expect(repeats).To(HaveLen(7), "refusals are logged at Info")
+	for _, entry := range repeats {
+		g.Expect(entry.Data).To(HaveKey(logrus.ErrorKey), "with the STS error")
+		g.Expect(entry.Data).To(HaveKeyWithValue("provider_arn", testProviderArn))
+	}
 	g.Expect(logsAt(hook, logrus.WarnLevel, "serving the last good bundle")).To(BeEmpty(), "a tombstone serves nothing")
 }
 
