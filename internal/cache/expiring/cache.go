@@ -375,13 +375,15 @@ func (c *cache[K, V]) Modify(k K, f func(V) V) (V, bool) {
 }
 
 // Delete an item from the cache. Does nothing if the key is not in the cache.
-func (c *cache[K, V]) Delete(k K) {
+// Returns true if an item was actually removed.
+func (c *cache[K, V]) Delete(k K) bool {
 	c.mu.Lock()
 	v, evicted := c.delete(k)
 	c.mu.Unlock()
 	if evicted && c.onEvicted != nil {
 		c.onEvicted(k, v)
 	}
+	return evicted
 }
 
 // Rename a key; the value and expiry will be left untouched; onEvicted will not

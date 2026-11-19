@@ -137,6 +137,21 @@ env:
 
 fullnameOverride: "eks-pod-identity-agent"
 
+# podLivenessCheck lets the agent watch this node's pods (via a node-scoped
+# informer, authenticating as the node identity) and skip renewing -- and
+# promptly evict -- credentials for pods that no longer exist, reducing needless
+# AssumeRoleForPodIdentity calls to EKS Auth under high pod churn.
+#
+# When enabled the chart passes --enable-pod-liveness to the agent. The Node 
+# authorizer scopes the node identity's read to this node's own pods. The node's 
+# IAM role must be mapped to system:node:<nodeName> (standard on EKS).
+#
+# Disabled by default. When enabled, the informer can still be turned off by
+# setting this back to false; when disabled the agent fails open and renews as
+# before.
+podLivenessCheck:
+  enabled: false
+
 image:
   containerRegistry: "602401143452.dkr.ecr.us-west-2.amazonaws.com"
   pullPolicy: Always
