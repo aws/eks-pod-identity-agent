@@ -37,9 +37,9 @@ type Session struct {
 	ServiceAccount string
 	// Audience is sent as DefaultAudience when empty.
 	Audience string
-	// ProviderArn is the member the released SDK doesn't model, sent as
-	// workloadIdentityProviderArn. It's left out when empty, which is how EKS
-	// Auth answers for a pod not enrolled in workload identity.
+	// ProviderArn is sent as workloadIdentityProviderArn. It's left out when
+	// empty, which is how EKS Auth answers for a pod not enrolled in workload
+	// identity.
 	ProviderArn string
 }
 

@@ -3,8 +3,8 @@ package eksauth
 // Most of these tests run the real SDK client, built by NewService, against the
 // fake EKS Auth in eksauthtest; the upstream tests from capturingRoundTripper on
 // build a service directly. They're in-package so they can assert on the
-// unexported client and middleware, which only works while eksauthtest doesn't
-// import this package.
+// unexported service, which only works while eksauthtest doesn't import this
+// package.
 
 import (
 	"bytes"
@@ -15,7 +15,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -27,7 +26,6 @@ import (
 	awseksauth "github.com/aws/aws-sdk-go-v2/service/eksauth"
 	"github.com/aws/aws-sdk-go-v2/service/eksauth/types"
 	"github.com/aws/smithy-go"
-	"github.com/aws/smithy-go/middleware"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 
@@ -39,10 +37,8 @@ import (
 )
 
 const (
-	testClusterName = "test-cluster"
-	testToken       = "projected-service-account-token"
-	// providerArnMember is spelled here, not read from the middleware's struct
-	// tag, so a wrong tag fails these tests.
+	testClusterName   = "test-cluster"
+	testToken         = "projected-service-account-token"
 	providerArnMember = "workloadIdentityProviderArn"
 )
 
@@ -119,10 +115,9 @@ func TestGetIamCredentials_TreatsANullMemberAsAbsent(t *testing.T) {
 	g.Expect(got.AccessKeyId).To(Equal(eksauthtest.EnrolledSession(testExpiration).AccessKeyID))
 }
 
-// TestGetIamCredentials_ReadsAMistypedMemberAsAbsent pins the hot path's
-// tolerance: a member of the wrong type records nothing, and the pod still gets
-// its credentials, read as not enrolled.
-func TestGetIamCredentials_ReadsAMistypedMemberAsAbsent(t *testing.T) {
+// TestGetIamCredentials_RejectsAMistypedMember proves a provider ARN member of
+// the wrong type fails the call with the SDK's deserialization error.
+func TestGetIamCredentials_RejectsAMistypedMember(t *testing.T) {
 	for name, value := range map[string]any{
 		"number":  42,
 		"boolean": true,
@@ -136,22 +131,18 @@ func TestGetIamCredentials_ReadsAMistypedMemberAsAbsent(t *testing.T) {
 			document[providerArnMember] = value
 			fake.SetRawResponse(http.StatusOK, mustJSON(t, document))
 
-			got, metadata, err := getIamCredentials(context.Background(), fake.Config())
-			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(metadata.ProviderArn()).To(BeEmpty())
-			session := eksauthtest.EnrolledSession(testExpiration)
-			g.Expect(got.AccessKeyId).To(Equal(session.AccessKeyID))
-			g.Expect(got.SecretAccessKey).To(Equal(session.SecretAccessKey))
-			g.Expect(got.Token).To(Equal(session.SessionToken))
-			g.Expect(metadata.AssociationId()).To(Equal(session.AssociationID))
+			got, _, err := getIamCredentials(context.Background(), fake.Config())
+			g.Expect(got).To(BeNil())
+			var deserializationErr *smithy.DeserializationError
+			g.Expect(errors.As(err, &deserializationErr)).To(BeTrue(), "%v", err)
 		})
 	}
 }
 
 // TestGetIamCredentials_IgnoresMembersItDoesNotRead proves that a member EKS
 // Auth's model does not have, such as a stray spiffeId, neither fails the call
-// nor changes what is decoded, whatever its type: the middleware reads its one
-// member and the SDK drops what it does not model.
+// nor changes what is decoded, whatever its type: the SDK drops what it does
+// not model.
 func TestGetIamCredentials_IgnoresMembersItDoesNotRead(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
@@ -239,8 +230,6 @@ func TestGetIamCredentials_SurfacesEveryModelledErrorAsItsSDKType(t *testing.T) 
 			g.Expect(got).To(BeNil())
 			g.Expect(metadata).To(BeNil())
 
-			// The middleware is installed on this call, so this is also the proof
-			// that it leaves an error response for the SDK to decode.
 			g.Expect(test.isType(err)).To(BeTrue(), "%v does not wrap the modelled type", err)
 			var apiErr smithy.APIError
 			g.Expect(errors.As(err, &apiErr)).To(BeTrue())
@@ -308,8 +297,6 @@ func TestGetIamCredentials_ReportsABodyThatIsNotAJSONObject(t *testing.T) {
 
 			got, _, err := getIamCredentials(context.Background(), fake.Config())
 			g.Expect(got).To(BeNil())
-			// The middleware leaves a body it cannot read to the SDK, so the error
-			// is the SDK's own deserialization error.
 			var deserializationErr *smithy.DeserializationError
 			g.Expect(errors.As(err, &deserializationErr)).To(BeTrue(), "%v", err)
 		})
@@ -354,10 +341,6 @@ func TestGetIamCredentials_ReportsAResponseMissingAMemberItReads(t *testing.T) {
 	}
 }
 
-// TestGetIamCredentials_DecodesTheFirstValueAsTheSDKDoes pins that the
-// middleware and the SDK agree on a body with bytes after its object. The SDK
-// decodes the first JSON value and ignores the rest, so the middleware has to
-// as well, or an enrolled pod would read as not enrolled.
 func TestGetIamCredentials_DecodesTheFirstValueAsTheSDKDoes(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
@@ -370,10 +353,9 @@ func TestGetIamCredentials_DecodesTheFirstValueAsTheSDKDoes(t *testing.T) {
 	g.Expect(got.AccessKeyId).To(Equal(session.AccessKeyID))
 }
 
-// TestGetIamCredentials_ReadsTheMemberOffTheAttemptThatSucceeded runs the
-// middleware under the SDK's standard retryer. The deserialize step runs once
-// per attempt and the retry middleware returns the last attempt's metadata, so
-// the member of a retried call comes from the response that was decoded.
+// TestGetIamCredentials_ReadsTheMemberOffTheAttemptThatSucceeded runs
+// GetIamCredentials under the SDK's standard retryer, so the member of a
+// retried call comes from the response that was decoded.
 func TestGetIamCredentials_ReadsTheMemberOffTheAttemptThatSucceeded(t *testing.T) {
 	g := NewWithT(t)
 	fake := eksauthtest.New(t)
@@ -419,71 +401,6 @@ func TestGetIamCredentials_ReturnsWhenTheContextEnds(t *testing.T) {
 	cancel()
 
 	g.Expect(errors.Is(<-errs, context.Canceled)).To(BeTrue())
-}
-
-// deserializeStep returns an optFn that records the IDs of the deserialize step,
-// in order, from the stack of the call it is passed to. APIOptions run in the
-// order they were appended, so passed after withWorkloadIdentityProviderArn it
-// sees the step as that left it.
-func deserializeStep(ids *[]string) func(*awseksauth.Options) {
-	return func(options *awseksauth.Options) {
-		options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
-			*ids = stack.Deserialize.List()
-			return nil
-		})
-	}
-}
-
-func assumeRoleInput() *awseksauth.AssumeRoleForPodIdentityInput {
-	return &awseksauth.AssumeRoleForPodIdentityInput{
-		ClusterName: aws.String(testClusterName),
-		Token:       aws.String(testToken),
-	}
-}
-
-// TestWorkloadIdentityProviderArnMiddleware_RunsInsideTheOperationDeserializer pins
-// the order the middleware depends on: it has to be inside (after)
-// OperationDeserializer to see the body before it's consumed, so an SDK change
-// that moves it fails with the reason.
-func TestWorkloadIdentityProviderArnMiddleware_RunsInsideTheOperationDeserializer(t *testing.T) {
-	g := NewWithT(t)
-	fake := eksauthtest.New(t)
-	client := NewService(context.Background(), fake.Config(), false).(*service).eksAuthService
-	middlewareID := workloadIdentityProviderArnMiddleware{}.ID()
-
-	var ids []string
-	out, err := client.AssumeRoleForPodIdentity(context.Background(), assumeRoleInput(),
-		withWorkloadIdentityProviderArn, deserializeStep(&ids))
-	g.Expect(err).ToNot(HaveOccurred())
-	t.Logf("deserialize step, outermost first: %v", ids)
-
-	g.Expect(ids).ToNot(BeEmpty())
-	g.Expect(ids[len(ids)-1]).To(Equal(middlewareID), "the middleware is innermost")
-	g.Expect(slices.Index(ids, "OperationDeserializer")).To(BeNumerically(">=", 0))
-	g.Expect(slices.Index(ids, "OperationDeserializer")).To(BeNumerically("<", slices.Index(ids, middlewareID)))
-
-	// And the SDK still decoded the body the middleware had already read.
-	g.Expect(out.Credentials).ToNot(BeNil())
-	g.Expect(aws.ToString(out.Credentials.AccessKeyId)).To(Equal(eksauthtest.EnrolledSession(time.Time{}).AccessKeyID))
-}
-
-func TestWorkloadIdentityProviderArnMiddleware_IsInstalledPerCallOnly(t *testing.T) {
-	g := NewWithT(t)
-	fake := eksauthtest.New(t)
-	svc := NewService(context.Background(), fake.Config(), false).(*service)
-	client := svc.eksAuthService
-	apiOptionsBefore := len(client.Options().APIOptions)
-
-	_, _, err := svc.GetIamCredentials(context.Background(), credentialsRequest())
-	g.Expect(err).ToNot(HaveOccurred())
-
-	// The call did not leave the middleware on its client.
-	g.Expect(client.Options().APIOptions).To(HaveLen(apiOptionsBefore))
-	var ids []string
-	_, err = client.AssumeRoleForPodIdentity(context.Background(), assumeRoleInput(), deserializeStep(&ids))
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(ids).To(ContainElement("OperationDeserializer"))
-	g.Expect(ids).ToNot(ContainElement(workloadIdentityProviderArnMiddleware{}.ID()))
 }
 
 func TestGetIamCredentials_LogsTheSessionButNeverItsSecrets(t *testing.T) {
