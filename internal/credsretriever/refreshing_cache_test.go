@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -531,20 +532,23 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 		requests                    []credentials.EksCredentialsRequest
 		expectedCredentialsResponse []credentials.EksCredentialsResponse
 		expectedErrMsg              string
-		expectedDelegateCalls       func(retriever *mockcreds.MockCredentialRetriever)
+		expectedDelegateCalls       func(retriever *mockcreds.MockCredentialRetriever, calls *atomic.Int32)
 	}{
 		{
 			name: "calls without error",
 			requests: []credentials.EksCredentialsRequest{
 				sampleRequestOne,
 			},
-			expectedDelegateCalls: func(delegate *mockcreds.MockCredentialRetriever) {
+			expectedDelegateCalls: func(delegate *mockcreds.MockCredentialRetriever, calls *atomic.Int32) {
+				// The call count is asserted from the test goroutine. A gomock .Times(1)
+				// violation would call t.Fatalf from a non-test goroutine and hang the test.
 				delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).DoAndReturn(
 					func(ctx context.Context, request *credentials.EksCredentialsRequest) (*credentials.EksCredentialsResponse, credentials.ResponseMetadata, error) {
+						calls.Add(1)
 						time.Sleep(200 * time.Millisecond) // Simulate API call latency
 						response := sampleResponseOne
 						return &response, responseMetadataTest("one"), nil
-					}).Times(1)
+					}).AnyTimes()
 			},
 			expectedCredentialsResponse: []credentials.EksCredentialsResponse{
 				sampleResponseOne,
@@ -563,8 +567,9 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 
 			// setup
 			delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+			var delegateCalls atomic.Int32
 			if test.expectedDelegateCalls != nil {
-				test.expectedDelegateCalls(delegate)
+				test.expectedDelegateCalls(delegate, &delegateCalls)
 			}
 
 			retriever := newTestRetriever(credcache.Opts{
@@ -582,7 +587,7 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 				// trigger
 
 				// Create a channel to receive iamCredentials from goroutines
-				credResponses := make(chan EksCredentialsResponseWithError)
+				credResponses := make(chan EksCredentialsResponseWithError, numRequests)
 				for j := 0; j < numRequests; j++ {
 					go func() {
 						cred, _, err := retriever.GetIamCredentials(ctx, &req)
@@ -595,11 +600,17 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 				}
 
 				responses := make([]EksCredentialsResponseWithError, numRequests)
-				// Wait for 3 results
+				// Wait for all results, failing fast instead of hanging until the package timeout
+				deadline := time.After(30 * time.Second)
 				for j := 0; j < numRequests; j++ {
-					response := <-credResponses // Receive result from any goroutine
-					responses[j] = response
+					select {
+					case response := <-credResponses: // Receive result from any goroutine
+						responses[j] = response
+					case <-deadline:
+						t.Fatalf("timed out waiting for %d of %d GetIamCredentials results", numRequests-j, numRequests)
+					}
 				}
+				g.Expect(delegateCalls.Load()).To(BeEquivalentTo(1), "concurrent requests for one token must share a single delegate call")
 				t.Logf("All %d GetIamCredentials requests done\n", numRequests)
 				close(credResponses)
 
@@ -624,6 +635,48 @@ func TestCachedCredentialRetriever_GetIamCredentials_ActiveRequestCaching(t *tes
 		})
 	}
 }
+// A caller that does not own the active-request marker (it gave up waiting) must not delete
+// the marker of the request that is still in flight.
+func TestCachedCredentialRetriever_GetIamCredentials_DoesNotDeleteMarkerOfOtherRequest(t *testing.T) {
+g := NewWithT(t)
+ctrl := gomock.NewController(t)
+defer ctrl.Finish()
+
+req := credentials.EksCredentialsRequest{
+ServiceAccountToken: test.CreateToken(t, test.TokenConfig{
+Expiry: time.Now().Add(time.Hour),
+Iat:    time.Now(),
+Nbf:    time.Now(),
+PodUID: "some.jwt.token.marker",
+}),
+}
+delegate := mockcreds.NewMockCredentialRetriever(ctrl)
+delegate.EXPECT().GetIamCredentials(gomock.Any(), gomock.Any()).Return(
+&credentials.EksCredentialsResponse{
+AccountId:  "accountOne",
+Expiration: credentials.SdkCompliantExpirationTime{Time: time.Now().Add(time.Hour)},
+}, responseMetadataTest("one"), nil).Times(1)
+
+retriever := newTestRetriever(credcache.Opts{
+RenewalTtl:      1 * time.Minute,
+MaxSize:         5,
+CleanupInterval: 0, // Disable janitor in tests
+RefreshQPS:      1,
+}, CachedCredentialRetrieverOpts{
+Delegate:              delegate,
+AuthoritativeDelegate: delegate,
+})
+
+// Simulate another caller that claimed the token and is still waiting on the delegate.
+g.Expect(retriever.internalActiveRequestCache.Add(req.ServiceAccountToken, nil)).To(Succeed())
+
+_, _, err := retriever.GetIamCredentials(context.Background(), &req)
+g.Expect(err).ToNot(HaveOccurred())
+
+_, stillClaimed := retriever.internalActiveRequestCache.Get(req.ServiceAccountToken)
+g.Expect(stillClaimed).To(BeTrue(), "marker of the in-flight request was deleted by a caller that did not own it")
+}
+
 func TestCachedCredentialRetriever_GetIamCredentials_MissingPodUID(t *testing.T) {
 	g := NewWithT(t)
 	ctrl := gomock.NewController(t)
