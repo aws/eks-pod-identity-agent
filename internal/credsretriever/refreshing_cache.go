@@ -120,22 +120,36 @@ func (r *cachedCredentialRetriever) GetIamCredentials(ctx context.Context,
 	ctx = logger.ContextWithField(ctx, "podUID", podUID)
 	log = logger.FromContext(ctx)
 
+	// Claim the token atomically: Add fails when another caller already owns the marker.
+	// Only the owner may delete the marker.
+	owner := false
 	for i := 0; i <= defaultActiveRequestRetries; i++ {
 		if resp, done := r.tryServingFromCache(ctx, podUID, request); done {
 			return resp, nil, nil
 		}
 
-		if !r.waitForActiveRequest(ctx, request.ServiceAccountToken, i) {
+		if r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil) == nil {
+			owner = true
 			break
 		}
+
+		r.waitForActiveRequest(ctx, i)
 	}
 
-	if _, ok := r.internalActiveRequestCache.Get(request.ServiceAccountToken); ok {
+	if owner {
+		defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
+		// The previous owner may have stored credentials and released the marker after the
+		// cache lookup above, so look again for an entry stored for this exact token before
+		// calling the delegate. No local validation is needed for an exact token match.
+		if val, ok := r.cache.Get(podUID); ok && val.Request != nil &&
+			val.Request.ServiceAccountToken == request.ServiceAccountToken {
+			if _, withinTtl := r.cache.CredentialsWithinValidTtl(val); withinTtl {
+				return val.Credentials, nil, nil
+			}
+		}
+	} else {
 		log.Warnf("Failed to complete active request in %v tries", defaultActiveRequestRetries)
 	}
-
-	r.internalActiveRequestCache.Add(request.ServiceAccountToken, nil)
-	defer r.internalActiveRequestCache.Delete(request.ServiceAccountToken)
 
 	log.WithField("cache-hit", 0).Tracef("Could not find entry in cache, requesting creds from delegate")
 	r.cache.RecordMiss()
@@ -214,22 +228,17 @@ func (r *cachedCredentialRetriever) tryInitTokenValidator(ctx context.Context) {
 	}()
 }
 
-// waitForActiveRequest checks if there's an in-flight request for the same token.
-// Returns true if the caller should continue waiting (i.e. keep looping), false to break out.
-func (r *cachedCredentialRetriever) waitForActiveRequest(ctx context.Context,
-	token string, attempt int) bool {
+// waitForActiveRequest waits before the next attempt while another caller owns the active request
+// marker for the same token.
+func (r *cachedCredentialRetriever) waitForActiveRequest(ctx context.Context, attempt int) {
 	log := logger.FromContext(ctx)
 
-	if _, ok := r.internalActiveRequestCache.Get(token); !ok {
-		return false
-	}
 	if attempt > 0 {
 		log.Infof("Waiting for active request with %v tries", attempt)
 	}
 	if attempt < defaultActiveRequestRetries {
 		time.Sleep(defaultActiveRequestWaitTime)
 	}
-	return true
 }
 
 func (r *cachedCredentialRetriever) callDelegateAndCache(ctx context.Context,
