@@ -228,8 +228,8 @@ func TestChartDaemonSetKeepsTheAgentUnprivileged(t *testing.T) {
 				t.Errorf("%s: DaemonSet %s runs the agent privileged", chartPath, daemonSet.Name)
 			}
 			if c := agent.SecurityContext; c == nil || c.Capabilities == nil ||
-				!slices.Equal(c.Capabilities.Add, []corev1.Capability{"CAP_NET_BIND_SERVICE"}) {
-				t.Errorf("%s: DaemonSet %s adds capabilities other than CAP_NET_BIND_SERVICE to the agent: %v",
+				!slices.Equal(c.Capabilities.Add, []corev1.Capability{"NET_BIND_SERVICE"}) {
+				t.Errorf("%s: DaemonSet %s adds capabilities other than NET_BIND_SERVICE to the agent: %v",
 					chartPath, daemonSet.Name, agent.SecurityContext)
 			}
 			for _, path := range kubeletDirs {
